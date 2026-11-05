@@ -696,6 +696,36 @@ fn load_or_make_seed(data_dir: &Path, name: &str) -> std::io::Result<[u8; 32]> {
     Ok(seed)
 }
 
+/// Parses a BTC amount string into satoshis, accepting either `.` or `,` as the decimal separator
+/// (a European `0,5` and an English `0.5` both mean half a coin). This is the canonical normalizer the
+/// GUI uses before it calls the sats-only API, so a locale never reaches the protocol. A string with
+/// both separators is ambiguous (thousands grouping) and refused rather than guessed; more than eight
+/// decimals is sub-satoshi and refused.
+pub fn parse_btc_to_sats(input: &str) -> Option<u64> {
+    let s = input.trim();
+    if s.contains('.') && s.contains(',') {
+        return None;
+    }
+    let norm = s.replace(',', ".");
+    let (whole, frac) = match norm.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (norm.as_str(), ""),
+    };
+    if (whole.is_empty() && frac.is_empty()) || frac.len() > 8 {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let frac: u64 = format!("{frac:0<8}").parse().ok()?;
+    whole.checked_mul(100_000_000)?.checked_add(frac)
+}
+
 struct Request {
     method: String,
     path: String,

@@ -136,3 +136,20 @@ fn an_oversized_body_is_refused() {
     let code = request(&addr, "PUT", "/settings", Some(&token), &body).0;
     assert_eq!(code, 413, "oversized body not refused");
 }
+
+#[test]
+fn btc_amounts_accept_dot_and_comma() {
+    use sovereign_swap::daemon::parse_btc_to_sats;
+    assert_eq!(parse_btc_to_sats("0.5"), Some(50_000_000));
+    assert_eq!(parse_btc_to_sats("0,5"), Some(50_000_000)); // European decimal comma
+    assert_eq!(parse_btc_to_sats("1"), Some(100_000_000));
+    assert_eq!(parse_btc_to_sats("0.50000000"), Some(50_000_000));
+    assert_eq!(parse_btc_to_sats("21000000"), Some(2_100_000_000_000_000));
+    assert_eq!(parse_btc_to_sats(" 0,00000001 "), Some(1)); // one sat, trimmed
+                                                            // refused: ambiguous grouping, sub-sat, and junk
+    assert_eq!(parse_btc_to_sats("1,234.5"), None);
+    assert_eq!(parse_btc_to_sats("0.123456789"), None);
+    assert_eq!(parse_btc_to_sats("1.2.3"), None);
+    assert_eq!(parse_btc_to_sats("abc"), None);
+    assert_eq!(parse_btc_to_sats("."), None);
+}
