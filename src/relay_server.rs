@@ -190,8 +190,13 @@ impl RelayServer {
     }
 
     fn serve_connection(&self, stream: TcpStream) {
+        // The WebSocket handshake must be read with a generous timeout: this relay is Tor-first, and
+        // a Tor circuit's round trip is well over the 50ms the read loop uses, so a short timeout set
+        // before the handshake drops every Tor client (the handshake read times out and the accept
+        // fails). Give the handshake room, then tighten to the short per-read timeout below for the
+        // message loop.
         if stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .is_err()
         {
             return;
@@ -203,6 +208,15 @@ impl RelayServer {
             Ok(ws) => ws,
             Err(_) => return,
         };
+        // Now the handshake is done, use a short read timeout so the message loop can interleave
+        // reads with draining the outbound queue without blocking.
+        if ws
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .is_err()
+        {
+            return;
+        }
         let (tx, rx): (Outbox, Receiver<String>) = mpsc::channel();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let secp = Secp256k1::verification_only();

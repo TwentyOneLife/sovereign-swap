@@ -173,3 +173,52 @@ fn our_wsconn_client_talks_to_the_relay() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].id, ev.id);
 }
+
+#[test]
+fn a_slow_handshake_still_connects() {
+    use std::io::{Read, Write};
+    use std::thread::sleep;
+
+    // A Tor circuit's handshake arrives well after the TCP connect. The relay must not drop it: the
+    // read timeout for the message loop must not apply to the handshake. 150ms is far over the loop's
+    // 50ms and under any test timeout.
+    let url = relay(RelayConfig::default());
+    let addr = url.trim_start_matches("ws://").trim_end_matches('/');
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sleep(Duration::from_millis(150));
+    sock.write_all(
+        b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    let mut buf = [0u8; 64];
+    let n = sock.read(&mut buf).unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "a slow (Tor-like) handshake was dropped: {head:?}"
+    );
+}
+
+#[test]
+fn an_oversized_valid_event_is_rejected_by_the_size_cap() {
+    // A validly built event whose JSON exceeds max_event_bytes must be rejected with "too large".
+    // This is the control the oversized/malformed attack could not reach: its event has no pubkey and
+    // dies at parse, before the size check. Here the event parses, so the size cap is what stops it.
+    let cfg = RelayConfig {
+        max_event_bytes: 2_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    let secp = Secp256k1::new();
+    let big = vec![0xAB; 1_200]; // content hex = 2400 chars, so the event JSON is over the 2000 cap
+    let ev = Event::build(&secp, &key(1), Event::now_for_test(), vec![], &big);
+    let replies = send_and_read(&url, &format!(r#"["EVENT",{}]"#, ev.to_json()));
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("\"OK\"") && r.contains("false") && r.contains("too large")),
+        "oversized valid event was not rejected by the size cap: {replies:?}"
+    );
+}
