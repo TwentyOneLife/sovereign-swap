@@ -61,7 +61,22 @@ No network, no Kali; runs in CI on every change.
   must be rejected; the hybrid signature must fail if either half fails.
 - Harvest-now: confirm no swap secret or key is ever in a message's cleartext.
 
-### C. Network and service, in the homelab lab (when the relay runs)
+### C. Network and service
+
+#### Client side (our code, in CI): done
+
+A relay is untrusted, so the first DoS question is whether a hostile or flooding relay can break our
+client. `WsConn` (design 0006) now: caps the WebSocket message size (a hostile oversized frame is
+refused, not buffered); keeps a bounded event buffer (a flood drops oldest, never exhausts memory);
+and treats an oversized, malformed or non-UTF-8 frame as a dropped frame, never a dropped connection.
+`tests/ws_hostile.rs` floods the client with garbage, a malformed event, an oversized frame and a
+non-EVENT line, then one valid event: only the valid event survives and the client stays connected.
+A hardening this found: capping `max_frame_size` too low makes tungstenite assert (itself a DoS), so
+only `max_message_size` is bounded.
+
+Because an interrupted swap always ends in refund, a relay going dark or hostile costs time, not coins.
+
+#### Server side, in the homelab lab (when the relay runs)
 
 Target: a relay deployed on the isolated `hacklab` network (`sovereign-homelab`), attacked from the
 Kali VM. Never against a live relay on real infrastructure.
