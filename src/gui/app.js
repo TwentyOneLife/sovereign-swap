@@ -50,8 +50,24 @@ async function loadStatus() {
 }
 
 // --- market ---
+let lastOffers = [];
+
+// Price context from OUR order book (no external oracle; xBTC has no liquid market to derive a rate
+// from, so the offers on our relay are the price discovery). Returns the rate range and midpoint for
+// a sell direction, to prefill the create form and show where the market is.
+function rateHint(sellChain) {
+  const rates = lastOffers
+    .filter((o) => o.sell_chain === sellChain)
+    .map((o) => o.counter_amount_sat / o.amount_sat)
+    .filter((r) => isFinite(r) && r > 0)
+    .sort((a, b) => a - b);
+  if (!rates.length) return null;
+  return { count: rates.length, min: rates[0], max: rates[rates.length - 1], mid: rates[Math.floor(rates.length / 2)] };
+}
+
 async function loadMarket() {
   const offers = await api("GET", "/offers").catch(() => []);
+  lastOffers = offers;
   const body = $("#offers tbody");
   body.innerHTML = "";
   $("#offers-empty").style.display = offers.length ? "none" : "block";
@@ -71,6 +87,11 @@ async function loadMarket() {
 
 function offerForm(o) {
   const sell = o ? o.sell_chain : "xbtc";
+  const hint = o ? null : rateHint(sell);
+  const price = o ? (o.counter_amount_sat / o.amount_sat).toFixed(4) : (hint ? hint.mid.toFixed(4) : "0.997");
+  const hintLine = hint
+    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${hint.min.toFixed(4)}–${hint.max.toFixed(4)}. You set your own price.</p>`
+    : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
   return `<h2>${o ? "Take offer" : "Create offer"}</h2>
     <label>I am selling
       <select id="f-chain" ${o ? "disabled" : ""}>
@@ -78,7 +99,8 @@ function offerForm(o) {
         <option value="btc" ${sell === "btc" ? "selected" : ""}>BTC</option>
       </select></label>
     <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
-    <label title="How much of the other coin per unit">Price <input id="f-price" value="${o ? (o.counter_amount_sat / o.amount_sat).toFixed(4) : "0.997"}"></label>
+    <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
+    ${hintLine}
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
       <button class="ghost" id="f-cancel">Cancel</button>
@@ -95,6 +117,11 @@ function openSheet(html) {
 
 function createSheet() {
   openSheet(offerForm(null));
+  // Re-suggest the price from the order book when the direction changes.
+  $("#f-chain").onchange = () => {
+    const h = rateHint($("#f-chain").value);
+    if (h) $("#f-price").value = h.mid.toFixed(4);
+  };
   $("#f-go").onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
     const price = parseFloat($("#f-price").value.replace(",", "."));
