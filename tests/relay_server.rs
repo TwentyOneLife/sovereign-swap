@@ -200,3 +200,25 @@ fn a_slow_handshake_still_connects() {
         "a slow (Tor-like) handshake was dropped: {head:?}"
     );
 }
+
+#[test]
+fn an_oversized_valid_event_is_rejected_by_the_size_cap() {
+    // A validly built event whose JSON exceeds max_event_bytes must be rejected with "too large".
+    // This is the control the oversized/malformed attack could not reach: its event has no pubkey and
+    // dies at parse, before the size check. Here the event parses, so the size cap is what stops it.
+    let cfg = RelayConfig {
+        max_event_bytes: 2_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    let secp = Secp256k1::new();
+    let big = vec![0xAB; 1_200]; // content hex = 2400 chars, so the event JSON is over the 2000 cap
+    let ev = Event::build(&secp, &key(1), Event::now_for_test(), vec![], &big);
+    let replies = send_and_read(&url, &format!(r#"["EVENT",{}]"#, ev.to_json()));
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("\"OK\"") && r.contains("false") && r.contains("too large")),
+        "oversized valid event was not rejected by the size cap: {replies:?}"
+    );
+}
