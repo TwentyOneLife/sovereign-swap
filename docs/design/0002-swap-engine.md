@@ -66,6 +66,17 @@ Rules taken over from BasicSwap's failure handling (`docs/edge-cases.md`):
 - Amounts are integers in satoshis; a partial bid converts at the offer's rate rounding down for the
   side that receives, and bids that round to below dust are refused (row 15).
 
+## Confirmation policy
+
+Depths are not the maker's to choose: the maker writes the offer, and the depth that protects the
+taker cannot be left to the maker. Each engine applies its own `Policy`, by chain and by the swap's
+BTC-side amount, and uses the larger of the policy and the offer. A spend counts as final, and stops
+being watched, only at the policy depth of its chain, so a reorg on xBTC cannot undo a claim we
+already stopped watching. Offers whose timelocks cannot fit these depths are refused, and so are
+amounts above the policy's limit. Lock inputs need `minconf` confirmations. The standard table
+(xBTC 6 / 12 / 36, BTC 1 / 2 / 3 up to 0.01 / 0.1 / 1 BTC) is provisional until a reorg-cost
+study of xBTC.
+
 ## Swap wallet
 
 Funding goes through a dedicated wallet on the user's own node of each chain (`walletcreatefundedpsbt`,

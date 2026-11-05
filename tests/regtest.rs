@@ -3,201 +3,19 @@
 //! Needs `BTC_BITCOIND` (Bitcoin Core) and `XBTC_BITCOIND` (Bitcoin Knots BLAKE2b); without them the
 //! tests are skipped with a note. `scripts/test-in-container.sh` provides both.
 
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+mod common;
 
-use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::ecdsa;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::EcdsaSighashType;
-use bitcoin::{
-    Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction, Txid, Witness,
-};
-use serde_json::{json, Value};
+use bitcoin::{Amount, OutPoint, PublicKey, Sequence, Transaction, Txid, Witness};
+use common::{binaries, Node};
+use serde_json::json;
 
 use sovereign_swap::htlc::{extract_preimage, unsigned_spend, Contract, Spend};
 use sovereign_swap::replay::{check_inputs, ReplayError};
-use sovereign_swap::rpc::{Client, RpcError};
-
-static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
-
-struct Node {
-    child: Child,
-    datadir: PathBuf,
-    rpc: Client,
-}
-
-impl Node {
-    /// `fork_height` set means a Knots BLAKE2b node with the fork activating at that height.
-    fn start(binary: &str, fork_height: Option<u32>) -> Node {
-        let base = 20_000 + (std::process::id() % 2_000) as u16 * 10;
-        let n = NEXT_PORT.fetch_add(2, Ordering::SeqCst);
-        let (rpc_port, p2p_port) = (base + n, base + n + 1);
-        let datadir = std::env::temp_dir().join(format!("sovswap-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&datadir).unwrap();
-        let mut conf = format!(
-            "regtest=1\n[regtest]\nrpcport={rpc_port}\nport={p2p_port}\nrpcuser=u\nrpcpassword=p\n\
-             listen=0\nconnect=0\ndnsseed=0\nfallbackfee=0.0001\ntxindex=1\nprinttoconsole=0\n"
-        );
-        if let Some(h) = fork_height {
-            conf.push_str(&format!("testactivationheight=blake2b@{h}\n"));
-        }
-        std::fs::write(datadir.join("bitcoin.conf"), conf).unwrap();
-        let child = Command::new(binary)
-            .arg(format!("-datadir={}", datadir.display()))
-            .spawn()
-            .unwrap();
-        let rpc = Client::new(&format!("127.0.0.1:{rpc_port}"), "u", "p");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match rpc.call("getblockchaininfo", json!([])) {
-                Ok(_) => break,
-                Err(e) if Instant::now() > deadline => panic!("{binary} did not start: {e:?}"),
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
-            }
-        }
-        Node {
-            child,
-            datadir,
-            rpc,
-        }
-    }
-
-    fn call(&self, method: &str, params: Value) -> Value {
-        self.rpc
-            .call(method, params)
-            .unwrap_or_else(|e| panic!("{method}: {e:?}"))
-    }
-
-    fn wallet(&self) -> Client {
-        if self
-            .call("listwallets", json!([]))
-            .as_array()
-            .unwrap()
-            .is_empty()
-        {
-            self.call("createwallet", json!(["w"]));
-        }
-        self.rpc.wallet("w")
-    }
-
-    fn new_address(&self) -> String {
-        self.wallet()
-            .call("getnewaddress", json!([]))
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_owned()
-    }
-
-    fn mine(&self, blocks: u32) {
-        let address = self.new_address();
-        self.call("generatetoaddress", json!([blocks, address]));
-    }
-
-    fn height(&self) -> u64 {
-        self.call("getblockcount", json!([])).as_u64().unwrap()
-    }
-
-    fn header_len(&self, height: u64) -> usize {
-        let hash = self.call("getblockhash", json!([height]));
-        self.call("getblockheader", json!([hash, false]))
-            .as_str()
-            .unwrap()
-            .len()
-            / 2
-    }
-
-    /// Mempool policy and consensus: `Err(reason)` when the node would not accept `tx`.
-    fn accept(&self, tx: &Transaction) -> Result<(), String> {
-        let r = &self.call("testmempoolaccept", json!([[serialize_hex(tx)]]))[0];
-        if r["allowed"].as_bool().unwrap() {
-            Ok(())
-        } else {
-            Err(r["reject-reason"].as_str().unwrap_or_default().to_owned())
-        }
-    }
-
-    /// Consensus only: mines `tx` into a block directly, bypassing mempool policy.
-    fn mine_tx(&self, tx: &Transaction) -> Result<(), String> {
-        let address = self.new_address();
-        match self
-            .rpc
-            .call("generateblock", json!([address, [serialize_hex(tx)]]))
-        {
-            Ok(_) => Ok(()),
-            Err(RpcError::Rpc { message, .. }) => Err(message),
-            Err(e) => panic!("generateblock: {e:?}"),
-        }
-    }
-
-    fn send(&self, tx: &Transaction) {
-        self.call("sendrawtransaction", json!([serialize_hex(tx)]));
-        self.mine(1);
-    }
-
-    /// Locks `amount` in `contract` from the node wallet and confirms it.
-    fn fund(&self, contract: &Contract, amount: Amount) -> OutPoint {
-        let address = Address::from_script(&contract.script_pubkey(), Network::Regtest).unwrap();
-        let txid = self
-            .wallet()
-            .call(
-                "sendtoaddress",
-                json!([address.to_string(), amount.to_btc()]),
-            )
-            .unwrap();
-        let tx: Transaction = deserialize_hex(
-            self.call("getrawtransaction", json!([txid]))
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        self.mine(1);
-        let vout = contract
-            .find_lock_output(&tx, amount)
-            .expect("wallet locked the agreed amount");
-        OutPoint {
-            txid: tx.compute_txid(),
-            vout,
-        }
-    }
-
-    fn destination(&self) -> ScriptBuf {
-        let info = self
-            .wallet()
-            .call("getaddressinfo", json!([self.new_address()]))
-            .unwrap();
-        ScriptBuf::from_hex(info["scriptPubKey"].as_str().unwrap()).unwrap()
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        let _ = self.rpc.call("stop", json!([]));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let _ = self.child.kill();
-        let _ = std::fs::remove_dir_all(&self.datadir);
-    }
-}
-
-fn binaries() -> Option<(String, String)> {
-    match (
-        std::env::var("BTC_BITCOIND"),
-        std::env::var("XBTC_BITCOIND"),
-    ) {
-        (Ok(btc), Ok(xbtc)) => Some((btc, xbtc)),
-        _ => {
-            eprintln!("skipped: set BTC_BITCOIND and XBTC_BITCOIND (scripts/test-in-container.sh)");
-            None
-        }
-    }
-}
 
 const LOCK_BLOCKS: u16 = 10;
 const AMOUNT: Amount = Amount::from_sat(100_000);
@@ -431,5 +249,73 @@ fn regtest_replay_shared_coinbase() {
     assert!(
         check_inputs(&tx2, &knots.rpc).is_ok(),
         "coin unique to BTC passes the guard"
+    );
+}
+
+/// The steps of `docs/guides/separating-coins.md`, on a shared history: a Knots wallet sends its
+/// shared coins to itself; the transaction is valid on xBTC only, and afterwards the BTC copies
+/// are untouched while the xBTC copies are spent.
+#[test]
+fn regtest_separating_coins_as_the_guide_says() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    const FORK: u64 = 150;
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(FORK as u32));
+    knots.call("createwallet", json!(["coins"]));
+    let wallet = knots.rpc.wallet("coins");
+    let shared = wallet.call("getnewaddress", json!([])).unwrap();
+    core.call("generatetoaddress", json!([FORK - 1, shared]));
+    for height in 1..FORK {
+        let hash = core.call("getblockhash", json!([height]));
+        knots.call(
+            "submitblock",
+            json!([core.call("getblock", json!([hash, 0]))]),
+        );
+    }
+    knots.mine(10);
+    core.mine(10);
+    let hash1 = core.call("getblockhash", json!([1]));
+    let coin1: Txid = core.call("getblock", json!([hash1, 1]))["tx"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !core
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "step 2: shared coin"
+    );
+
+    // Step 4: build without broadcasting.
+    let to = wallet.call("getnewaddress", json!([])).unwrap();
+    let built = wallet
+        .call(
+            "sendall",
+            json!([[to], null, "unset", 2, {"add_to_wallet": false}]),
+        )
+        .unwrap();
+    let tx: Transaction = deserialize_hex(built["hex"].as_str().unwrap()).unwrap();
+    assert!(tx.input.iter().any(|i| i.previous_output.txid == coin1));
+
+    // Step 5: invalid on BTC, valid on xBTC.
+    assert!(core.accept(&tx).is_err(), "step 5: BTC must reject it");
+    knots.accept(&tx).expect("step 5: xBTC accepts it");
+
+    // Steps 6 and 7.
+    knots.send(&tx);
+    assert!(
+        knots
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "xBTC copy spent"
+    );
+    assert!(
+        !core
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "BTC copy untouched"
     );
 }

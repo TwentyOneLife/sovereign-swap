@@ -21,11 +21,25 @@ KNOTS_TAR=bitcoin-$KNOTS_VERSION-x86_64-linux-gnu.tar.gz
 KNOTS_SHA=4c67f1139b668fc3b98e339dd16112c636b2c0f42c2294b98fb92d1d27943e24
 KNOTS_SIGNERS="1A3E761F19D2CC7785C5502EA291A2C45D0C504A"
 
+# GitHub's release CDN answers 504 now and then; gh fetches the same asset through the API.
+get() { # url file
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$2" "$1" && return
+    case $1 in
+    https://github.com/*/releases/download/*)
+        command -v gh >/dev/null || return 1
+        path=${1#https://github.com/}
+        gh release download "$(echo "$path" | cut -d/ -f5)" --repo "$(echo "$path" | cut -d/ -f1-2)" \
+            --pattern "$(basename "$1")" --output "$2" --clobber
+        ;;
+    *) return 1 ;;
+    esac
+}
+
 fetch() { # name url tarball sha keyfile signers
     dir=$DEST/$1
     mkdir -p "$dir"
     for f in "$3" SHA256SUMS SHA256SUMS.asc; do
-        [ -f "$dir/$f" ] || curl -fsSL --retry 3 -o "$dir/$f" "$2/$f"
+        [ -f "$dir/$f" ] || get "$2/$f" "$dir/$f"
     done
     echo "$4  $dir/$3" | sha256sum -c --quiet
     grep -q "^$4  $3\$" "$dir/SHA256SUMS"
