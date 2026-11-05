@@ -75,6 +75,8 @@ pub struct Engine<T: Transport> {
     records: Vec<Record>,
     /// Tests only: drop this many broadcasts instead of sending them.
     pub drop_broadcasts: u32,
+    /// Tests only: lock this amount instead of the agreed one, as a cheating counterparty would.
+    pub lock_amount_override: Option<Amount>,
 }
 
 impl<T: Transport> Engine<T> {
@@ -111,6 +113,7 @@ impl<T: Transport> Engine<T> {
             state,
             records,
             drop_broadcasts: 0,
+            lock_amount_override: None,
         })
     }
 
@@ -400,7 +403,7 @@ impl<T: Transport> Engine<T> {
                     let other = &self.nodes[&own_chain.other()].rpc;
                     let tx = self.nodes[&own_chain].fund(
                         own_contract,
-                        own_amount,
+                        self.lock_amount_override.unwrap_or(own_amount),
                         self.config.fee_rate_sat_vb,
                         self.config.policy.funding_minconf(own_chain),
                         other,
@@ -423,10 +426,10 @@ impl<T: Transport> Engine<T> {
                     .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
                 (own_chain.other(), tx)
             }
-            Action::Refund { lock } => {
+            Action::Refund { lock, value } => {
                 let spend = Spend {
                     outpoint: lock,
-                    value: own_amount,
+                    value,
                     destination: record.refund_to.clone(),
                     fee: self.config.spend_fee,
                 };

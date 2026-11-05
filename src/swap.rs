@@ -144,6 +144,8 @@ pub struct Swap {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockView {
     pub outpoint: OutPoint,
+    /// What the output actually holds; a refund must sign for this, not for the agreed amount.
+    pub value: Amount,
     /// False when the contract received a different amount than agreed.
     pub amount_ok: bool,
     /// None while unconfirmed.
@@ -179,6 +181,7 @@ pub enum Action {
     },
     Refund {
         lock: OutPoint,
+        value: Amount,
     },
 }
 
@@ -260,7 +263,10 @@ impl Swap {
         let refund_open = self.remaining(Side::Maker, own, ha).is_some_and(|r| r <= 0);
         if own.spend.is_none() && refund_open && self.phase != Phase::Claiming {
             self.phase = Phase::Refunding;
-            return vec![Action::Refund { lock: own.outpoint }];
+            return vec![Action::Refund {
+                lock: own.outpoint,
+                value: own.value,
+            }];
         }
         vec![]
     }
@@ -338,7 +344,10 @@ impl Swap {
         }
         if own.spend.is_none() && self.remaining(Side::Taker, own, hb).is_some_and(|r| r <= 0) {
             self.phase = Phase::Refunding;
-            return vec![Action::Refund { lock: own.outpoint }];
+            return vec![Action::Refund {
+                lock: own.outpoint,
+                value: own.value,
+            }];
         }
         self.phase = Phase::Locked;
         vec![]
@@ -418,6 +427,7 @@ mod tests {
     fn lock(n: u8, confirmed_height: Option<u32>) -> LockView {
         LockView {
             outpoint: outpoint(n),
+            value: Amount::from_sat(1_000_000),
             amount_ok: true,
             confirmed_height,
             spend: None,
@@ -562,7 +572,10 @@ mod tests {
         assert_eq!(s.decide(&view(138, 138, own.clone(), None), SECRET), vec![]);
         assert_eq!(
             s.decide(&view(139, 139, own, None), SECRET),
-            vec![Action::Refund { lock: outpoint(1) }]
+            vec![Action::Refund {
+                lock: outpoint(1),
+                value: Amount::from_sat(1_000_000)
+            }]
         );
         assert_eq!(s.phase, Phase::Refunding);
     }
@@ -633,7 +646,10 @@ mod tests {
         );
         assert_eq!(
             s.decide(&view(121, 121, Some(lock(1, Some(100))), own), None),
-            vec![Action::Refund { lock: outpoint(2) }]
+            vec![Action::Refund {
+                lock: outpoint(2),
+                value: Amount::from_sat(1_000_000)
+            }]
         );
     }
 

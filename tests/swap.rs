@@ -158,6 +158,11 @@ impl World {
     /// A maker selling on `maker_chain` and a taker buying, both funded, the offer published,
     /// seen, and bid for in full.
     fn parties(&self, maker_chain: Chain) -> (Party, Party) {
+        self.parties_for(maker_chain, offer(maker_chain).maker_amount)
+    }
+
+    /// As `parties`, with the taker bidding for `maker_part` of the offer.
+    fn parties_for(&self, maker_chain: Chain, maker_part: Amount) -> (Party, Party) {
         let (a, b) = memory_pair();
         let mut maker = Party::new("maker", a, &self.btc, &self.xbtc);
         let mut taker = Party::new("taker", b, &self.btc, &self.xbtc);
@@ -168,10 +173,7 @@ impl World {
         maker.engine().publish(offer.clone()).unwrap();
         taker.tick();
         assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));
-        taker
-            .engine()
-            .bid(&offer, offer.maker_amount, [9; 16])
-            .unwrap();
+        taker.engine().bid(&offer, maker_part, [9; 16]).unwrap();
         (maker, taker)
     }
 
@@ -352,5 +354,99 @@ fn engine_refuses_to_lock_coins_that_exist_on_both_chains() {
             .unwrap()
             .is_empty(),
         "nothing broadcast"
+    );
+}
+
+fn unconfirmed_balance(node: &Node, wallet: &str) -> f64 {
+    let b = node
+        .rpc
+        .wallet(wallet)
+        .call("getbalances", json!([]))
+        .unwrap();
+    b["mine"]["trusted"].as_f64().unwrap() + b["mine"]["untrusted_pending"].as_f64().unwrap()
+}
+
+/// Row 3 (`test_11_bad_itx`): the maker locks less than agreed. The taker never locks; the maker
+/// gets its own lock back.
+#[test]
+fn taker_does_not_lock_against_a_short_maker_lock() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    maker.engine().lock_amount_override = Some(Amount::from_sat(49_000_000));
+    let before = unconfirmed_balance(&w.btc, "taker");
+    w.run(&mut maker, &mut taker, 60, always, false, |m, t| {
+        t.phase() == Some(Phase::Abandoned) && m.phase() == Some(Phase::Refunded)
+    });
+    assert_eq!(
+        unconfirmed_balance(&w.btc, "taker"),
+        before,
+        "the taker spent nothing"
+    );
+}
+
+/// Row 4 (`test_10_bad_ptx`): the taker locks less than agreed. The maker never reveals the
+/// secret; both refund.
+#[test]
+fn maker_does_not_reveal_against_a_short_taker_lock() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    taker.engine().lock_amount_override = Some(Amount::from_sat(14_000_000));
+    w.run(
+        &mut maker,
+        &mut taker,
+        70,
+        always,
+        false,
+        both(Phase::Refunded),
+    );
+}
+
+/// Row 11: the taker is offline until too little of the maker's lock remains, then refuses to lock.
+#[test]
+fn a_taker_back_too_late_does_not_lock() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    taker.tick();
+    // 40-block maker lock; the taker needs 2 + 20 + 3 + 3 = 28 blocks left when it locks.
+    for _ in 0..15 {
+        maker.tick();
+        w.mine();
+    }
+    w.run(&mut maker, &mut taker, 50, always, false, |m, t| {
+        t.phase() == Some(Phase::Abandoned) && m.phase() == Some(Phase::Refunded)
+    });
+}
+
+/// Row 13 (`test_04_ltc_btc_redeem_reorg`): the block holding the taker's claim is reorged out.
+/// The engine keeps watching and the swap completes.
+#[test]
+fn swap_completes_after_the_takers_claim_is_reorged_out() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    w.run(&mut maker, &mut taker, 30, always, false, |_, t| {
+        t.phase() == Some(Phase::Claiming)
+    });
+    w.xbtc.mine(1);
+    let tip = w.xbtc.call("getbestblockhash", json!([]));
+    w.xbtc.call("invalidateblock", json!([tip]));
+    taker.tick();
+    assert_eq!(
+        taker.phase(),
+        Some(Phase::Claiming),
+        "not done while the claim is unconfirmed"
+    );
+    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+}
+
+/// Row 15 (`test_15_variable_amount`): the taker takes 40 % of the offer.
+#[test]
+fn a_partial_bid_swaps_the_proportional_amount() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties_for(Chain::Xbtc, Amount::from_sat(20_000_000));
+    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+    let swap = maker.engine().swaps().next().unwrap().clone();
+    assert_eq!(
+        (swap.maker_part, swap.taker_part),
+        (Amount::from_sat(20_000_000), Amount::from_sat(6_000_000))
     );
 }
