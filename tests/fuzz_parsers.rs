@@ -186,3 +186,19 @@ mod envelope_fuzz {
         }
     }
 }
+
+mod nostr_fuzz {
+    use super::{iters, Rng};
+    use sovereign_swap::nostr::Event;
+
+    #[test]
+    fn event_from_json_never_panics_on_random_bytes() {
+        let mut rng = Rng(0x4059_1234);
+        for _ in 0..iters(300_000) {
+            let len = rng.below(400);
+            let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            // Must only ever return Err, never panic.
+            let _ = Event::from_json(&bytes);
+        }
+    }
+}

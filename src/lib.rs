@@ -5,6 +5,7 @@ pub mod envelope;
 pub mod htlc;
 pub mod keys;
 pub mod node;
+pub mod nostr;
 pub mod policy;
 pub mod replay;
 pub mod rpc;
