@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -419,6 +419,20 @@ fn serve_landing(mut stream: &TcpStream) {
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
+    let _ = stream.flush();
+    // The request was only peeked, so its bytes are still unread. Closing a socket with unread data
+    // makes the kernel send RST, which discards any unacknowledged response bytes and truncates the
+    // page over a high-latency path (it arrived whole on a LAN but cut off over Tor). Half-close the
+    // write side to mark the end of the response, then drain the request so the socket closes with a
+    // clean FIN.
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut sink = [0u8; 1024];
+    while let Ok(n) = stream.read(&mut sink) {
+        if n == 0 {
+            break;
+        }
+    }
 }
 
 /// The browser-facing page. Self-contained (no external assets), and deliberately plain: it states
