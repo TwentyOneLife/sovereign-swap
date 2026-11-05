@@ -50,6 +50,15 @@ clean sans, flat cards, generous whitespace, no gradients or marketing chrome, p
 Nostr live in the footer. Every screen states the sovereign facts plainly: non-custodial, keys never
 leave the node, no account. This is the same palette the relay's landing page already uses.
 
+### Responsive, and mobile without a native app
+
+The GUI is a responsive web app (mobile-first layout, breakpoints), so it runs on a phone browser with
+no native app. But the daemon is loopback-only, so a phone cannot reach `127.0.0.1` on the node. The
+sovereign way to reach it from a phone is the node's own authenticated tunnel: StartOS gives the
+packaged client (M4c) a **Tor onion** (the same path the relay took), so the phone's Tor browser opens
+the responsive GUI over Tor. The loopback API is never exposed to the LAN; "mobile" is the responsive
+page served over the node's onion.
+
 ## Screens
 
 ### Shell (header + footer on every screen)
@@ -125,6 +134,18 @@ leave the node, no account. This is the same palette the relay's landing page al
 │                                   [ Save ]                     │ ← orange
 └──────────────────────────────────────────────────────────────┘
 ```
+
+#### Node connection: StartOS config, not the web frontend
+
+On a StartOS node the **node RPC connection is set in the StartOS package config, not the web GUI** -
+a config Action like the relay's "Relay limits", but better: a **dependency-wired node selection** (the
+way electrs/mempool pick their bitcoind), so StartOS hands the daemon the chosen node's RPC address and
+cookie automatically. The person never types a host, port, or credential into a web page, and the
+daemon never takes them from the untrusted frontend. It is a **separate config** from the relay's (a
+different package: the swap client vs the relay). The web GUI then shows the node fields **read-only**
+(address + reachability) and the person edits only the swap-level preferences (relays, policy, signer)
+there. Off StartOS (a plain daemon), the free-text fields above apply; the daemon reads whichever source
+wrote its `settings.json`.
 
 ## Daemon API (local, authenticated)
 
