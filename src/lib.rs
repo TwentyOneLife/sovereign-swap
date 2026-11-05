@@ -14,3 +14,4 @@ pub mod rpc;
 pub mod store;
 pub mod swap;
 pub mod transport;
+pub mod ws;

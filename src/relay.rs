@@ -44,3 +44,32 @@ impl Relay {
         (matched, events.len())
     }
 }
+
+use crate::routing::RelayConn;
+
+/// A `RelayConn` over the in-process `Relay`, tracking this party's read cursor.
+pub struct InProcessConn {
+    relay: Relay,
+    cursor: Mutex<usize>,
+}
+
+impl InProcessConn {
+    pub fn new(relay: Relay) -> InProcessConn {
+        InProcessConn {
+            relay,
+            cursor: Mutex::new(0),
+        }
+    }
+}
+
+impl RelayConn for InProcessConn {
+    fn publish(&self, event: crate::nostr::Event) {
+        self.relay.publish(event);
+    }
+    fn poll(&self, subscriber: &bitcoin::secp256k1::XOnlyPublicKey) -> Vec<crate::nostr::Event> {
+        let mut cursor = self.cursor.lock().unwrap();
+        let (events, next) = self.relay.query(*cursor, subscriber);
+        *cursor = next;
+        events
+    }
+}

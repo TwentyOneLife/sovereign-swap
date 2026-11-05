@@ -5,16 +5,16 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, PubkeyHash};
 
 use sovereign_swap::envelope::Identity;
-use sovereign_swap::relay::Relay;
+use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::swap::{Chain, Message, Offer};
 use sovereign_swap::transport::Transport;
 
-fn party(relay: &Relay, id_seed: u8, routing_seed: u8) -> RelayTransport {
+fn party(relay: &Relay, id_seed: u8, routing_seed: u8) -> RelayTransport<InProcessConn> {
     RelayTransport::new(
         Identity::from_seed(&[id_seed; 32]),
         &[routing_seed; 32],
-        relay.clone(),
+        InProcessConn::new(relay.clone()),
     )
 }
 

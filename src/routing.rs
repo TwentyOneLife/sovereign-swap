@@ -13,37 +13,42 @@ use crate::envelope::{
     open, seal, sign_broadcast, verify_broadcast, Identity, PublicIdentity, PUBLIC_IDENTITY_LEN,
 };
 use crate::nostr::{p_tag, Event};
-use crate::relay::Relay;
 use crate::swap::Message;
 use crate::transport::Transport;
 
 /// A peer as this party has learned it: its relay routing key and its envelope identity.
 type Peer = (XOnlyPublicKey, PublicIdentity);
 
-pub struct RelayTransport {
+/// A connection to one or more relays. An in-process `Relay` and a real WebSocket relay both
+/// implement it, so the routing below is written once and runs over either.
+pub trait RelayConn {
+    fn publish(&self, event: Event);
+    /// Events newly arrived for `subscriber` (addressed to it or broadcast, never its own), deduped.
+    fn poll(&self, subscriber: &XOnlyPublicKey) -> Vec<Event>;
+}
+
+pub struct RelayTransport<C: RelayConn> {
     me: Identity,
     routing: Keypair,
     routing_key: XOnlyPublicKey,
-    relay: Relay,
+    conn: C,
     secp: Secp256k1<All>,
-    cursor: Mutex<usize>,
     /// offer id -> the maker of that offer.
     offers: Mutex<HashMap<[u8; 16], Peer>>,
     /// swap id -> the counterparty of that swap.
     swaps: Mutex<HashMap<[u8; 16], Peer>>,
 }
 
-impl RelayTransport {
-    pub fn new(me: Identity, routing_seed: &[u8; 32], relay: Relay) -> RelayTransport {
+impl<C: RelayConn> RelayTransport<C> {
+    pub fn new(me: Identity, routing_seed: &[u8; 32], conn: C) -> RelayTransport<C> {
         let secp = Secp256k1::new();
         let routing = Keypair::from_seckey_slice(&secp, routing_seed).expect("valid scalar");
         RelayTransport {
             routing_key: routing.x_only_public_key().0,
             me,
             routing,
-            relay,
+            conn,
             secp,
-            cursor: Mutex::new(0),
             offers: Mutex::new(HashMap::new()),
             swaps: Mutex::new(HashMap::new()),
         }
@@ -74,7 +79,7 @@ impl RelayTransport {
     }
 }
 
-impl Transport for RelayTransport {
+impl<C: RelayConn> Transport for RelayTransport<C> {
     fn send(&self, message: &Message) {
         let payload = serde_json::to_vec(message).expect("a Message serializes");
         let (tags, envelope) = match message {
@@ -119,15 +124,11 @@ impl Transport for RelayTransport {
             tags,
             &self.frame(envelope),
         );
-        self.relay.publish(event);
+        self.conn.publish(event);
     }
 
     fn receive(&self) -> Vec<Message> {
-        let mut cursor = self.cursor.lock().unwrap();
-        let (events, next) = self.relay.query(*cursor, &self.routing_key);
-        *cursor = next;
-        drop(cursor);
-
+        let events = self.conn.poll(&self.routing_key);
         let mut out = Vec::new();
         for event in events {
             if event.verify(&self.secp).is_err() {

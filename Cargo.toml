@@ -17,4 +17,6 @@ x25519-dalek = { version = "=3.0.0", default-features = false, features = ["stat
 aes-gcm = "=0.11.1"
 hkdf = "=0.13.0"
 sha2 = "=0.11.1"
+# WebSocket client for Nostr relays (M3b-3), no TLS/async: Tor-first ws:// over a SOCKS5 tunnel.
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 serde_json = "=1.0.154"
