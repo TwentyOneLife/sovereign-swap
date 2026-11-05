@@ -5,7 +5,7 @@
 //! It is the driver the homelab's module 13 runs against the lab relay, to prove the relay carries
 //! a real swap (clean, and again while the relay is under a flood). It is gated on three env vars
 //! and skips with a note when they are absent, exactly as `regtest.rs` skips without node binaries:
-//!   RELAY         ws:// URL of the relay (e.g. ws://10.13.37.61:7777/)
+//!   RELAY         ws:// URL of the relay (e.g. ws://<relay-host>:7777/)
 //!   BTC_BITCOIND  path to a Bitcoin Core binary       (via common::binaries)
 //!   XBTC_BITCOIND path to a Bitcoin Knots BLAKE2b binary
 //!
@@ -116,7 +116,7 @@ impl Drop for Party {
 #[test]
 fn a_full_swap_settles_over_the_real_relay() {
     let Ok(relay_url) = std::env::var("RELAY") else {
-        eprintln!("skipped: set RELAY to the relay ws:// URL (e.g. ws://10.13.37.61:7777/)");
+        eprintln!("skipped: set RELAY to the relay ws:// URL (e.g. ws://<relay-host>:7777/)");
         return;
     };
     let Some((btc, xbtc)) = binaries() else {
