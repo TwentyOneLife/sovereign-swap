@@ -36,7 +36,11 @@ An event is `{id, pubkey, created_at, kind, tags, content, sig}`.
 
 - **M3b-1 (this doc's first PR): the event layer.** `src/nostr.rs`: build, serialize, id, sign, and
   verify an event; parse one from the wire; NIP-01 canonical escaping. Pure, tested, no network.
-- **M3b-2: an in-process relay and a routing client.** A `Relay` that stores events and serves REQ
+- **M3b-2: an in-process relay and a routing client. Done.** `src/relay.rs` (store-and-forward,
+  dedup, filter by kind and `p` tag, never your own events) and `src/routing.rs`
+  (`RelayTransport`: broadcast offers, route bids/steps to the peer learned from the signed offer,
+  seal to its identity). Tests: an offer reaches two takers, a bid reaches only the maker, a forged
+  event is dropped, and a full swap routes over the relay. Original note: A `Relay` that stores events and serves REQ
   subscriptions (by kind and by `p` tag) with dedup, and a `RelayTransport` implementing
   `ByteTransport` over it: publish our events, subscribe for ours, dedupe by event id. Routing: a
   taker subscribes to the kind to find offers; a bid is addressed to the maker's routing key from the

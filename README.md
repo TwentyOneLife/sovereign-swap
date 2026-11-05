@@ -15,6 +15,9 @@ asset. The ticker "xBTC" is also used by unrelated tokens.
 
 ## Design
 
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the component and data-flow diagrams (message
+  plane over Nostr, settlement plane on the two chains).
+
 - [`docs/design/0001-htlc-and-replay-guard.md`](docs/design/0001-htlc-and-replay-guard.md): the
   contract, why it checks the secret's size, and why BTC transactions must not be replayable on xBTC.
 - [`docs/design/0002-swap-engine.md`](docs/design/0002-swap-engine.md): the state machine, the
