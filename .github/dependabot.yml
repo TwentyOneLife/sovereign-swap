@@ -1,0 +1,17 @@
+# Actions are pinned by commit and the base image by digest; Dependabot keeps those pins fresh.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: ci }
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: image }
+  # Crates are pinned exactly in Cargo.toml; a bump touches consensus-adjacent code and gets read.
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    commit-message: { prefix: deps }
+    labels: [dependencies]
