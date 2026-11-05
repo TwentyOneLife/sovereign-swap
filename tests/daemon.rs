@@ -200,3 +200,34 @@ fn events_stream_opens_as_sse() {
         "no initial stream comment: {text}"
     );
 }
+
+#[test]
+fn the_gui_is_served_with_the_token_injected() {
+    let (addr, token) = daemon();
+    // The page loads without the token (the browser fetches it fresh); the token is injected into it.
+    let (code, body) = request(&addr, "GET", "/", None, "");
+    assert_eq!(code, 200, "GUI page not served");
+    assert!(
+        body.contains("sovereign-swap"),
+        "not the GUI html: {}",
+        &body[..body.len().min(80)]
+    );
+    assert!(
+        body.contains(&token),
+        "API token not injected into the page"
+    );
+    assert!(
+        !body.contains("__TOKEN__"),
+        "token placeholder left in the page"
+    );
+    assert_eq!(
+        request(&addr, "GET", "/app.js", None, "").0,
+        200,
+        "app.js not served"
+    );
+    assert_eq!(
+        request(&addr, "GET", "/app.css", None, "").0,
+        200,
+        "app.css not served"
+    );
+}

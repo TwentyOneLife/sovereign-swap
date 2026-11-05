@@ -45,6 +45,12 @@ use wire::{
     read_request, reason, valid_id, Request,
 };
 
+/// The GUI (design 0009), embedded in the binary and served on the loopback API. `index.html` carries
+/// a `__TOKEN__` placeholder the daemon fills with the API token before serving it.
+const INDEX_HTML: &str = include_str!("../gui/index.html");
+const APP_CSS: &str = include_str!("../gui/app.css");
+const APP_JS: &str = include_str!("../gui/app.js");
+
 struct DaemonState {
     settings: Settings,
     offers: Vec<Offer>,
@@ -204,8 +210,47 @@ impl Daemon {
             }
             return;
         }
+        // The GUI itself is served without the token (a cross-origin site cannot read the response,
+        // so it cannot steal the token injected into the page); the API it then calls still needs it.
+        if req.method == "GET" {
+            match req.path.as_str() {
+                "/" | "/index.html" => {
+                    let page = INDEX_HTML.replace("__TOKEN__", &self.token);
+                    return self.write_asset(
+                        &mut stream,
+                        "text/html; charset=utf-8",
+                        page.as_bytes(),
+                    );
+                }
+                "/app.css" => {
+                    return self.write_asset(
+                        &mut stream,
+                        "text/css; charset=utf-8",
+                        APP_CSS.as_bytes(),
+                    )
+                }
+                "/app.js" => {
+                    return self.write_asset(
+                        &mut stream,
+                        "application/javascript; charset=utf-8",
+                        APP_JS.as_bytes(),
+                    )
+                }
+                _ => {}
+            }
+        }
         let (status, body) = self.route(&req);
         self.write_json(&mut stream, status, &body);
+    }
+
+    fn write_asset(&self, stream: &mut TcpStream, content_type: &str, body: &[u8]) {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
     }
 
     fn write_json(&self, stream: &mut TcpStream, status: u16, body: &Value) {
