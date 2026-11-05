@@ -327,6 +327,15 @@ impl<T: Transport> Engine<T> {
         self.save_state()
     }
 
+    /// The live on-chain view of swap `id` (both locks' txids, confirmations and heights), or `None`
+    /// if there is no such swap. Queries the nodes, so a caller asks for it on demand, not every tick.
+    pub fn chain_view(&self, id: [u8; 16]) -> Option<Result<ChainView, EngineError>> {
+        self.records
+            .iter()
+            .find(|r| r.swap.id == id)
+            .map(|r| self.view(r))
+    }
+
     fn view(&self, record: &Record) -> Result<ChainView, EngineError> {
         let swap = &record.swap;
         let (a, b) = (

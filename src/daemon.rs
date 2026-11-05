@@ -30,7 +30,9 @@ use crate::node::ChainNode;
 use crate::policy::Policy;
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
-use crate::swap::{Chain as SwapChain, Offer as SwapOffer, Phase, Role, Swap};
+use crate::swap::{
+    Chain as SwapChain, ChainView, LockView, Offer as SwapOffer, Phase, Role, Side, Swap,
+};
 use crate::ws::WsConn;
 
 /// How often the engine thread drives a swap forward when no command arrives.
@@ -497,11 +499,9 @@ impl Daemon {
         if !self.engine_running() {
             return (404, json!({"error": "no such swap"}));
         }
-        match self.engine_call(EngineCmd::Swaps) {
-            Ok(swaps) => match swaps.iter().find(|s| s.id == id) {
-                Some(s) => (200, s.to_json()),
-                None => (404, json!({"error": "no such swap"})),
-            },
+        match self.engine_call(move |reply| EngineCmd::Detail(id, reply)) {
+            Ok(Some(detail)) => (200, detail),
+            Ok(None) => (404, json!({"error": "no such swap"})),
             Err(e) => (503, json!({ "error": e })),
         }
     }
@@ -601,6 +601,8 @@ enum EngineCmd {
     Publish(SwapOffer, Sender<Result<(), String>>),
     Offers(Sender<Vec<SwapOffer>>),
     Swaps(Sender<Vec<SwapView>>),
+    /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
+    Detail([u8; 16], Sender<Option<Value>>),
     Take {
         offer_id: [u8; 16],
         maker_part: Amount,
@@ -706,6 +708,26 @@ fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTransport<WsConn>>
             let views = engine.swaps().map(SwapView::of).collect();
             let _ = reply.send(views);
         }
+        EngineCmd::Detail(id, reply) => {
+            // Static view first (ends the swaps() borrow), then the live chain view.
+            let base = engine.swaps().find(|s| s.id == id).map(|s| {
+                (
+                    SwapView::of(s).to_json(),
+                    s.own_side(),
+                    s.offer.maker_lock_blocks,
+                    s.offer.taker_lock_blocks,
+                )
+            });
+            let detail = base.map(|(mut j, side, mlb, tlb)| {
+                match engine.chain_view(id) {
+                    Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
+                    Some(Err(e)) => j["chain_error"] = json!(format!("{e:?}")),
+                    None => {}
+                }
+                j
+            });
+            let _ = reply.send(detail);
+        }
         EngineCmd::Take {
             offer_id,
             maker_part,
@@ -752,6 +774,45 @@ fn offer_to_json(o: &SwapOffer) -> Value {
         "maker_lock_blocks": o.maker_lock_blocks,
         "taker_lock_blocks": o.taker_lock_blocks,
     })
+}
+
+/// The live chain view for the swap-detail screen: heights, each lock's txid and confirmations, and
+/// the countdown until our own lock can be refunded.
+fn chain_view_json(
+    view: &ChainView,
+    own_side: Side,
+    maker_lock_blocks: u16,
+    taker_lock_blocks: u16,
+) -> Value {
+    let (own_lock, own_height, own_lock_blocks) = match own_side {
+        Side::Maker => (&view.maker_lock, view.maker_chain_height, maker_lock_blocks),
+        Side::Taker => (&view.taker_lock, view.taker_chain_height, taker_lock_blocks),
+    };
+    // Refundable at confirmed_height + lock_blocks - 1; negative means it is already available.
+    let refund_in = own_lock
+        .as_ref()
+        .and_then(|l| l.confirmed_height)
+        .map(|h| i64::from(h) + i64::from(own_lock_blocks) - 1 - i64::from(own_height));
+    json!({
+        "maker_height": view.maker_chain_height,
+        "taker_height": view.taker_chain_height,
+        "maker_lock": lock_json(&view.maker_lock, view.maker_chain_height),
+        "taker_lock": lock_json(&view.taker_lock, view.taker_chain_height),
+        "refund_in_blocks": refund_in,
+    })
+}
+
+fn lock_json(lock: &Option<LockView>, height: u32) -> Value {
+    match lock {
+        Some(l) => json!({
+            "txid": l.outpoint.txid.to_string(),
+            "vout": l.outpoint.vout,
+            "confirmations": l.confirmed_height.map(|h| height.saturating_sub(h) + 1),
+            "amount_ok": l.amount_ok,
+            "spent": l.spend.is_some(),
+        }),
+        None => Value::Null,
+    }
 }
 
 fn chain_str(c: SwapChain) -> &'static str {
@@ -967,5 +1028,34 @@ fn reason(status: u16) -> &'static str {
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::OutPoint;
+
+    #[test]
+    fn chain_detail_reports_confirmations_and_refund_countdown() {
+        let lock = LockView {
+            outpoint: OutPoint::null(),
+            value: Amount::from_sat(500_000),
+            amount_ok: true,
+            confirmed_height: Some(100),
+            spend: None,
+        };
+        let view = ChainView {
+            maker_chain_height: 105,
+            taker_chain_height: 50,
+            maker_lock: Some(lock),
+            taker_lock: None,
+        };
+        // We are the maker, so our lock is on the maker chain with 40 lock blocks.
+        let j = chain_view_json(&view, Side::Maker, 40, 20);
+        assert_eq!(j["maker_lock"]["confirmations"], 6); // 105 - 100 + 1
+        assert_eq!(j["refund_in_blocks"], 34); // 100 + 40 - 1 - 105
+        assert_eq!(j["taker_lock"], Value::Null);
+        assert_eq!(j["maker_lock"]["spent"], false);
     }
 }

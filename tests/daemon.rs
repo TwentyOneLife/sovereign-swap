@@ -173,15 +173,24 @@ fn events_stream_needs_the_token() {
 fn events_stream_opens_as_sse() {
     let (addr, token) = daemon();
     let mut sock = TcpStream::connect(&addr).unwrap();
-    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
     sock.write_all(
         format!("GET /events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n")
             .as_bytes(),
     )
     .unwrap();
+    // The stream opens and sends the headers + initial comment; read until we have them (the server
+    // writes in a couple of chunks, so a single read can race under parallel load).
+    let mut text = String::new();
     let mut buf = [0u8; 512];
-    let n = sock.read(&mut buf).unwrap_or(0);
-    let text = String::from_utf8_lossy(&buf[..n]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && !text.contains(": connected") {
+        match sock.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => {}
+        }
+    }
     assert!(
         text.contains("text/event-stream"),
         "not an SSE stream: {text}"
