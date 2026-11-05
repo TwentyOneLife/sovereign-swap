@@ -222,3 +222,55 @@ fn an_oversized_valid_event_is_rejected_by_the_size_cap() {
         "oversized valid event was not rejected by the size cap: {replies:?}"
     );
 }
+
+#[test]
+fn a_browser_get_gets_the_landing_page_not_a_websocket() {
+    use std::io::{Read, Write};
+
+    let url = relay(RelayConfig::default());
+    // ws://127.0.0.1:PORT/ -> 127.0.0.1:PORT
+    let addr = url.trim_start_matches("ws://").trim_end_matches('/');
+
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: relay.local\r\nAccept: text/html\r\n\r\n")
+        .unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(600))).ok();
+
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match sock.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK"),
+        "status line: {text:.40}"
+    );
+    assert!(text.contains("text/html"), "content type missing");
+    assert!(text.contains("sovereign-swap relay"), "title missing");
+    assert!(
+        text.contains("Do not send any coins"),
+        "funds warning missing"
+    );
+    assert!(text.contains("4859"), "kind missing");
+}
+
+#[test]
+fn a_websocket_client_still_reaches_the_relay_after_the_landing_branch() {
+    // The peek-based classifier must not disturb a real WebSocket client.
+    let url = relay(RelayConfig::default());
+    let secp = Secp256k1::new();
+    let ev = Event::build(&secp, &key(9), Event::now_for_test(), vec![], &[4, 2]);
+    let replies = send_and_read(&url, &format!(r#"["EVENT",{}]"#, ev.to_json()));
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("\"OK\"") && r.contains("true")),
+        "websocket EVENT was not accepted: {replies:?}"
+    );
+}
