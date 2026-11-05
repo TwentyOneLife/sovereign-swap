@@ -27,6 +27,14 @@ asset. The ticker "xBTC" is also used by unrelated tokens.
 - [`docs/edge-cases.md`](docs/edge-cases.md): every failure scenario taken over from BasicSwap, with
   the test that covers it.
 
+## Running a relay
+
+`sovereign-swap-relay` is a hardened Nostr relay that carries only swap events (kind 4859): it
+verifies every event, serves one kind, caps event size, rate-limits per connection, and bounds its
+store with a time-to-live. Run it with `cargo run --bin sovereign-swap-relay`; configure it from the
+environment (`RELAY_BIND`, `RELAY_MAX_EVENT_BYTES`, `RELAY_MAX_CONNECTIONS`, `RELAY_MAX_EVENTS_PER_MIN`,
+`RELAY_STORE_CAP`, `RELAY_RETENTION_SECS`). Anyone can run one; clients list several.
+
 ## Tests
 
 ```

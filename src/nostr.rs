@@ -143,6 +143,14 @@ impl Event {
             .map_err(|_| NostrError::BadSignature)
     }
 
+    /// A timestamp for tests, so events are inside any retention window.
+    pub fn now_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     pub fn to_json(&self) -> String {
         let tags: Vec<String> = self
             .tags
