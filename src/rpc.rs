@@ -33,6 +33,10 @@ impl Client {
         }
     }
 
+    pub fn host_port(&self) -> &str {
+        &self.host_port
+    }
+
     pub fn wallet(&self, name: &str) -> Client {
         Client {
             path: format!("/wallet/{name}"),

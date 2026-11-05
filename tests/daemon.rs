@@ -2,12 +2,17 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use sovereign_swap::daemon::Daemon;
 
+static NEXT: AtomicU32 = AtomicU32::new(0);
+
 fn daemon() -> (String, String) {
-    let dir = std::env::temp_dir().join(format!("sovswap-daemon-{}", std::process::id()));
+    // A unique data dir per daemon, so tests running in parallel do not share token/settings/state.
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sovswap-daemon-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     Daemon::open(&dir).unwrap().spawn().unwrap()
 }
