@@ -180,18 +180,27 @@ impl NewOffer {
             Chain::Btc => SwapChain::Btc,
             Chain::Xbtc => SwapChain::Xbtc,
         };
-        let taker_amount = (self.amount_sat as f64 * self.price).round() as u64;
+        let taker_amount = Amount::from_sat((self.amount_sat as f64 * self.price).round() as u64);
+        let maker_amount = Amount::from_sat(self.amount_sat);
+        let margin = s.margin_blocks as u32;
+        // Size the timelocks to the amount from policy, so a larger offer (needing deeper
+        // confirmations) is not rejected for too-short locks. Fall back to the fixed defaults if the
+        // amount is above the policy table; the engine then returns the precise error.
+        let (maker_lock_blocks, taker_lock_blocks) = engine_config(s)
+            .policy
+            .min_lock_blocks(maker_chain, maker_amount, taker_amount, 1, 1, margin)
+            .unwrap_or((MAKER_LOCK_BLOCKS, TAKER_LOCK_BLOCKS));
         SwapOffer {
             id: random16(),
             maker_chain,
-            maker_amount: Amount::from_sat(self.amount_sat),
-            taker_amount: Amount::from_sat(taker_amount),
+            maker_amount,
+            taker_amount,
             min_maker_amount: Amount::from_sat(self.min_amount_sat),
-            maker_lock_blocks: MAKER_LOCK_BLOCKS,
-            taker_lock_blocks: TAKER_LOCK_BLOCKS,
+            maker_lock_blocks,
+            taker_lock_blocks,
             maker_lock_depth: 1,
             taker_lock_depth: 1,
-            margin_blocks: s.margin_blocks as u32,
+            margin_blocks: margin,
         }
     }
 }

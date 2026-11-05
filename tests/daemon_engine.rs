@@ -99,11 +99,10 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
     // Let both engines' relay subscriptions register before the offer is published.
     std::thread::sleep(Duration::from_millis(500));
 
-    // Publish via the API. A small amount, so the default 40/20 timelocks satisfy policy (the
-    // engine correctly rejects too-short locks for large amounts; sizing the daemon defaults from
-    // policy per amount is a later refinement).
+    // Publish a 0.5 BTC offer via the API. The daemon sizes the timelocks to the amount from
+    // policy, so this is accepted where a fixed 40/20 default would be rejected as too short.
     let offer =
-        r#"{"sell_chain":"xbtc","amount_sat":500000,"price":0.997,"min_amount_sat":500000}"#;
+        r#"{"sell_chain":"xbtc","amount_sat":50000000,"price":0.997,"min_amount_sat":50000000}"#;
     let (code, body) = request(&maker, "POST", "/offers", &maker_tok, offer);
     assert_eq!(code, 200, "publish failed: {body}");
 
@@ -112,7 +111,7 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
     let mut seen = false;
     while Instant::now() < deadline {
         let (_, list) = request(&taker, "GET", "/offers", &taker_tok, "");
-        if list.contains("\"amount_sat\":500000") && list.contains("\"sell_chain\":\"xbtc\"") {
+        if list.contains("\"amount_sat\":50000000") && list.contains("\"sell_chain\":\"xbtc\"") {
             seen = true;
             break;
         }
