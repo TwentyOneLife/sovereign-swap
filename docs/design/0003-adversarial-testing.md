@@ -44,6 +44,10 @@ No network, no Kali; runs in CI on every change.
   depth up to the policy's final depth; our side must recover or complete, never settle early.
 - **Property test of the state machine**: random event sequences fed to `Swap::decide`, asserting the
   invariant and that no reachable state both claims and refunds the same lock.
+- **Throughput and isolation** (`tests/load.rs`, landed): many swaps between one maker and taker at
+  once (default 30, run at 100), every one must settle, no key index reused across swaps, no swap's
+  lock funded from another's coin. 100 concurrent swaps settle in 6 confirmation rounds; throughput
+  is bounded by block confirmations and node RPC, not by the engine.
 
 ### B. Wire and post-quantum envelope (with M3)
 
