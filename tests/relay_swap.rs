@@ -14,7 +14,7 @@ use sovereign_swap::engine::{Config, Engine};
 use sovereign_swap::envelope::Identity;
 use sovereign_swap::node::ChainNode;
 use sovereign_swap::policy::Policy;
-use sovereign_swap::relay::Relay;
+use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::swap::{Chain, Offer, Phase};
 
@@ -49,7 +49,7 @@ fn offer() -> Offer {
 struct Party {
     dir: PathBuf,
     name: &'static str,
-    engine: Engine<RelayTransport>,
+    engine: Engine<RelayTransport<InProcessConn>>,
 }
 
 impl Party {
@@ -66,7 +66,7 @@ impl Party {
         let tp = RelayTransport::new(
             Identity::from_seed(&[id_seed; 32]),
             &[routing_seed; 32],
-            relay.clone(),
+            InProcessConn::new(relay.clone()),
         );
         let open = |n: &Node| ChainNode::open(n.rpc.clone(), name).unwrap();
         let engine = Engine::open(&dir, open(btc), open(xbtc), tp, config()).unwrap();

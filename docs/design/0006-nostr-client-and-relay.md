@@ -45,11 +45,16 @@ An event is `{id, pubkey, created_at, kind, tags, content, sig}`.
   `ByteTransport` over it: publish our events, subscribe for ours, dedupe by event id. Routing: a
   taker subscribes to the kind to find offers; a bid is addressed to the maker's routing key from the
   signed offer. This runs the multi-peer offer/bid flow in CI with no network.
-- **M3b-3: the real wire.** A WebSocket client (NIP-01 `EVENT`/`REQ`/`EOSE`/`CLOSE`) over a SOCKS
-  proxy (Tor), talking to a real relay (`sovereign-swap-relay`). Dependency decision to verify first:
-  a pinned WebSocket crate (e.g. tungstenite) versus a minimal hand-rolled RFC 6455 client; prefer
-  the smallest verifiable option. List several relays; a dead or censoring one must not endanger a
-  swap.
+- **M3b-3: the real wire. Done (code).** `src/ws.rs`: `WsConn`, a `RelayConn` over a real relay via
+  WebSocket. Decision taken: **tungstenite** (pinned `=0.30.0`, blocking, no TLS, `handshake`
+  feature) for the RFC 6455 framing, plus a hand-rolled SOCKS5 connector (~40 lines, no dependency)
+  so an `.onion` is dialed inside Tor. Tor-first means plain `ws://` inside the Tor circuit (content
+  is end-to-end encrypted by the envelope); clearnet `wss://` (rustls) is a later option. One owner
+  thread holds the socket, draining publishes and buffering a `REQ` subscription's events; routing
+  is the same generic code as the in-process relay (`RelayConn`). Tested in CI against a localhost
+  toy relay (`tests/ws_relay.rs`): the tungstenite handshake, NIP-01 framing and multi-peer routing
+  over real WebSocket frames. Tor interop against a live relay is a manual check (the relay address
+  is operator config, never in this repo).
 - **M3c: DoS and protocol-fuzz** the relay from the homelab Kali VM (design 0003 Layer C, issue #58).
 
 ## Test plan
