@@ -30,3 +30,13 @@ done while one of its rows lacks a passing test.
 | 21 | Counterparty sets low confirmation depths in its offer (no BasicSwap equivalent here: there each side configures its own) | the taker must not lock against a shallow lock because the maker asked for it | M2 | unit `an_offer_cannot_lower_the_depths_that_protect_us`, `the_taker_waits_for_its_own_depth_not_the_offers` |
 | 22 | Spend final too early on a weak chain | a reorg deeper than our "done" depth could undo our claim after we stopped watching | M2 | unit `a_claim_on_xbtc_is_watched_until_the_xbtc_final_depth` |
 | 23 | Lock funded from unconfirmed coins | our lock vanishes with its parent | M2 | `minconf` in `ChainNode::fund`, per chain in `Policy` |
+
+## Fuzzing and adversarial tests
+
+See `docs/design/0003-adversarial-testing.md`. Beyond the rows above:
+
+| Target | Test | Property |
+|---|---|---|
+| Contract-script parser | `from_script_never_panics_and_only_accepts_round_tripping_scripts` | hostile bytes never panic; accepted only if byte-for-byte a template |
+| Counterparty-script check | `check_script_never_panics_on_a_hostile_counterparty_script` | hostile bytes never panic; accepted only on an exact match |
+| Preimage extraction | `extract_preimage_never_panics_and_only_returns_the_real_secret` | hostile witnesses never panic; a returned value's hash is the secret |

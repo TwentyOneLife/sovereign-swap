@@ -1,0 +1,168 @@
+//! Hostile-input fuzzing of the parsers that read data from a counterparty or the chain, see
+//! `docs/design/0003-adversarial-testing.md`. A counterparty controls the bytes of the contract
+//! script it sends and of the witnesses it puts on chain, so these functions must never panic,
+//! loop forever or accept something that does not round-trip, whatever the input.
+//!
+//! Deterministic: a seeded xorshift PRNG, so a failure reprints the seed to reproduce it. Raise the
+//! iteration counts with SOVSWAP_FUZZ_ITERS for a longer soak.
+
+use bitcoin::blockdata::transaction::Version;
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::{
+    absolute, Amount, OutPoint, PubkeyHash, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
+};
+
+use sovereign_swap::htlc::{extract_preimage, Contract};
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        // xorshift64*; fixed, so a seed reproduces a run exactly.
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn byte(&mut self) -> u8 {
+        self.next() as u8
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn bytes(&mut self, max: usize) -> Vec<u8> {
+        let len = self.below(max + 1);
+        (0..len).map(|_| self.byte()).collect()
+    }
+}
+
+fn iters(default: u64) -> u64 {
+    std::env::var("SOVSWAP_FUZZ_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn contract(rng: &mut Rng) -> Contract {
+    Contract {
+        secret_hash: std::array::from_fn(|_| rng.byte()),
+        claim_pkh: PubkeyHash::from_byte_array(std::array::from_fn(|_| rng.byte())),
+        refund_pkh: PubkeyHash::from_byte_array(std::array::from_fn(|_| rng.byte())),
+        lock_blocks: (rng.next() as u16) | 1,
+    }
+}
+
+/// Builds bytes that are usually close to a real contract script, so the parser's branches are
+/// reached, not just rejected at byte 0.
+fn scriptish(rng: &mut Rng) -> Vec<u8> {
+    let mut bytes = contract(rng).script().into_bytes();
+    for _ in 0..rng.below(6) {
+        if bytes.is_empty() {
+            break;
+        }
+        match rng.below(4) {
+            0 => {
+                let at = rng.below(bytes.len());
+                bytes[at] = rng.byte();
+            }
+            1 => {
+                let at = rng.below(bytes.len() + 1);
+                bytes.insert(at, rng.byte());
+            }
+            2 => {
+                let at = rng.below(bytes.len());
+                bytes.remove(at);
+            }
+            _ => bytes.truncate(rng.below(bytes.len() + 1)),
+        }
+    }
+    bytes
+}
+
+#[test]
+fn from_script_never_panics_and_only_accepts_round_tripping_scripts() {
+    let mut rng = Rng(0x5A17_C01E);
+    for i in 0..iters(2_000_000) {
+        let bytes = if i % 3 == 0 {
+            rng.bytes(140)
+        } else {
+            scriptish(&mut rng)
+        };
+        let script = ScriptBuf::from_bytes(bytes.clone());
+        // The contract is held to the exact template, so anything it accepts must rebuild byte for
+        // byte; otherwise an attacker could craft a lock the engine misreads.
+        if let Ok(parsed) = Contract::from_script(&script) {
+            assert_eq!(
+                parsed.script().into_bytes(),
+                bytes,
+                "seed 0x5A17C01E iter {i}: accepted a script that does not round-trip"
+            );
+        }
+    }
+}
+
+#[test]
+fn check_script_never_panics_on_a_hostile_counterparty_script() {
+    let mut rng = Rng(0xC0DE_F00D);
+    let expected = contract(&mut rng);
+    for _ in 0..iters(1_000_000) {
+        let script = ScriptBuf::from_bytes(scriptish(&mut rng));
+        // Accepting it means it matched the expected contract exactly, so it must round-trip too.
+        if expected.check_script(&script).is_ok() {
+            assert_eq!(
+                ScriptBuf::from_bytes(expected.script().into_bytes()),
+                script
+            );
+        }
+    }
+}
+
+fn hostile_witness(rng: &mut Rng) -> Witness {
+    let items = rng.below(7);
+    let mut w = Witness::new();
+    for _ in 0..items {
+        w.push(rng.bytes(40));
+    }
+    w
+}
+
+#[test]
+fn extract_preimage_never_panics_and_only_returns_the_real_secret() {
+    let mut rng = Rng(0xBEEF_1234);
+    let preimage: [u8; 32] = std::array::from_fn(|_| rng.byte());
+    let c = Contract {
+        secret_hash: sha256::Hash::hash(&preimage).to_byte_array(),
+        ..contract(&mut rng)
+    };
+    for _ in 0..iters(1_000_000) {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: (0..rng.below(4))
+                .map(|_| TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::all_zeros(),
+                        vout: rng.next() as u32,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence(rng.next() as u32),
+                    witness: hostile_witness(&mut rng),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(rng.next() % 1_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        if let Some(found) = extract_preimage(&tx, &c) {
+            assert_eq!(
+                found, preimage,
+                "extract_preimage returned a value whose hash is not the secret"
+            );
+        }
+    }
+}
