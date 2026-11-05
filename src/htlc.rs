@@ -17,7 +17,7 @@ use bitcoin::{
 
 pub const PREIMAGE_LEN: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Contract {
     pub secret_hash: [u8; 32],
     pub claim_pkh: PubkeyHash,
