@@ -175,9 +175,20 @@ async function loadSwaps() {
   }
 }
 
-async function showSwap(id) {
+// The open swap detail, auto-refreshed: confirmations and the refund countdown change every block
+// without a phase change, so SSE alone would not catch them. Poll on a timer with a visible countdown.
+const DETAIL_REFRESH = 30; // seconds
+let detailId = null;
+let detailNext = 0;
+
+function showSwap(id) {
+  detailId = id;
+  detailNext = Date.now();
+}
+
+async function renderSwap(id) {
   const s = await api("GET", "/swaps/" + id).catch(() => null);
-  if (!s) return;
+  if (!s || detailId !== id) return;
   const c = s.chain || {};
   const leg = (name, lock) =>
     `<div class="leg card"><strong>${name}</strong><br>` +
@@ -186,17 +197,30 @@ async function showSwap(id) {
         `${lock.confirmations == null ? "unconfirmed" : lock.confirmations + " conf"} · ${lock.spent ? "spent" : "locked"}`
       : "not locked yet") +
     `</div>`;
+  const done = ["done", "refunded", "abandoned"].includes(s.phase);
   $("#swap-detail").innerHTML =
     `<div class="card"><div class="row between"><h2>Swap #${s.id.slice(0, 6)}</h2>` +
-    `<span class="pill ${["done","refunded","abandoned"].includes(s.phase) ? "phase-"+s.phase : "phase-active"}">${s.phase}</span></div>` +
+    `<span class="pill ${done ? "phase-" + s.phase : "phase-active"}">${s.phase}</span></div>` +
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">${leg("Your leg", c.maker_lock)}${leg("Counterparty", c.taker_lock)}</div>` +
     (c.refund_in_blocks != null
       ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>`
       : "") +
-    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p></div>`;
+    `<p class="muted">Funds are safe: this ends claimed or refunded, always.` +
+    (done ? "" : ` <span id="detail-age"></span>`) + `</p></div>`;
 }
+
+// One ticker drives the detail refresh + its countdown.
+setInterval(() => {
+  if (detailId === null || $("#swaps").classList.contains("active") === false) return;
+  if (Date.now() >= detailNext) {
+    renderSwap(detailId);
+    detailNext = Date.now() + DETAIL_REFRESH * 1000;
+  }
+  const el = $("#detail-age");
+  if (el) el.textContent = `· refreshing in ${Math.max(0, Math.round((detailNext - Date.now()) / 1000))}s`;
+}, 1000);
 
 // --- settings ---
 async function loadSettings() {
@@ -259,6 +283,7 @@ function onEvent() {
   const active = $(".view.active").id;
   refresh(active);
   loadStatus();
+  if (detailId !== null) detailNext = Date.now(); // a phase change refreshes the open detail at once
 }
 
 function refresh(tab) {
