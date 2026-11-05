@@ -153,3 +153,41 @@ fn btc_amounts_accept_dot_and_comma() {
     assert_eq!(parse_btc_to_sats("abc"), None);
     assert_eq!(parse_btc_to_sats("."), None);
 }
+
+#[test]
+fn events_stream_needs_the_token() {
+    let (addr, _) = daemon();
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    sock.write_all(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = sock.read(&mut buf).unwrap_or(0);
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains(" 401 "),
+        "/events without a token must be 401"
+    );
+}
+
+#[test]
+fn events_stream_opens_as_sse() {
+    let (addr, token) = daemon();
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    sock.write_all(
+        format!("GET /events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = [0u8; 512];
+    let n = sock.read(&mut buf).unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        text.contains("text/event-stream"),
+        "not an SSE stream: {text}"
+    );
+    assert!(
+        text.contains(": connected"),
+        "no initial stream comment: {text}"
+    );
+}

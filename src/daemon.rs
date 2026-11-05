@@ -30,7 +30,7 @@ use crate::node::ChainNode;
 use crate::policy::Policy;
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
-use crate::swap::{Chain as SwapChain, Offer as SwapOffer, Phase};
+use crate::swap::{Chain as SwapChain, Offer as SwapOffer, Phase, Role, Swap};
 use crate::ws::WsConn;
 
 /// How often the engine thread drives a swap forward when no command arrives.
@@ -221,6 +221,9 @@ pub struct Daemon {
     /// is stable across restarts.
     identity_seed: [u8; 32],
     routing_seed: [u8; 32],
+    /// Server-Sent-Events subscribers (the GUI). The engine thread broadcasts phase changes and new
+    /// offers here so the GUI updates live instead of polling.
+    events: Arc<Mutex<Vec<Sender<String>>>>,
 }
 
 impl Daemon {
@@ -243,6 +246,7 @@ impl Daemon {
             engine: Arc::new(Mutex::new(None)),
             identity_seed: load_or_make_seed(data_dir, "identity.seed")?,
             routing_seed: load_or_make_seed(data_dir, "routing.seed")?,
+            events: Arc::new(Mutex::new(Vec::new())),
         };
         // If the saved settings are already complete, bring the engine up; otherwise it starts after
         // the first complete PUT /settings.
@@ -292,7 +296,8 @@ impl Daemon {
             .map_err(|e| format!("engine: {e:?}"))?;
 
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || run_engine(engine, rx));
+        let events = Arc::clone(&self.events);
+        std::thread::spawn(move || run_engine(engine, rx, events));
         *self.engine.lock().unwrap() = Some(tx);
         Ok(())
     }
@@ -344,10 +349,26 @@ impl Daemon {
 
     fn serve_connection(&self, mut stream: TcpStream) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let (status, body) = match read_request(&mut stream) {
-            Ok(req) => self.route(&req),
-            Err(code) => (code, json!({"error": "bad request"})),
+        let req = match read_request(&mut stream) {
+            Ok(req) => req,
+            Err(code) => {
+                return self.write_json(&mut stream, code, &json!({"error": "bad request"}))
+            }
         };
+        // The live event stream is a long-lived connection, not a single response.
+        if req.method == "GET" && req.path == "/events" {
+            if self.authorized(&req) {
+                self.serve_events(stream);
+            } else {
+                self.write_json(&mut stream, 401, &json!({"error": "unauthorized"}));
+            }
+            return;
+        }
+        let (status, body) = self.route(&req);
+        self.write_json(&mut stream, status, &body);
+    }
+
+    fn write_json(&self, stream: &mut TcpStream, status: u16, body: &Value) {
         let body = body.to_string();
         let resp = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\
@@ -356,6 +377,31 @@ impl Daemon {
             len = body.len(),
         );
         let _ = stream.write_all(resp.as_bytes());
+    }
+
+    /// Serves the live event stream (Server-Sent Events): headers, then one `data:` line per event
+    /// the engine broadcasts, with a periodic keepalive. Returns (and the subscriber is pruned on the
+    /// next broadcast) when the client disconnects.
+    fn serve_events(&self, mut stream: TcpStream) {
+        let headers =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+                       Connection: keep-alive\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        if stream.write_all(headers.as_bytes()).is_err() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<String>();
+        self.events.lock().unwrap().push(tx);
+        let _ = stream.write_all(b": connected\n\n");
+        loop {
+            let frame = match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(line) => format!("data: {line}\n\n"),
+                Err(RecvTimeoutError::Timeout) => ": keepalive\n\n".to_owned(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            if stream.write_all(frame.as_bytes()).is_err() {
+                return; // client gone; the broadcaster prunes our sender when its send next fails
+            }
+        }
     }
 
     fn route(&self, req: &Request) -> (u16, Value) {
@@ -562,13 +608,32 @@ enum EngineCmd {
     },
 }
 
-/// The slice of a swap the API exposes (id and phase); more detail follows as the GUI needs it.
+/// The slice of a swap the API exposes: id, phase, our role, the direction and amounts, and whether
+/// the secret is out. Live on-chain detail (confirmations, txids, refund countdown) follows once the
+/// engine surfaces per-swap chain views.
 pub struct SwapView {
     id: [u8; 16],
     phase: Phase,
+    role: Role,
+    maker_chain: SwapChain,
+    maker_part: Amount,
+    taker_part: Amount,
+    secret_revealed: bool,
 }
 
 impl SwapView {
+    fn of(s: &Swap) -> SwapView {
+        SwapView {
+            id: s.id,
+            phase: s.phase,
+            role: s.role,
+            maker_chain: s.offer.maker_chain,
+            maker_part: s.maker_part,
+            taker_part: s.taker_part,
+            secret_revealed: s.learned_secret.is_some(),
+        }
+    }
+
     fn is_active(&self) -> bool {
         !matches!(self.phase, Phase::Done | Phase::Refunded | Phase::Abandoned)
     }
@@ -577,13 +642,25 @@ impl SwapView {
         json!({
             "id": self.id.to_hex_string(Case::Lower),
             "phase": format!("{:?}", self.phase).to_lowercase(),
+            "role": match self.role { Role::Maker => "maker", Role::Taker => "taker" },
+            "maker_chain": chain_str(self.maker_chain),
+            "taker_chain": chain_str(self.maker_chain.other()),
+            "maker_amount_sat": self.maker_part.to_sat(),
+            "taker_amount_sat": self.taker_part.to_sat(),
+            "secret_revealed": self.secret_revealed,
         })
     }
 }
 
 /// Owns the engine, drives it forward on a timer, and serves commands. Ends when the daemon drops its
 /// sender (all senders gone => `Disconnected`).
-fn run_engine(mut engine: Engine<RelayTransport<WsConn>>, rx: Receiver<EngineCmd>) {
+fn run_engine(
+    mut engine: Engine<RelayTransport<WsConn>>,
+    rx: Receiver<EngineCmd>,
+    events: Arc<Mutex<Vec<Sender<String>>>>,
+) {
+    let mut last_phase: std::collections::BTreeMap<[u8; 16], Phase> = Default::default();
+    let mut last_offers = 0usize;
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
             Ok(cmd) => handle_engine_cmd(cmd, &mut engine),
@@ -591,7 +668,30 @@ fn run_engine(mut engine: Engine<RelayTransport<WsConn>>, rx: Receiver<EngineCmd
             Err(RecvTimeoutError::Disconnected) => return,
         }
         let _ = engine.tick();
+        // Broadcast what changed so the GUI updates without polling: a swap whose phase moved, and a
+        // change in the number of discovered offers.
+        for s in engine.swaps() {
+            if last_phase.insert(s.id, s.phase) != Some(s.phase) {
+                broadcast(&events, &SwapView::of(s).to_json().to_string());
+            }
+        }
+        let offers = engine.seen_offers().len();
+        if offers != last_offers {
+            last_offers = offers;
+            broadcast(
+                &events,
+                &json!({"type": "offers", "count": offers}).to_string(),
+            );
+        }
     }
+}
+
+/// Sends one SSE data line to every subscriber, dropping any whose receiver is gone.
+fn broadcast(events: &Arc<Mutex<Vec<Sender<String>>>>, line: &str) {
+    events
+        .lock()
+        .unwrap()
+        .retain(|tx| tx.send(line.to_owned()).is_ok());
 }
 
 fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTransport<WsConn>>) {
@@ -603,13 +703,7 @@ fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTransport<WsConn>>
             let _ = reply.send(engine.seen_offers().to_vec());
         }
         EngineCmd::Swaps(reply) => {
-            let views = engine
-                .swaps()
-                .map(|s| SwapView {
-                    id: s.id,
-                    phase: s.phase,
-                })
-                .collect();
+            let views = engine.swaps().map(SwapView::of).collect();
             let _ = reply.send(views);
         }
         EngineCmd::Take {
