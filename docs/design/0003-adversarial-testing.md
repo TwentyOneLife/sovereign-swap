@@ -40,10 +40,15 @@ No network, no Kali; runs in CI on every change.
   never locks, never claims, comes back too late, races its refund against our claim, double-spends
   its own lock, broadcasts conflicting transactions, and sends duplicate or out-of-order messages.
   Each case asserts the invariant for our side.
+- **Downtime and replay** (landed): a taker whose engine is down while its refund window passes still
+  refunds on return, since the deadline lives in the swap file; replayed offers, bids and accepts
+  create no duplicate swap.
 - **Reorg** (landed for the claim case): blocks holding a lock or a claim are invalidated at each
   depth up to the policy's final depth; our side must recover or complete, never settle early.
-- **Property test of the state machine**: random event sequences fed to `Swap::decide`, asserting the
-  invariant and that no reachable state both claims and refunds the same lock.
+- **Property test of the state machine** (`tests/property.rs`, landed): random, even self-inconsistent,
+  chain views fed to `Swap::decide` must never panic, never claim and refund the same lock in one
+  call, and never leave a settled swap (a terminal guard in `decide` enforces the last). A monotonic
+  chain simulator drives the taker to a terminal phase and asserts it stays there.
 - **Throughput and isolation** (`tests/load.rs`, landed): many swaps between one maker and taker at
   once (default 30, run at 100), every one must settle, no key index reused across swaps, no swap's
   lock funded from another's coin. 100 concurrent swaps settle in 6 confirmation rounds; throughput

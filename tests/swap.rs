@@ -450,3 +450,56 @@ fn a_partial_bid_swaps_the_proportional_amount() {
         (Amount::from_sat(20_000_000), Amount::from_sat(6_000_000))
     );
 }
+
+/// Row 16/18, downtime variant: the taker locks, then its engine is down while blocks pass beyond
+/// its refund window, and the maker never claims. On return the taker still refunds in time: the
+/// deadline lives in the swap file, not in a running timer.
+#[test]
+fn a_taker_offline_past_its_window_still_refunds_on_return() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    // Tick both until the taker's own lock is on chain, then the maker goes dark.
+    w.run(&mut maker, &mut taker, 40, always, false, |_, t| {
+        t.phase() == Some(Phase::Locked)
+    });
+    // The taker is offline; the taker's lock (20 blocks) runs out while nobody ticks.
+    for _ in 0..25 {
+        w.mine();
+    }
+    taker.reopen(&w.btc, &w.xbtc);
+    w.run(
+        &mut maker,
+        &mut taker,
+        10,
+        |_, _| (false, true),
+        false,
+        |_, t| t.phase() == Some(Phase::Refunded),
+    );
+}
+
+/// A replayed offer, bid and accept must not create a second swap on either side.
+#[test]
+fn duplicate_messages_do_not_create_duplicate_swaps() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    let offer = offer(Chain::Xbtc);
+    // Replay the offer and the bid with the same ids.
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    let _ = taker.engine().bid(&offer, offer.maker_amount, [9; 16]);
+    for _ in 0..3 {
+        maker.tick();
+        taker.tick();
+        w.mine();
+    }
+    assert_eq!(
+        maker.engine().swaps().count(),
+        1,
+        "maker made a duplicate swap"
+    );
+    assert_eq!(
+        taker.engine().swaps().count(),
+        1,
+        "taker made a duplicate swap"
+    );
+}
