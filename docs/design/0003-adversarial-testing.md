@@ -1,0 +1,84 @@
+# 0003 Adversarial testing and hardening
+
+Status: accepted for implementation, 2026-11-05. First increment (parser fuzzing) landed with this
+document.
+
+## Why
+
+A swap engine is attacked for money, not for downtime. The question each test answers is: can a
+counterparty, a hostile relay, or someone flooding the service make our side lose coins, get stuck,
+or be driven offline? Every attack below is paired with the property it must not break. Tests target
+only our own code and our own isolated lab.
+
+## What an attacker controls
+
+- **The counterparty** chooses amounts, timings, which transactions to broadcast and when, the bytes
+  of the contract script it funds, and the witnesses it puts on chain. It can lie, stall, race us,
+  double-spend its own lock, and send protocol messages out of order or replayed.
+- **The relay and transport** (from M3) can drop, reorder, duplicate and forge-at-the-transport
+  messages, and is assumed fully hostile: every guarantee rests on the end-to-end envelope.
+- **The network** can flood a running service with connections and requests.
+- **The chains** can reorg; xBTC cheaply, given its hashrate.
+
+## The invariant
+
+For every swap and every interleaving of events, our side ends in exactly one of: both legs settled
+in our favour, or our locked coins recovered by refund. It is never possible for us to have paid the
+counterparty without being able to claim, or to have locked coins we can neither claim nor refund.
+
+## Layers
+
+### A. Protocol and funds, in-repo, deterministic (now)
+
+No network, no Kali; runs in CI on every change.
+
+- **Parser fuzzing** (`tests/fuzz_parsers.rs`, landed): millions of hostile byte strings through the
+  contract-script parser, the counterparty-script check, and preimage extraction. None may panic,
+  loop, or accept input that does not round-trip or whose hash is not the secret. A counterparty
+  controls exactly these bytes.
+- **Adversarial counterparty** (`tests/swap.rs`, partly landed): a peer that under-locks, over-locks,
+  never locks, never claims, comes back too late, races its refund against our claim, double-spends
+  its own lock, broadcasts conflicting transactions, and sends duplicate or out-of-order messages.
+  Each case asserts the invariant for our side.
+- **Reorg** (landed for the claim case): blocks holding a lock or a claim are invalidated at each
+  depth up to the policy's final depth; our side must recover or complete, never settle early.
+- **Property test of the state machine**: random event sequences fed to `Swap::decide`, asserting the
+  invariant and that no reachable state both claims and refunds the same lock.
+
+### B. Wire and post-quantum envelope (with M3)
+
+- Fuzz the message decoder with malformed, truncated, oversized and duplicated frames.
+- Forgery: a message with a broken or swapped signature, a downgraded suite, or a replayed envelope
+  must be rejected; the hybrid signature must fail if either half fails.
+- Harvest-now: confirm no swap secret or key is ever in a message's cleartext.
+
+### C. Network and service, in the homelab lab (when the relay runs)
+
+Target: a relay deployed on the isolated `hacklab` network (`sovereign-homelab`), attacked from the
+Kali VM. Never against a live relay on real infrastructure.
+
+- **Resource exhaustion / DoS**: connection floods, slow-loris, oversized and high-rate events,
+  subscription floods. Control: the relay's rate limits, event-size cap, kind allowlist, and
+  proof-of-work requirement (see `infra/plans/xbtc-swap-relay-comm.md`). Each attack is run with the
+  control off then on, and the difference recorded.
+- **Malformed Nostr**: protocol-fuzz the relay's event handling.
+- **Censorship / eclipse**: a relay that drops our messages; the client must fall back to other
+  relays and no swap must be endangered by one relay going dark.
+- **Transport privacy**: confirm Tor-only operation leaks no clearnet metadata.
+
+DoS protects availability, not funds: the invariant already guarantees that a service going down
+during a swap ends in refund, never loss. That is itself a test (kill the engine mid-swap, it still
+refunds), so availability attacks cannot cost coins, only time.
+
+## On "using AI to attack"
+
+The durable form of an AI-found attack is a committed regression test, not a one-off exploit run. A
+model may be used to generate adversarial sequences and malformed inputs offline; anything it finds
+becomes a deterministic test here, so the hardening is reproducible and cannot regress. The runtime
+never calls out to a model, per the sovereign-code rules.
+
+## Where it lives
+
+- Layers A and B: this repository, run in CI.
+- Layer C: a module in `sovereign-homelab` plus a deployable relay target, driven from Kali. It does
+  not run in this repository's CI.
