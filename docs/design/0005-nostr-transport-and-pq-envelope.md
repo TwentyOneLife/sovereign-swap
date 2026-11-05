@@ -73,7 +73,11 @@ what a swap needs.
   identities from a 32-byte seed, 7 unit tests (round trip, per-byte tamper, wrong recipient, wrong
   sender, both-signature-halves-required, broadcast) and a decoder fuzz test. **Remaining:** wire it
   behind the `Transport` trait so the two-engine tests run on the encrypted envelope, and publish
-  cross-implementation test vectors.
+  cross-implementation test vectors. **Done:** an `EnvelopeTransport` wraps a byte transport and
+  carries every `Message` as a format-3 envelope (offers broadcast-signed, the rest sealed to the
+  peer; frames that do not verify or decrypt are dropped). A full BTC/xBTC swap runs over it end to
+  end (`tests/envelope_swap.rs`). **Remaining:** cross-implementation test vectors. Peer discovery
+  and routing to more than one counterparty is M3b (the Nostr client).
 - M3b: the Nostr client and Tor transport; a relay (`sovereign-swap-relay`) for tests.
 - M3c (then): Layer C of design 0003, DoS and protocol-fuzz the relay from the homelab Kali VM.
 
