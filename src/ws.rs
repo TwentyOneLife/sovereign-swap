@@ -5,7 +5,7 @@
 //! no TLS is used on the Tor path. One owner thread holds the WebSocket: it sends what `publish`
 //! queues and buffers the events a `REQ` subscription returns. See design 0006.
 
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, Sender};
@@ -13,15 +13,21 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::secp256k1::XOnlyPublicKey;
-use tungstenite::{client::client, Message as WsMessage};
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::{client::client_with_config, Error as WsProtoError, Message as WsMessage};
 
 use crate::nostr::{Event, KIND_SWAP};
 use crate::routing::RelayConn;
 
+/// Caps on untrusted input from a relay: a message larger than this is refused, and no more than
+/// this many events are buffered (oldest dropped), so a hostile or flooding relay cannot exhaust
+/// memory. Our events are a few KiB; a relay's max event is 128 KiB.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_BUFFERED_EVENTS: usize = 10_000;
+
 pub struct WsConn {
     outgoing: Sender<String>,
-    incoming: Arc<Mutex<Vec<Event>>>,
-    cursor: Mutex<usize>,
+    incoming: Arc<Mutex<VecDeque<Event>>>,
     _worker: std::thread::JoinHandle<()>,
 }
 
@@ -45,8 +51,11 @@ impl WsConn {
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(WsError::Io)?;
-        let (mut socket, _resp) =
-            client(url, stream).map_err(|e| WsError::Handshake(e.to_string()))?;
+        // Bound total message size (memory) but leave the frame size at the library default: a
+        // too-small frame cap makes tungstenite assert rather than error on an oversized frame.
+        let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
+        let (mut socket, _resp) = client_with_config(url, stream, Some(config))
+            .map_err(|e| WsError::Handshake(e.to_string()))?;
 
         // Subscribe to our event kind; we filter and route client-side.
         let req = format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#);
@@ -54,14 +63,13 @@ impl WsConn {
             .send(WsMessage::Text(req.into()))
             .map_err(|e| WsError::Handshake(e.to_string()))?;
 
-        let incoming: Arc<Mutex<Vec<Event>>> = Arc::default();
+        let incoming: Arc<Mutex<VecDeque<Event>>> = Arc::default();
         let buffer = Arc::clone(&incoming);
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         let worker = std::thread::spawn(move || run(socket, rx, buffer));
         Ok(WsConn {
             outgoing: tx,
             incoming,
-            cursor: Mutex::new(0),
             _worker: worker,
         })
     }
@@ -71,9 +79,8 @@ impl WsConn {
 fn run<S: Read + Write>(
     mut socket: tungstenite::WebSocket<S>,
     rx: Receiver<String>,
-    buffer: Arc<Mutex<Vec<Event>>>,
+    buffer: Arc<Mutex<VecDeque<Event>>>,
 ) {
-    let mut seen = HashSet::new();
     loop {
         while let Ok(text) = rx.try_recv() {
             if socket.send(WsMessage::Text(text.into())).is_err() {
@@ -83,14 +90,19 @@ fn run<S: Read + Write>(
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
                 if let Some(event) = parse_event_message(&text) {
-                    if seen.insert(event.id) {
-                        buffer.lock().unwrap().push(event);
+                    let mut buf = buffer.lock().unwrap();
+                    if buf.len() >= MAX_BUFFERED_EVENTS {
+                        buf.pop_front();
                     }
+                    buf.push_back(event);
                 }
             }
             Ok(WsMessage::Close(_)) => return,
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e))
+            // A hostile relay sending an oversized, malformed or non-UTF-8 frame must not drop the
+            // connection: skip that frame and keep reading. Only a closed or broken socket ends it.
+            Err(WsProtoError::Capacity(_) | WsProtoError::Protocol(_) | WsProtoError::Utf8(_)) => {}
+            Err(WsProtoError::Io(e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -118,17 +130,12 @@ impl RelayConn for WsConn {
     }
 
     fn poll(&self, subscriber: &XOnlyPublicKey) -> Vec<Event> {
-        let buffer = self.incoming.lock().unwrap();
-        let mut cursor = self.cursor.lock().unwrap();
-        let out = buffer
-            .iter()
-            .skip(*cursor)
+        let drained: Vec<Event> = self.incoming.lock().unwrap().drain(..).collect();
+        drained
+            .into_iter()
             .filter(|e| e.pubkey != *subscriber)
             .filter(|e| e.recipient().map_or(true, |to| to == *subscriber))
-            .cloned()
-            .collect();
-        *cursor = buffer.len();
-        out
+            .collect()
     }
 }
 
