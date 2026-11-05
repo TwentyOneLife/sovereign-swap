@@ -1,5 +1,6 @@
 //! Peer-to-peer atomic swaps between BTC and xBTC (Bitcoin Blake2b).
 
+pub mod daemon;
 pub mod engine;
 pub mod envelope;
 pub mod htlc;
