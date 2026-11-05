@@ -8,6 +8,7 @@ use bitcoin::{Amount, OutPoint, PubkeyHash};
 use serde::{Deserialize, Serialize};
 
 use crate::htlc::{Contract, PREIMAGE_LEN};
+use crate::policy::Depths;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Chain {
@@ -38,9 +39,9 @@ pub struct Offer {
     pub min_maker_amount: Amount,
     pub maker_lock_blocks: u16,
     pub taker_lock_blocks: u16,
-    /// Depth the taker waits for on the maker's lock before locking.
+    /// Depth the maker asks the taker to wait for on its lock; each engine may require more.
     pub maker_lock_depth: u32,
-    /// Depth the maker waits for on the taker's lock before revealing the secret.
+    /// Depth the maker will wait for on the taker's lock before revealing the secret.
     pub taker_lock_depth: u32,
     /// Blocks kept in reserve before any deadline.
     pub margin_blocks: u32,
@@ -131,6 +132,7 @@ pub struct Swap {
     pub maker_contract: Contract,
     /// On the taker chain: the maker claims it, the taker refunds it.
     pub taker_contract: Contract,
+    pub depths: Depths,
     /// Taker only: the swap is abandoned if the maker's lock is not confirmed by this maker-chain height.
     pub lock_deadline: u32,
     /// Taker only: the secret, kept once seen, since a reorg can take its transaction away again.
@@ -180,9 +182,6 @@ pub enum Action {
     },
 }
 
-/// A spend counts as final at this depth.
-pub const FINAL_DEPTH: u32 = 3;
-
 impl Swap {
     pub fn own_side(&self) -> Side {
         match self.role {
@@ -229,18 +228,25 @@ impl Swap {
             self.phase = Phase::Locked;
         }
         if let Some(spend) = own.spend.as_ref().filter(|s| s.ours) {
-            self.phase = final_or(spend, Phase::Refunded, Phase::Refunding);
+            self.phase = final_or(
+                spend,
+                self.depths.maker_final,
+                Phase::Refunded,
+                Phase::Refunding,
+            );
             return vec![];
         }
         if let Some(theirs) = &view.taker_lock {
             if let Some(spend) = theirs.spend.as_ref().filter(|s| s.ours) {
-                self.phase = final_or(spend, Phase::Done, Phase::Claiming);
+                self.phase = final_or(spend, self.depths.taker_final, Phase::Done, Phase::Claiming);
                 return vec![];
             }
-            let deep = Self::depth(theirs, hb) >= self.offer.taker_lock_depth;
+            let deep = Self::depth(theirs, hb) >= self.depths.taker_lock;
+            // Room for our claim to become final before the taker's refund opens.
+            let needed = i64::from(self.offer.margin_blocks) + i64::from(self.depths.taker_final);
             let time_left = self
                 .remaining(Side::Taker, theirs, hb)
-                .is_some_and(|r| r > i64::from(self.offer.margin_blocks));
+                .is_some_and(|r| r > needed);
             // Once the secret has been broadcast it is public: keep claiming whatever the clock says.
             let go = self.phase == Phase::Claiming || (theirs.amount_ok && deep && time_left);
             if theirs.spend.is_none() && own.spend.is_none() && go {
@@ -267,7 +273,7 @@ impl Swap {
             .and_then(|l| l.spend.as_ref())
             .filter(|s| s.ours)
         {
-            self.phase = final_or(spend, Phase::Done, Phase::Claiming);
+            self.phase = final_or(spend, self.depths.maker_final, Phase::Done, Phase::Claiming);
             return vec![];
         }
         let seen = view
@@ -300,12 +306,13 @@ impl Swap {
                 }
                 return vec![];
             };
-            let deep = Self::depth(theirs, ha) >= self.offer.maker_lock_depth;
-            // Enough of the maker's lock must remain for our lock to confirm, run out and refund,
-            // or a maker whose lock confirmed late could take both.
-            let needed = i64::from(self.offer.taker_lock_depth)
+            let deep = Self::depth(theirs, ha) >= self.depths.maker_lock;
+            // Enough of the maker's lock must remain for our lock to confirm and run out, and for a
+            // claim to become final, or a maker whose lock confirmed late could take both.
+            let needed = i64::from(self.depths.taker_lock)
                 + i64::from(self.offer.taker_lock_blocks)
-                + i64::from(self.offer.margin_blocks);
+                + i64::from(self.offer.margin_blocks)
+                + i64::from(self.depths.maker_final);
             let time_left = self
                 .remaining(Side::Maker, theirs, ha)
                 .is_some_and(|r| r > needed);
@@ -321,7 +328,12 @@ impl Swap {
         };
 
         if let Some(spend) = own.spend.as_ref().filter(|s| s.ours) {
-            self.phase = final_or(spend, Phase::Refunded, Phase::Refunding);
+            self.phase = final_or(
+                spend,
+                self.depths.taker_final,
+                Phase::Refunded,
+                Phase::Refunding,
+            );
             return vec![];
         }
         if own.spend.is_none() && self.remaining(Side::Taker, own, hb).is_some_and(|r| r <= 0) {
@@ -333,8 +345,8 @@ impl Swap {
     }
 }
 
-fn final_or(spend: &SpendView, done: Phase, pending: Phase) -> Phase {
-    if spend.depth >= FINAL_DEPTH {
+fn final_or(spend: &SpendView, final_depth: u32, done: Phase, pending: Phase) -> Phase {
+    if spend.depth >= final_depth {
         done
     } else {
         pending
@@ -381,6 +393,12 @@ mod tests {
             taker_part: Amount::from_sat(300_000),
             maker_contract: contract(3),
             taker_contract: contract(5),
+            depths: Depths {
+                maker_lock: 2,
+                taker_lock: 2,
+                maker_final: 3,
+                taker_final: 3,
+            },
             lock_deadline: 110,
             learned_secret: None,
             phase: match role {
@@ -486,16 +504,16 @@ mod tests {
             s.decide(&view(105, 105, own.clone(), Some(wrong)), SECRET),
             vec![]
         );
-        // Confirmed at 100, 20 blocks: refund opens at 120; margin 3.
+        // Confirmed at 100 for 20 blocks: refund valid from 120; margin 3 plus final depth 3.
         assert_eq!(
             s.decide(
-                &view(105, 117, own.clone(), Some(lock(2, Some(100)))),
+                &view(105, 113, own.clone(), Some(lock(2, Some(100)))),
                 SECRET
             ),
             vec![]
         );
         assert_eq!(
-            s.decide(&view(105, 115, own, Some(lock(2, Some(100)))), SECRET),
+            s.decide(&view(105, 112, own, Some(lock(2, Some(100)))), SECRET),
             vec![Action::Claim {
                 lock: outpoint(2),
                 preimage: [9; 32]
@@ -531,7 +549,7 @@ mod tests {
             ),
             claim
         );
-        theirs.spend.as_mut().unwrap().depth = FINAL_DEPTH;
+        theirs.spend.as_mut().unwrap().depth = 3;
         assert_eq!(s.decide(&view(105, 118, own, Some(theirs)), SECRET), vec![]);
         assert_eq!(s.phase, Phase::Done);
     }
@@ -659,5 +677,43 @@ mod tests {
             vec![Action::Fund]
         );
         assert_eq!(s.phase, Phase::Locking);
+    }
+
+    #[test]
+    fn a_claim_on_xbtc_is_watched_until_the_xbtc_final_depth() {
+        let mut s = swap(Role::Taker);
+        s.depths.maker_final = 6;
+        let mut theirs = lock(1, Some(100));
+        theirs.spend = Some(SpendView {
+            preimage: Some([9; 32]),
+            depth: 5,
+            ours: true,
+        });
+        s.decide(
+            &view(106, 106, Some(theirs.clone()), Some(lock(2, Some(102)))),
+            None,
+        );
+        assert_eq!(s.phase, Phase::Claiming);
+        theirs.spend.as_mut().unwrap().depth = 6;
+        s.decide(
+            &view(107, 107, Some(theirs), Some(lock(2, Some(102)))),
+            None,
+        );
+        assert_eq!(s.phase, Phase::Done);
+    }
+
+    #[test]
+    fn the_taker_waits_for_its_own_depth_not_the_offers() {
+        let mut s = swap(Role::Taker);
+        s.offer.maker_lock_depth = 0;
+        s.depths.maker_lock = 6;
+        assert_eq!(
+            s.decide(&view(102, 102, Some(lock(1, Some(100))), None), None),
+            vec![]
+        );
+        assert_eq!(
+            s.decide(&view(105, 105, Some(lock(1, Some(100))), None), None),
+            vec![Action::Fund]
+        );
     }
 }

@@ -19,6 +19,8 @@ asset. The ticker "xBTC" is also used by unrelated tokens.
   contract, why it checks the secret's size, and why BTC transactions must not be replayable on xBTC.
 - [`docs/design/0002-swap-engine.md`](docs/design/0002-swap-engine.md): the state machine, the
   swap wallet and persistence.
+- [`docs/guides/separating-coins.md`](docs/guides/separating-coins.md): separating BTC and xBTC
+  coins by hand, step by step.
 - [`docs/edge-cases.md`](docs/edge-cases.md): every failure scenario taken over from BasicSwap, with
   the test that covers it.
 

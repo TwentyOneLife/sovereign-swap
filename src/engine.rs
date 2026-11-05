@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
 use crate::node::{ChainNode, NodeError};
+use crate::policy::{Policy, PolicyError};
 use crate::store::write_atomic;
 use crate::swap::{Action, BidError, Chain, ChainView, Message, Offer, Phase, Role, Swap};
 use crate::transport::Transport;
 
-/// Maker-chain blocks a taker waits for the maker's lock to confirm before giving up.
+/// Maker-chain blocks a taker waits, beyond the required depth, for the maker's lock before giving up.
 const LOCK_WAIT_BLOCKS: u32 = 10;
 
 #[derive(Clone, Debug)]
@@ -22,6 +23,7 @@ pub struct Config {
     /// Fee of each claim and refund transaction.
     pub spend_fee: Amount,
     pub fee_rate_sat_vb: u64,
+    pub policy: Policy,
 }
 
 /// What a swap needs besides its state: where our coins go, and our lock once signed.
@@ -46,6 +48,7 @@ struct State {
 #[derive(Debug)]
 pub enum EngineError {
     Bid(BidError),
+    Policy(PolicyError),
     Node(NodeError),
     Io(std::io::Error),
 }
@@ -143,6 +146,10 @@ impl<T: Transport> Engine<T> {
     }
 
     pub fn publish(&mut self, offer: Offer) -> Result<(), EngineError> {
+        self.config
+            .policy
+            .depths(&offer, offer.maker_amount, offer.taker_amount)
+            .map_err(EngineError::Policy)?;
         self.state.own_offers.push(offer.clone());
         self.save_state()?;
         self.transport.send(&Message::Offer(offer));
@@ -159,7 +166,11 @@ impl<T: Transport> Engine<T> {
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
         }
-        offer.taker_part(maker_part).map_err(EngineError::Bid)?;
+        let taker_part = offer.taker_part(maker_part).map_err(EngineError::Bid)?;
+        self.config
+            .policy
+            .depths(offer, maker_part, taker_part)
+            .map_err(EngineError::Policy)?;
         let index = self.take_index();
         self.state
             .bids
@@ -205,6 +216,9 @@ impl<T: Transport> Engine<T> {
                 let Ok(taker_part) = offer.taker_part(maker_part) else {
                     return Ok(());
                 };
+                let Ok(depths) = self.config.policy.depths(&offer, maker_part, taker_part) else {
+                    return Ok(());
+                };
                 let index = self.take_index();
                 let secret_hash =
                     bitcoin::hashes::sha256::Hash::hash(&self.keys.secret(index)).to_byte_array();
@@ -226,6 +240,7 @@ impl<T: Transport> Engine<T> {
                         refund_pkh: taker_refund_pkh,
                         lock_blocks: offer.taker_lock_blocks,
                     },
+                    depths,
                     lock_deadline: 0,
                     learned_secret: None,
                     phase: Phase::Locking,
@@ -251,6 +266,11 @@ impl<T: Transport> Engine<T> {
                 };
                 let (_, offer, maker_part, index) = self.state.bids[pos].clone();
                 let taker_part = offer.taker_part(maker_part).map_err(EngineError::Bid)?;
+                let depths = self
+                    .config
+                    .policy
+                    .depths(&offer, maker_part, taker_part)
+                    .map_err(EngineError::Policy)?;
                 let swap = Swap {
                     id: swap_id,
                     role: Role::Taker,
@@ -269,7 +289,10 @@ impl<T: Transport> Engine<T> {
                         refund_pkh: self.keys.pkh(index, Use::Refund),
                         lock_blocks: offer.taker_lock_blocks,
                     },
-                    lock_deadline: self.nodes[&offer.maker_chain].height()? + LOCK_WAIT_BLOCKS,
+                    depths,
+                    lock_deadline: self.nodes[&offer.maker_chain].height()?
+                        + depths.maker_lock
+                        + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
                     phase: Phase::Waiting,
                     offer,
@@ -379,6 +402,7 @@ impl<T: Transport> Engine<T> {
                         own_contract,
                         own_amount,
                         self.config.fee_rate_sat_vb,
+                        self.config.policy.funding_minconf(own_chain),
                         other,
                     )?;
                     self.records[i].funding = Some(tx.clone());

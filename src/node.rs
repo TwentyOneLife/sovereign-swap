@@ -178,17 +178,20 @@ impl ChainNode {
         }))
     }
 
-    /// Funds and signs a lock of `amount` in `contract` from the funding wallet, refusing inputs
-    /// that are still spendable on `other_chain`. Nothing is broadcast.
+    /// Funds and signs a lock of `amount` in `contract` from the funding wallet, from inputs with at
+    /// least `minconf` confirmations, refusing inputs that are still spendable on `other_chain`.
+    /// Nothing is broadcast.
     pub fn fund(
         &self,
         contract: &Contract,
         amount: Amount,
         fee_rate_sat_vb: u64,
+        minconf: u32,
         other_chain: &impl UtxoLookup<Error = RpcError>,
     ) -> Result<Transaction, NodeError> {
         let outputs = json!([{ self.address(contract).to_string(): amount.to_btc() }]);
-        let options = json!({ "fee_rate": fee_rate_sat_vb, "replaceable": true });
+        let options =
+            json!({ "fee_rate": fee_rate_sat_vb, "replaceable": true, "minconf": minconf });
         let funded = self
             .wallet
             .call("walletcreatefundedpsbt", json!([[], outputs, 0, options]))?;

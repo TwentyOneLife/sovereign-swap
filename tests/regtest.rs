@@ -251,3 +251,71 @@ fn regtest_replay_shared_coinbase() {
         "coin unique to BTC passes the guard"
     );
 }
+
+/// The steps of `docs/guides/separating-coins.md`, on a shared history: a Knots wallet sends its
+/// shared coins to itself; the transaction is valid on xBTC only, and afterwards the BTC copies
+/// are untouched while the xBTC copies are spent.
+#[test]
+fn regtest_separating_coins_as_the_guide_says() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    const FORK: u64 = 150;
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(FORK as u32));
+    knots.call("createwallet", json!(["coins"]));
+    let wallet = knots.rpc.wallet("coins");
+    let shared = wallet.call("getnewaddress", json!([])).unwrap();
+    core.call("generatetoaddress", json!([FORK - 1, shared]));
+    for height in 1..FORK {
+        let hash = core.call("getblockhash", json!([height]));
+        knots.call(
+            "submitblock",
+            json!([core.call("getblock", json!([hash, 0]))]),
+        );
+    }
+    knots.mine(10);
+    core.mine(10);
+    let hash1 = core.call("getblockhash", json!([1]));
+    let coin1: Txid = core.call("getblock", json!([hash1, 1]))["tx"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !core
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "step 2: shared coin"
+    );
+
+    // Step 4: build without broadcasting.
+    let to = wallet.call("getnewaddress", json!([])).unwrap();
+    let built = wallet
+        .call(
+            "sendall",
+            json!([[to], null, "unset", 2, {"add_to_wallet": false}]),
+        )
+        .unwrap();
+    let tx: Transaction = deserialize_hex(built["hex"].as_str().unwrap()).unwrap();
+    assert!(tx.input.iter().any(|i| i.previous_output.txid == coin1));
+
+    // Step 5: invalid on BTC, valid on xBTC.
+    assert!(core.accept(&tx).is_err(), "step 5: BTC must reject it");
+    knots.accept(&tx).expect("step 5: xBTC accepts it");
+
+    // Steps 6 and 7.
+    knots.send(&tx);
+    assert!(
+        knots
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "xBTC copy spent"
+    );
+    assert!(
+        !core
+            .call("gettxout", json!([coin1.to_string(), 0]))
+            .is_null(),
+        "BTC copy untouched"
+    );
+}

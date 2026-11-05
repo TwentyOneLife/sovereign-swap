@@ -4,6 +4,7 @@ pub mod engine;
 pub mod htlc;
 pub mod keys;
 pub mod node;
+pub mod policy;
 pub mod replay;
 pub mod rpc;
 pub mod store;

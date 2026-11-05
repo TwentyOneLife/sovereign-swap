@@ -12,14 +12,24 @@ use serde_json::json;
 use common::{binaries, Node};
 use sovereign_swap::engine::{Config, Engine, EngineError};
 use sovereign_swap::node::{ChainNode, NodeError};
+use sovereign_swap::policy::Policy;
 use sovereign_swap::replay::ReplayError;
 use sovereign_swap::swap::{BidError, Chain, Offer, Phase};
 use sovereign_swap::transport::{memory_pair, Memory};
 
-const CONFIG: Config = Config {
-    spend_fee: Amount::from_sat(2_000),
-    fee_rate_sat_vb: 2,
-};
+/// Shallow depths keep regtest runs short; `Policy::standard` is tested on its own.
+fn config() -> Config {
+    Config {
+        spend_fee: Amount::from_sat(2_000),
+        fee_rate_sat_vb: 2,
+        policy: Policy {
+            btc: vec![(Amount::from_sat(100_000_000), 2)],
+            xbtc: vec![(Amount::from_sat(100_000_000), 3)],
+            funding_minconf_btc: 1,
+            funding_minconf_xbtc: 1,
+        },
+    }
+}
 
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -57,7 +67,7 @@ impl Party {
                 open(btc),
                 open(xbtc),
                 self.transport.clone(),
-                CONFIG,
+                config(),
             )
             .unwrap(),
         );
