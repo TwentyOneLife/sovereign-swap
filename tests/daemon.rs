@@ -231,3 +231,15 @@ fn the_gui_is_served_with_the_token_injected() {
         "app.css not served"
     );
 }
+
+#[test]
+fn reference_rate_is_token_guarded_and_off_by_default() {
+    let (addr, token) = daemon();
+    assert_eq!(request(&addr, "GET", "/reference-rate", None, "").0, 401);
+    let (code, body) = request(&addr, "GET", "/reference-rate", Some(&token), "");
+    assert_eq!(code, 200);
+    assert!(
+        body.contains("\"enabled\":false"),
+        "reference must be off by default: {body}"
+    );
+}

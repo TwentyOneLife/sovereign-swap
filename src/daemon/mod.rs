@@ -32,6 +32,7 @@ use crate::ws::WsConn;
 
 /// How often the engine thread drives a swap forward when no command arrives.
 mod engine;
+mod reference;
 mod types;
 mod wire;
 
@@ -39,6 +40,7 @@ pub use engine::SwapView;
 pub use types::{parse_btc_to_sats, Chain, Settings, Signer};
 
 use engine::{engine_config, offer_to_json, run_engine, EngineCmd};
+use reference::Reference;
 use types::{NewOffer, Offer};
 use wire::{
     constant_time_eq, load_or_make_seed, load_or_make_token, offer_id_of, random_hex, reachable,
@@ -67,6 +69,8 @@ pub struct Daemon {
     /// is stable across restarts.
     identity_seed: [u8; 32],
     routing_seed: [u8; 32],
+    /// Optional external price reference (opt-in, over Tor).
+    reference: Reference,
     /// Server-Sent-Events subscribers (the GUI). The engine thread broadcasts phase changes and new
     /// offers here so the GUI updates live instead of polling.
     events: Arc<Mutex<Vec<Sender<String>>>>,
@@ -93,6 +97,7 @@ impl Daemon {
             identity_seed: load_or_make_seed(data_dir, "identity.seed")?,
             routing_seed: load_or_make_seed(data_dir, "routing.seed")?,
             events: Arc::new(Mutex::new(Vec::new())),
+            reference: Reference::default(),
         };
         // If the saved settings are already complete, bring the engine up; otherwise it starts after
         // the first complete PUT /settings.
@@ -296,6 +301,7 @@ impl Daemon {
         }
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/status") => (200, self.status()),
+            ("GET", "/reference-rate") => self.reference_rate(),
             ("GET", "/settings") => (
                 200,
                 serde_json::to_value(&self.state.lock().unwrap().settings).unwrap(),
@@ -327,6 +333,25 @@ impl Daemon {
                 constant_time_eq(presented.as_bytes(), self.token.as_bytes())
             }
             None => false,
+        }
+    }
+
+    /// The opt-in external price reference (nonkyc BTCB2/BTC, over Tor). `{enabled:false}` when off;
+    /// a hint only, never a price the protocol relies on.
+    fn reference_rate(&self) -> (u16, Value) {
+        if !self.state.lock().unwrap().settings.price_reference {
+            return (200, json!({ "enabled": false }));
+        }
+        match self.reference.get() {
+            Ok(r) => (
+                200,
+                json!({
+                    "enabled": true,
+                    "rate": r.rate, "bid": r.bid, "ask": r.ask,
+                    "source": "nonkyc BTCB2/BTC, over Tor",
+                }),
+            ),
+            Err(e) => (200, json!({ "enabled": true, "error": e })),
         }
     }
 

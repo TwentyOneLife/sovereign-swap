@@ -53,6 +53,9 @@ pub struct Settings {
     pub xbtc_rpc_user: String,
     #[serde(default)]
     pub xbtc_rpc_pass: String,
+    /// Opt-in external price reference (nonkyc BTCB2/BTC, fetched over Tor). A hint only; off by default.
+    #[serde(default)]
+    pub price_reference: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +72,7 @@ impl Default for Settings {
             btc_rpc_pass: String::new(),
             xbtc_rpc_user: String::new(),
             xbtc_rpc_pass: String::new(),
+            price_reference: false,
         }
     }
 }

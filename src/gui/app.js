@@ -101,6 +101,7 @@ function offerForm(o) {
     <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
     <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
     ${hintLine}
+    ${o ? "" : '<p id="f-ref" class="muted"></p><p id="f-dev" class="muted" style="color:var(--orange)"></p>'}
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
       <button class="ghost" id="f-cancel">Cancel</button>
@@ -121,7 +122,34 @@ function createSheet() {
   $("#f-chain").onchange = () => {
     const h = rateHint($("#f-chain").value);
     if (h) $("#f-price").value = h.mid.toFixed(4);
+    showReference();
   };
+  // Optional external reference (nonkyc, over Tor) + a fat-finger deviation warning.
+  let refRate = null; // BTC per xBTC
+  async function showReference() {
+    const box = $("#f-ref");
+    if (!box) return;
+    try {
+      const r = await api("GET", "/reference-rate");
+      if (!r.enabled) { box.textContent = ""; refRate = null; return; }
+      if (r.error) { box.textContent = "Reference unavailable (" + r.error + "); using the order book."; refRate = null; return; }
+      refRate = r.rate;
+      const sell = $("#f-chain").value;
+      const shown = sell === "xbtc" ? r.rate : 1 / r.rate; // price is per-unit of what you sell
+      box.innerHTML = `Reference: <strong>${shown.toFixed(sell === "xbtc" ? 8 : 4)}</strong> (${r.source}). You still set the price.`;
+    } catch (e) { box.textContent = ""; refRate = null; }
+  }
+  function checkDeviation() {
+    const w = $("#f-dev");
+    if (!w || refRate === null) return;
+    const sell = $("#f-chain").value;
+    const ref = sell === "xbtc" ? refRate : 1 / refRate;
+    const p = parseFloat($("#f-price").value.replace(",", "."));
+    const off = isFinite(p) && ref > 0 ? Math.abs(p - ref) / ref : 0;
+    w.textContent = off > 0.05 ? `⚠ ${(off * 100).toFixed(0)}% from the reference — check the price.` : "";
+  }
+  $("#f-price").addEventListener("input", checkDeviation);
+  showReference();
   $("#f-go").onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
     const price = parseFloat($("#f-price").value.replace(",", "."));
@@ -234,6 +262,7 @@ async function loadSettings() {
   f.btc_conf.value = s.btc_conf;
   f.xbtc_conf.value = s.xbtc_conf;
   f.margin_blocks.value = s.margin_blocks;
+  f.price_reference.checked = !!s.price_reference;
 }
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -246,6 +275,7 @@ $("#settings-form").addEventListener("submit", async (e) => {
     btc_conf: +f.btc_conf.value,
     xbtc_conf: +f.xbtc_conf.value,
     margin_blocks: +f.margin_blocks.value,
+    price_reference: f.price_reference.checked,
   };
   try {
     await api("PUT", "/settings", body);
