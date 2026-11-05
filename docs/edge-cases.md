@@ -40,3 +40,4 @@ See `docs/design/0003-adversarial-testing.md`. Beyond the rows above:
 | Contract-script parser | `from_script_never_panics_and_only_accepts_round_tripping_scripts` | hostile bytes never panic; accepted only if byte-for-byte a template |
 | Counterparty-script check | `check_script_never_panics_on_a_hostile_counterparty_script` | hostile bytes never panic; accepted only on an exact match |
 | Preimage extraction | `extract_preimage_never_panics_and_only_returns_the_real_secret` | hostile witnesses never panic; a returned value's hash is the secret |
+| Many concurrent swaps | `many_swaps_run_concurrently_without_interference` | N swaps through one engine pair all settle; distinct key index each; no shared-coin or file interference |
