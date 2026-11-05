@@ -1,0 +1,51 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    container:
+      image: rust@sha256:ed2c95ca377d6571b124b05e75e01207973ded639dce7d5542eb7bcd797e32aa
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the relay (reproducible, pinned toolchain)
+        run: |
+          apt-get -qq update && apt-get -qq install -y --no-install-recommends gnupg >/dev/null
+          cargo build --locked --release --bin sovereign-swap-relay
+          mkdir -p dist
+          cp target/release/sovereign-swap-relay dist/sovereign-swap-relay-x86_64-linux
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum sovereign-swap-relay-x86_64-linux > SHA256SUMS
+      - name: Sign the checksums with the release key
+        working-directory: dist
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        # One signature over SHA256SUMS covers every artifact; a verifier checks the signature once
+        # then the hashes. The private key lives only in Actions secrets.
+        run: |
+          test -n "$GPG_PRIVATE_KEY"
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS
+          gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+      - name: Verify against the published key, in an empty keyring, as a user would
+        working-directory: dist
+        run: |
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import ../keys/twentyonelife-release.asc
+          gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Publish the release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/sovereign-swap-relay-x86_64-linux
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
