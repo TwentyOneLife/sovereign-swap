@@ -183,7 +183,11 @@ can start one and watch one, never seize or redirect value (0007).
 Defence in depth, because the GUI is untrusted and replaceable:
 
 1. **GUI** - immediate, for UX only: amounts are positive and well-formed, the rate is sane, the
-   "you receive" figure recomputes live, Publish/Take stay disabled until the form is valid.
+   "you receive" figure recomputes live, Publish/Take stay disabled until the form is valid. A BTC
+   amount field accepts **both decimal separators**, `0.5` and `0,5` (European), normalizing to
+   satoshis before it calls the API (which is integer-sats only, so no locale reaches the protocol);
+   a string with both separators or more than eight decimals is refused, not guessed. The canonical
+   normalizer is `daemon::parse_btc_to_sats`, which the GUI mirrors.
 2. **Daemon / API** - authoritative: amount above dust and above the offer's min fill, funds actually
    available in the funding wallet, node reachable, rate within a sanity band, timelocks taken from
    policy not the form. A bad request is rejected `422` with per-field reasons; the GUI shows them.
