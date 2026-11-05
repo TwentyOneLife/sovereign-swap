@@ -212,6 +212,10 @@ impl Swap {
 
     /// The secret (maker only) is passed in so it never has to be stored in the swap file.
     pub fn decide(&mut self, view: &ChainView, secret: Option<[u8; PREIMAGE_LEN]>) -> Vec<Action> {
+        // A settled swap is never reconsidered, so no later chain state can resurrect it.
+        if matches!(self.phase, Phase::Done | Phase::Refunded | Phase::Abandoned) {
+            return vec![];
+        }
         match self.role {
             Role::Maker => self.decide_maker(view, secret.expect("maker always has the secret")),
             Role::Taker => self.decide_taker(view),
