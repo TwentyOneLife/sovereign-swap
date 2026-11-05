@@ -39,7 +39,17 @@ the classical and the post-quantum scheme:
   the suite is inside the signed header, so there is no downgrade. Duplicates and expired messages
   (`created + ttl`) are dropped.
 
-## Library choice (verify before coding)
+## Library choice (decided 2026-11-05)
+
+**libcrux** (`libcrux-ml-kem` / `libcrux-ml-dsa`, pinned `=0.0.11`), for its formal verification, the
+strongest provenance for funds-adjacent crypto. Verified in the pinned image: ML-KEM-1024
+(shared secret 32 B, ciphertext 1568 B) and ML-DSA-87 (signature 4627 B) build and round-trip on
+stable `rustc 1.99.1`, sizes matching the spec. Classical halves: `x25519-dalek`, the `secp256k1`
+Schnorr already in the tree, `aes-gcm`, `hkdf`, `sha2`, each pinned exactly. RustCrypto `ml-kem`/
+`ml-dsa` (unaudited) and `aws-lc-rs` (pulls in a C library, worse for reproducible sovereign builds)
+were rejected.
+
+## Library notes
 
 Rust post-quantum support must be picked on provenance, not convenience, per GUARDRAILS 4:
 - Candidates: `libcrux-ml-kem` / `libcrux-ml-dsa` (formally verified) or `aws-lc-rs`. Pin exactly,
@@ -58,8 +68,12 @@ what a swap needs.
 
 ## Milestone split
 
-- M3a: the envelope (format 3) with test vectors and decoder fuzzing, behind the `Transport` trait,
-  still over the in-memory pair, so the two-engine tests run unchanged on the encrypted envelope.
+- M3a: the envelope (format 3). **Done:** `src/envelope.rs` implements seal/open (direct messages,
+  sign-then-encrypt) and sign/verify (broadcast offers) with the hybrid suite, deterministic
+  identities from a 32-byte seed, 7 unit tests (round trip, per-byte tamper, wrong recipient, wrong
+  sender, both-signature-halves-required, broadcast) and a decoder fuzz test. **Remaining:** wire it
+  behind the `Transport` trait so the two-engine tests run on the encrypted envelope, and publish
+  cross-implementation test vectors.
 - M3b: the Nostr client and Tor transport; a relay (`sovereign-swap-relay`) for tests.
 - M3c (then): Layer C of design 0003, DoS and protocol-fuzz the relay from the homelab Kali VM.
 

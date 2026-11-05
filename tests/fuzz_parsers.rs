@@ -166,3 +166,23 @@ fn extract_preimage_never_panics_and_only_returns_the_real_secret() {
         }
     }
 }
+
+mod envelope_fuzz {
+    use super::{iters, Rng};
+    use sovereign_swap::envelope::{open, verify_broadcast, Identity};
+
+    #[test]
+    fn open_and_verify_never_panic_on_random_bytes() {
+        let alice = Identity::from_seed(&[1; 32]);
+        let bob = Identity::from_seed(&[2; 32]);
+        let mut rng = Rng(0xEE11_2233);
+        for _ in 0..iters(200_000) {
+            // Lengths around the real header/key sizes so the length checks and slicing are exercised.
+            let len = rng.below(3400);
+            let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            // Must only ever return Err, never panic, on bytes we did not seal.
+            assert!(open(&bob, alice.public(), &bytes).is_err());
+            assert!(verify_broadcast(alice.public(), &bytes).is_err());
+        }
+    }
+}
