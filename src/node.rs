@@ -170,8 +170,11 @@ impl ChainNode {
                 break;
             }
         }
+        let value = Amount::from_btc(entry["amount"].as_f64().unwrap_or_default())
+            .map_err(|e| NodeError::Unexpected(e.to_string()))?;
         Ok(Some(LockView {
             outpoint,
+            value,
             amount_ok: exact.is_some(),
             confirmed_height,
             spend,
