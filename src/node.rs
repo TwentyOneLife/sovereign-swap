@@ -27,11 +27,43 @@ impl From<RpcError> for NodeError {
     }
 }
 
+/// Signs a funding transaction. The engine builds the unsigned PSBT and runs the replay guard; the
+/// signer turns it into a signed PSBT. This is the seam that keeps funding keys off the engine
+/// server: in production the signer is an external cold device, so the engine holds no spending key
+/// for the user's balance. `WalletSigner` (the node wallet) is the hot default for regtest and tests.
+pub trait FundingSigner: Send + Sync {
+    fn sign(&self, unsigned_psbt: &str) -> Result<String, NodeError>;
+}
+
+/// Signs with a bitcoind wallet that holds the keys. Hot: only for test and regtest use, never the
+/// cold production path.
+pub struct WalletSigner {
+    wallet: Client,
+}
+
+impl FundingSigner for WalletSigner {
+    fn sign(&self, unsigned_psbt: &str) -> Result<String, NodeError> {
+        let signed = self
+            .wallet
+            .call("walletprocesspsbt", json!([unsigned_psbt]))?;
+        if signed["complete"] != true {
+            return Err(NodeError::Unexpected(
+                "signer did not fully sign the funding psbt".into(),
+            ));
+        }
+        signed["psbt"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| NodeError::Unexpected("no psbt in sign result".into()))
+    }
+}
+
 pub struct ChainNode {
     pub rpc: Client,
     wallet: Client,
     watch: Client,
     network: Network,
+    signer: Box<dyn FundingSigner>,
 }
 
 fn parse<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T, NodeError> {
@@ -64,12 +96,24 @@ impl ChainNode {
                 rpc.call("createwallet", json!([wallet, watch_only, watch_only]))?;
             }
         }
+        let wallet = rpc.wallet(name);
+        let signer = Box::new(WalletSigner {
+            wallet: wallet.clone(),
+        });
         Ok(ChainNode {
-            wallet: rpc.wallet(name),
+            wallet,
             watch: rpc.wallet(&watch_name),
+            signer,
             rpc,
             network,
         })
+    }
+
+    /// Replaces the signer, e.g. an external cold signer in production so no funding key is on the
+    /// engine host. The funding wallet is then watch-only.
+    pub fn with_signer(mut self, signer: Box<dyn FundingSigner>) -> ChainNode {
+        self.signer = signer;
+        self
     }
 
     pub fn height(&self) -> Result<u32, NodeError> {
@@ -198,16 +242,20 @@ impl ChainNode {
         let funded = self
             .wallet
             .call("walletcreatefundedpsbt", json!([[], outputs, 0, options]))?;
-        let psbt = &funded["psbt"];
+        let psbt = funded["psbt"]
+            .as_str()
+            .ok_or_else(|| NodeError::Unexpected("no psbt".into()))?;
         let decoded = self.rpc.call("decodepsbt", json!([psbt]))?;
         check_inputs(&inputs_of(&decoded["tx"])?, other_chain).map_err(NodeError::Replay)?;
-        let signed = self.wallet.call("walletprocesspsbt", json!([psbt]))?;
-        if signed["complete"] != true {
+        // Delegate signing: the engine never holds the funding keys (cold in production).
+        let signed_psbt = self.signer.sign(psbt)?;
+        let finalized = self.rpc.call("finalizepsbt", json!([signed_psbt]))?;
+        if finalized["complete"] != true {
             return Err(NodeError::Unexpected(
-                "wallet could not sign the lock".into(),
+                "funding psbt did not finalize".into(),
             ));
         }
-        let tx: Transaction = parse(&signed["hex"])?;
+        let tx: Transaction = parse(&finalized["hex"])?;
         contract
             .find_lock_output(&tx, amount)
             .map_err(|e| NodeError::Unexpected(format!("funded lock: {e:?}")))?;
