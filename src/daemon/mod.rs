@@ -75,6 +75,14 @@ pub struct Daemon {
     /// Server-Sent-Events subscribers (the GUI). The engine thread broadcasts phase changes and new
     /// offers here so the GUI updates live instead of polling.
     events: Arc<Mutex<Vec<Sender<String>>>>,
+    /// Optional web UI password (`SWAP_USERNAME`/`SWAP_PASSWORD`, set by the StartOS package). When
+    /// present, the page and its assets (which carry the API token) are served only to a browser that
+    /// passes HTTP Basic auth, so knowing the onion is no longer enough to reach the swaps.
+    basic_auth: Option<(String, String)>,
+    /// When set (`SWAP_CONFIG_LOCKED=1`, the StartOS package), node/relay config is owned by the
+    /// package action: the web UI shows it read-only and `PUT /settings` is refused. This keeps the
+    /// one config source authoritative and off the public page.
+    config_locked: bool,
 }
 
 impl Daemon {
@@ -87,6 +95,14 @@ impl Daemon {
             Err(_) => Settings::default(),
         };
         let token = load_or_make_token(data_dir)?;
+        let basic_auth = match (
+            std::env::var("SWAP_USERNAME"),
+            std::env::var("SWAP_PASSWORD"),
+        ) {
+            (Ok(u), Ok(p)) if !u.is_empty() && !p.is_empty() => Some((u, p)),
+            _ => None,
+        };
+        let config_locked = std::env::var("SWAP_CONFIG_LOCKED").as_deref() == Ok("1");
         let daemon = Daemon {
             state: Arc::new(Mutex::new(DaemonState { settings })),
             token,
@@ -96,6 +112,8 @@ impl Daemon {
             routing_seed: load_or_make_seed(data_dir, "routing.seed")?,
             events: Arc::new(Mutex::new(Vec::new())),
             reference: Reference::default(),
+            basic_auth,
+            config_locked,
         };
         // If the saved settings are already complete, bring the engine up; otherwise it starts after
         // the first complete PUT /settings. A failure here is not fatal (the GUI learns it from GET
@@ -222,6 +240,20 @@ impl Daemon {
                 return self.write_json(&mut stream, code, &json!({"error": "bad request"}))
             }
         };
+        // Web UI password: when StartOS has set credentials, the page and its assets (which carry the
+        // API token) are served only to a Basic-authenticated browser. The API and event stream stay
+        // token-gated, and the token is never served without the password, so the whole site is behind
+        // it. When no credentials are set (a plain non-StartOS daemon), the page is open as before.
+        if let Some((user, pass)) = self.basic_auth.clone() {
+            let is_page = req.method == "GET"
+                && matches!(
+                    req.path.as_str(),
+                    "/" | "/index.html" | "/app.css" | "/app.js"
+                );
+            if is_page && !self.basic_ok(&req, &user, &pass) {
+                return self.write_unauthorized_basic(&mut stream);
+            }
+        }
         // The live event stream is a long-lived connection, not a single response.
         if req.method == "GET" && req.path == "/events" {
             if self.authorized(&req) {
@@ -271,6 +303,18 @@ impl Daemon {
             body.len()
         );
         let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
+    }
+
+    /// A 401 that makes the browser prompt for the web UI password (HTTP Basic).
+    fn write_unauthorized_basic(&self, stream: &mut TcpStream) {
+        let body = br#"{"error":"authentication required"}"#;
+        let resp = format!(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"sovereign-swap\", charset=\"UTF-8\"\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(resp.as_bytes());
         let _ = stream.write_all(body);
     }
 
@@ -352,6 +396,21 @@ impl Daemon {
         }
     }
 
+    /// Whether the request carries the correct HTTP Basic credentials. Compared in constant time
+    /// against the expected header, so neither the username nor the password leaks by timing.
+    fn basic_ok(&self, req: &Request, user: &str, pass: &str) -> bool {
+        match req.headers.get("authorization") {
+            Some(h) => {
+                let expected = format!(
+                    "Basic {}",
+                    crate::rpc::base64(format!("{user}:{pass}").as_bytes())
+                );
+                constant_time_eq(h.as_bytes(), expected.as_bytes())
+            }
+            None => false,
+        }
+    }
+
     /// The opt-in external price reference (nonkyc BTCB2/BTC, over Tor). `{enabled:false}` when off;
     /// a hint only, never a price the protocol relies on.
     fn reference_rate(&self) -> (u16, Value) {
@@ -387,6 +446,7 @@ impl Daemon {
             "relays": settings.relays.len(),
             "engine": running,
             "active_swaps": active,
+            "config_locked": self.config_locked,
         })
     }
 
@@ -470,6 +530,12 @@ impl Daemon {
     }
 
     fn put_settings(&self, body: &[u8]) -> (u16, Value) {
+        if self.config_locked {
+            return (
+                403,
+                json!({"error": "configuration is managed by StartOS; edit it in Actions and Config"}),
+            );
+        }
         let Ok(settings) = serde_json::from_slice::<Settings>(body) else {
             return (
                 400,
