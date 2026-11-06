@@ -56,6 +56,31 @@ pub struct Settings {
     /// Opt-in external price reference (nonkyc BTCB2/BTC, fetched over Tor). A hint only; off by default.
     #[serde(default)]
     pub price_reference: bool,
+    /// Voluntary fee, off by default (design 0010). Off keeps the engine on today's lock path with no
+    /// fee output and no BIP352 code. Stays off until a legal opinion.
+    #[serde(default)]
+    pub fee_enabled: bool,
+    /// The operator's published silent payment address (BIP352). Each swap pays a fresh, unlinkable
+    /// output derived from it. Required when `fee_enabled`; ignored otherwise.
+    #[serde(default)]
+    pub fee_sp_address: String,
+    /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
+    #[serde(default = "default_fee_maker_bps")]
+    pub fee_maker_bps: u16,
+    /// Taker fee, basis points (default 30 = 0.30 %).
+    #[serde(default = "default_fee_taker_bps")]
+    pub fee_taker_bps: u16,
+}
+
+/// The largest fee a setting may ask for: a guard against a fat-finger, not a policy (spec 7.5 sets
+/// the real defaults far below this). One percent is already well above any sane swap fee.
+pub(crate) const MAX_FEE_BPS: u16 = 100;
+
+fn default_fee_maker_bps() -> u16 {
+    20
+}
+fn default_fee_taker_bps() -> u16 {
+    30
 }
 
 impl Default for Settings {
@@ -73,6 +98,10 @@ impl Default for Settings {
             xbtc_rpc_user: String::new(),
             xbtc_rpc_pass: String::new(),
             price_reference: false,
+            fee_enabled: false,
+            fee_sp_address: String::new(),
+            fee_maker_bps: default_fee_maker_bps(),
+            fee_taker_bps: default_fee_taker_bps(),
         }
     }
 }
@@ -102,8 +131,29 @@ impl Settings {
         if self.margin_blocks < 1 || self.margin_blocks > 1000 {
             e.push("margin_blocks: 1..=1000".to_owned());
         }
+        if self.fee_maker_bps > MAX_FEE_BPS {
+            e.push(format!("fee_maker_bps: 0..={MAX_FEE_BPS}"));
+        }
+        if self.fee_taker_bps > MAX_FEE_BPS {
+            e.push(format!("fee_taker_bps: 0..={MAX_FEE_BPS}"));
+        }
+        // Only when the fee is switched on does the address matter. The signer's BIP352 capability is
+        // checked where the live signer is known (the engine wiring), not in this pure validation; a
+        // non-BIP352 signer refuses to enable fees there with a clear message (design 0010).
+        if self.fee_enabled && !looks_like_sp_address(&self.fee_sp_address) {
+            e.push("fee_sp_address: a silent payment address is required when the fee is enabled".to_owned());
+        }
         e
     }
+}
+
+/// A lightweight shape check for a silent payment address (BIP352): the bech32m `sp1`/`tsp1` prefix
+/// and a plausible length. This is a settings guard only; the authoritative parse happens in the
+/// BIP352 layer that derives the output (design 0010 step 3), which rejects anything malformed or on
+/// the wrong network before a single sat is committed.
+fn looks_like_sp_address(a: &str) -> bool {
+    let a = a.trim();
+    (a.starts_with("sp1") || a.starts_with("tsp1")) && a.len() >= 110 && a.len() <= 1023
 }
 
 /// A scaffold offer record. The live version is published to the relays and discovered from them;
@@ -214,5 +264,51 @@ pub(crate) fn valid_host_port(s: &str) -> bool {
                 && !host.contains('/')
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A plausible-length sp1 string for the shape check (not a real key; the BIP352 layer parses it).
+    fn sp_addr() -> String {
+        format!("sp1q{}", "q".repeat(110))
+    }
+
+    #[test]
+    fn fee_defaults_are_off_and_old_config_loads() {
+        let s = Settings::default();
+        assert!(!s.fee_enabled);
+        assert_eq!((s.fee_maker_bps, s.fee_taker_bps), (20, 30));
+        assert!(s.validate().is_empty(), "defaults must validate");
+        // Config written before the fee fields existed still deserializes (serde defaults).
+        let old = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":[],
+            "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(!s.fee_enabled && s.fee_maker_bps == 20 && s.fee_taker_bps == 30);
+    }
+
+    #[test]
+    fn enabling_the_fee_requires_a_silent_payment_address() {
+        let mut s = Settings::default();
+        s.fee_enabled = true;
+        assert!(
+            s.validate().iter().any(|m| m.contains("fee_sp_address")),
+            "enabled fee with no address must be refused"
+        );
+        s.fee_sp_address = sp_addr();
+        assert!(s.validate().is_empty(), "a well-formed sp address is accepted");
+        // Disabled again, the address is irrelevant and a blank one is fine.
+        s.fee_enabled = false;
+        s.fee_sp_address = String::new();
+        assert!(s.validate().is_empty());
+    }
+
+    #[test]
+    fn a_fat_finger_rate_is_capped() {
+        let mut s = Settings::default();
+        s.fee_maker_bps = MAX_FEE_BPS + 1;
+        assert!(s.validate().iter().any(|m| m.contains("fee_maker_bps")));
     }
 }
