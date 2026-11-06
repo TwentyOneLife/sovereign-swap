@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>sovereign-swap</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <div class="brand">⇄ <strong>sovereign-swap</strong></div>
+  <nav>
+    <button class="tab active" data-tab="market" title="Offers from other people">Market</button>
+    <button class="tab" data-tab="swaps" title="Your swaps, live and past">Swaps</button>
+    <button class="tab" data-tab="settings" title="Your nodes, relays and limits">Settings</button>
+  </nav>
+  <div id="status" class="status" title="Node and Tor connectivity">…</div>
+</header>
+
+<main>
+  <!-- MARKET -->
+  <section id="market" class="view active">
+    <div class="row between">
+      <h1>Market</h1>
+      <button id="new-offer" class="primary">+ Create offer</button>
+    </div>
+    <p class="muted">Offers are public. Identities are not — only a throwaway routing key.</p>
+    <table id="offers">
+      <thead><tr>
+        <th title="The chain the maker is selling">Selling</th>
+        <th title="How much they sell">Amount</th>
+        <th title="What you pay, on the other chain">For</th>
+        <th title="How much of the other coin per unit; above 1.0 favours the seller">Rate</th>
+        <th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <p id="offers-empty" class="muted center">No offers yet.</p>
+  </section>
+
+  <!-- SWAPS -->
+  <section id="swaps" class="view">
+    <h1>Swaps</h1>
+    <table id="swaps-table">
+      <thead><tr>
+        <th>Swap</th><th title="Your role">Role</th><th>Direction</th>
+        <th title="Where the swap is in its lifecycle">Phase</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <p id="swaps-empty" class="muted center">No swaps yet.</p>
+    <div id="swap-detail"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="settings" class="view">
+    <h1>Settings</h1>
+    <form id="settings-form" class="card">
+      <label>BTC node <input name="btc_node" placeholder="127.0.0.1:8332"></label>
+      <label>xBTC node <input name="xbtc_node" placeholder="127.0.0.1:8442"></label>
+      <label>Relays (one per line, ws:// or wss://)
+        <textarea name="relays" rows="2" placeholder="ws://…onion:7777"></textarea></label>
+      <label>Signer
+        <select name="signer" title="Cold keeps your spending keys offline; Hot is for regtest only">
+          <option value="cold">Cold / watch-only</option>
+          <option value="hot">Hot (regtest only)</option>
+        </select></label>
+      <label title="Fetch nonkyc's BTCB2/BTC price over Tor as a hint; off by default, never relied on"><input type="checkbox" name="price_reference"> External price reference (nonkyc, over Tor) — a hint only</label>
+      <div class="row">
+        <label title="Confirmations we wait on a BTC lock">BTC conf <input name="btc_conf" type="number" min="1" value="1"></label>
+        <label title="Confirmations we wait on an xBTC lock">xBTC conf <input name="xbtc_conf" type="number" min="1" value="2"></label>
+        <label title="Safety gap between the two legs' timelocks">Margin <input name="margin_blocks" type="number" min="1" value="2"></label>
+      </div>
+      <div class="row between">
+        <span id="settings-msg" class="muted"></span>
+        <button class="primary" type="submit">Save</button>
+      </div>
+    </form>
+    <p class="muted">On a StartOS node the BTC/xBTC node connection comes from the package config; here
+      these fields apply to a plain daemon.</p>
+  </section>
+</main>
+
+<footer>
+  <span>non-custodial · your keys stay on your node</span>
+  <span class="muted">no account · Tor-first</span>
+</footer>
+
+<!-- Create / Take offer modal -->
+<div id="modal" class="modal hidden"><div class="sheet card"></div></div>
+
+<script>window.SWAP_TOKEN="__TOKEN__";</script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -113,6 +113,39 @@ impl Policy {
         }
         Ok(depths)
     }
+
+    /// The smallest `(maker_lock_blocks, taker_lock_blocks)` that satisfy `depths` for an offer of
+    /// these parameters, plus a small headroom. A client sizes an offer's timelocks to the amount
+    /// with this, rather than a fixed default that is too short once the amount needs deeper
+    /// confirmations. `None` if the amount is above the policy's table (there is no valid lock then).
+    pub fn min_lock_blocks(
+        &self,
+        maker_chain: Chain,
+        maker_part: Amount,
+        taker_part: Amount,
+        maker_lock_depth: u32,
+        taker_lock_depth: u32,
+        margin: u32,
+    ) -> Option<(u16, u16)> {
+        let btc_side = match maker_chain {
+            Chain::Btc => maker_part,
+            Chain::Xbtc => taker_part,
+        };
+        let maker_final = self.depth(maker_chain, btc_side)?;
+        let taker_final = self.depth(maker_chain.other(), btc_side)?;
+        let maker_lock = maker_lock_depth.max(maker_final);
+        let taker_lock = taker_lock_depth.max(taker_final);
+        // Mirror `depths`: each lock must exceed its room, so take room + headroom. The maker's room
+        // includes the taker's lock blocks, so size the taker first.
+        let headroom = 2;
+        let taker_lock_blocks = taker_lock + margin + taker_final + headroom;
+        let maker_lock_blocks =
+            maker_lock + taker_lock + taker_lock_blocks + margin + maker_final + headroom;
+        Some((
+            u16::try_from(maker_lock_blocks).ok()?,
+            u16::try_from(taker_lock_blocks).ok()?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +230,37 @@ mod tests {
             p.depths(&offer(288, 12), small.0, small.1),
             Err(PolicyError::TimelocksTooShort)
         );
+    }
+
+    #[test]
+    fn min_lock_blocks_pass_the_depths_check_for_any_amount() {
+        let policy = Policy::standard();
+        // Across the policy table (small to the cap), the sized locks must satisfy `depths`.
+        for sat in [500_000u64, 50_000_000, 100_000_000] {
+            let o = {
+                let mut o = offer(0, 0);
+                o.maker_amount = Amount::from_sat(sat);
+                o.taker_amount = Amount::from_sat((sat as f64 * 0.997) as u64);
+                o
+            };
+            let (m, t) = policy
+                .min_lock_blocks(
+                    o.maker_chain,
+                    o.maker_amount,
+                    o.taker_amount,
+                    1,
+                    1,
+                    o.margin_blocks,
+                )
+                .expect("within the table");
+            let sized = Offer {
+                maker_lock_blocks: m,
+                taker_lock_blocks: t,
+                ..o.clone()
+            };
+            policy
+                .depths(&sized, sized.maker_amount, sized.taker_amount)
+                .expect("sized timelocks satisfy depths");
+        }
     }
 }
