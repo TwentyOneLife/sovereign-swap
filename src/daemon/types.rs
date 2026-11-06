@@ -156,7 +156,9 @@ impl Settings {
 /// the wrong network before a single sat is committed.
 fn looks_like_sp_address(a: &str) -> bool {
     let a = a.trim();
-    (a.starts_with("sp1") || a.starts_with("tsp1")) && a.len() >= 110 && a.len() <= 1023
+    (a.starts_with("sp1") || a.starts_with("tsp1") || a.starts_with("sprt1"))
+        && a.len() >= 110
+        && a.len() <= 1023
 }
 
 /// What a `POST /offers` body must contain. Validated before an offer is created.

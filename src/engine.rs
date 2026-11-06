@@ -419,6 +419,9 @@ impl<T: Transport> Engine<T> {
         let Ok(recipient) = SilentPaymentAddress::parse(&terms.sp_address) else {
             return FeeState::Failed;
         };
+        if recipient.network != cp_chain.network() {
+            return FeeState::Failed; // a fee address for the wrong network
+        }
         let Ok(proof_bytes) = <[u8; 64]>::try_from(proof.proof.as_slice()) else {
             return FeeState::Failed;
         };
@@ -544,6 +547,12 @@ impl<T: Transport> Engine<T> {
                                 SilentPaymentAddress::parse(&terms.sp_address).map_err(|e| {
                                     NodeError::Unexpected(format!("fee address: {e:?}"))
                                 })?;
+                            if addr.network != self.nodes[&own_chain].network() {
+                                return Err(NodeError::Unexpected(
+                                    "fee address is for the wrong network".into(),
+                                )
+                                .into());
+                            }
                             let rates = FeeRates {
                                 maker_bps: terms.maker_bps,
                                 taker_bps: terms.taker_bps,

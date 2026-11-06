@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
-use bitcoin::{OutPoint, ScriptBuf, Txid, Witness};
+use bitcoin::{Network, OutPoint, ScriptBuf, Txid, Witness};
 use serde_json::Value;
 
 use sovereign_swap::silentpayments::{
@@ -190,7 +190,7 @@ fn receiving_vectors_match_without_labels() {
             let addr = SilentPaymentAddress {
                 scan: scan_pub,
                 spend: spend_pub,
-                testnet: false,
+                network: Network::Bitcoin,
             };
             let expected_addr = rv["expected"]["addresses"].as_array().unwrap()[0]
                 .as_str()

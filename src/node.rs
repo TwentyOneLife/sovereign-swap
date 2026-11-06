@@ -134,6 +134,10 @@ impl ChainNode {
         self
     }
 
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
     pub fn height(&self) -> Result<u32, NodeError> {
         Ok(self
             .rpc
