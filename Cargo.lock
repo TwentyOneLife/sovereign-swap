@@ -1039,6 +1039,7 @@ name = "sovereign-swap"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "bech32",
  "bitcoin",
  "hkdf",
  "libcrux-ml-dsa",

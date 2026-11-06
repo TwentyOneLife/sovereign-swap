@@ -291,8 +291,10 @@ mod tests {
 
     #[test]
     fn enabling_the_fee_requires_a_silent_payment_address() {
-        let mut s = Settings::default();
-        s.fee_enabled = true;
+        let mut s = Settings {
+            fee_enabled: true,
+            ..Default::default()
+        };
         assert!(
             s.validate().iter().any(|m| m.contains("fee_sp_address")),
             "enabled fee with no address must be refused"
@@ -307,8 +309,10 @@ mod tests {
 
     #[test]
     fn a_fat_finger_rate_is_capped() {
-        let mut s = Settings::default();
-        s.fee_maker_bps = MAX_FEE_BPS + 1;
+        let s = Settings {
+            fee_maker_bps: MAX_FEE_BPS + 1,
+            ..Default::default()
+        };
         assert!(s.validate().iter().any(|m| m.contains("fee_maker_bps")));
     }
 }

@@ -9,6 +9,9 @@ publish = false
 
 [dependencies]
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "serde"] }
+# Already in the tree via bitcoin; promoted to a direct, pinned dep for silent payment (BIP352)
+# address bech32m encode/decode. No new crate enters the lockfile.
+bech32 = { version = "=0.11.1", default-features = false, features = ["alloc"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 # Post-quantum primitives: libcrux is formally verified (design 0005). Pinned exactly.
 libcrux-ml-kem = "=0.0.11"
