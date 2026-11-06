@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
+use crate::fee::{self, FeeRates};
 use crate::node::{ChainNode, FeeProof, NodeError};
+use crate::silentpayments::SilentPaymentAddress;
 use crate::policy::{Policy, PolicyError};
 use crate::store::write_atomic;
 use crate::swap::{Action, BidError, Chain, ChainView, Message, Offer, Phase, Role, Swap};
@@ -416,15 +418,34 @@ impl<T: Transport> Engine<T> {
                 Some(tx) => (own_chain, tx),
                 None => {
                     let other = &self.nodes[&own_chain.other()].rpc;
-                    // The fee is wired through here; the terms come from the offer in a later step
-                    // (design 0010), so for now no fee is requested.
+                    let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
+                    // The voluntary fee (design 0010): terms come from the offer, the amount from
+                    // our role and what we lock. If the offer sets terms we cannot honour (a bad
+                    // address, or a trade below the minimum), funding fails loudly: we never lock
+                    // without the fee the counterparty will look for.
+                    let fee = match &swap.offer.fee {
+                        None => None,
+                        Some(terms) => {
+                            let addr = SilentPaymentAddress::parse(&terms.sp_address).map_err(
+                                |e| NodeError::Unexpected(format!("fee address: {e:?}")),
+                            )?;
+                            let rates = FeeRates {
+                                maker_bps: terms.maker_bps,
+                                taker_bps: terms.taker_bps,
+                            };
+                            let amount = fee::fee_amount(rates, swap.role, lock_amount).map_err(
+                                |e| NodeError::Unexpected(format!("fee amount: {e:?}")),
+                            )?;
+                            Some((amount, addr))
+                        }
+                    };
                     let (tx, fee_proof) = self.nodes[&own_chain].fund(
                         own_contract,
-                        self.lock_amount_override.unwrap_or(own_amount),
+                        lock_amount,
                         self.config.fee_rate_sat_vb,
                         self.config.policy.funding_minconf(own_chain),
                         other,
-                        None,
+                        fee.as_ref().map(|(a, addr)| (*a, addr)),
                     )?;
                     self.records[i].funding = Some(tx.clone());
                     self.records[i].fee = fee_proof;

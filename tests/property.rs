@@ -48,6 +48,7 @@ fn swap(role: Role) -> Swap {
         maker_lock_depth: 2,
         taker_lock_depth: 2,
         margin_blocks: 3,
+        fee: None,
     };
     Swap {
         id: [2; 16],

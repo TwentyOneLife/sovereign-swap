@@ -28,6 +28,16 @@ impl Chain {
 /// Below this a swap output is not worth making; also keeps both sides clear of dust.
 pub const MIN_SWAP_AMOUNT: Amount = Amount::from_sat(10_000);
 
+/// The voluntary fee terms an offer carries (design 0010). Both sides pay and verify against these,
+/// so the terms are never taken from one side's local settings; `None` on an offer means no fee.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeTerms {
+    pub maker_bps: u16,
+    pub taker_bps: u16,
+    /// The operator's silent payment (BIP352) address the fee output pays.
+    pub sp_address: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
     pub id: [u8; 16],
@@ -45,6 +55,10 @@ pub struct Offer {
     pub taker_lock_depth: u32,
     /// Blocks kept in reserve before any deadline.
     pub margin_blocks: u32,
+    /// Voluntary fee terms (design 0010); `None` means a fee-less offer. `serde(default)` so offers
+    /// from before the fee existed still deserialize.
+    #[serde(default)]
+    pub fee: Option<FeeTerms>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -384,7 +398,17 @@ mod tests {
             maker_lock_depth: 2,
             taker_lock_depth: 2,
             margin_blocks: 3,
+            fee: None,
         }
+    }
+
+    #[test]
+    fn an_offer_from_before_the_fee_still_deserializes() {
+        // A pre-fee offer has no `fee` field; serde(default) fills it with None.
+        let mut v = serde_json::to_value(offer()).unwrap();
+        v.as_object_mut().unwrap().remove("fee");
+        let back: Offer = serde_json::from_value(v).unwrap();
+        assert!(back.fee.is_none());
     }
 
     fn contract(byte: u8) -> Contract {

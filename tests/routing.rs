@@ -30,6 +30,7 @@ fn offer() -> Offer {
         maker_lock_depth: 1,
         taker_lock_depth: 1,
         margin_blocks: 2,
+        fee: None,
     }
 }
 

@@ -2,7 +2,7 @@
 use bitcoin::Amount;
 use serde::{Deserialize, Serialize};
 
-use crate::swap::{Chain as SwapChain, Offer as SwapOffer};
+use crate::swap::{Chain as SwapChain, FeeTerms, Offer as SwapOffer};
 
 use super::engine::{engine_config, MAKER_LOCK_BLOCKS, TAKER_LOCK_BLOCKS};
 use super::wire::random16;
@@ -211,6 +211,14 @@ impl NewOffer {
             .policy
             .min_lock_blocks(maker_chain, maker_amount, taker_amount, 1, 1, margin)
             .unwrap_or((MAKER_LOCK_BLOCKS, TAKER_LOCK_BLOCKS));
+        // The fee terms travel in the offer (design 0010), filled from the operator's settings when
+        // the fee is on; a fee-less offer carries None. The address was shape-checked by
+        // Settings::validate; the taker's engine parses it for its network before paying.
+        let fee = s.fee_enabled.then(|| FeeTerms {
+            maker_bps: s.fee_maker_bps,
+            taker_bps: s.fee_taker_bps,
+            sp_address: s.fee_sp_address.clone(),
+        });
         SwapOffer {
             id: random16(),
             maker_chain,
@@ -222,6 +230,7 @@ impl NewOffer {
             maker_lock_depth: 1,
             taker_lock_depth: 1,
             margin_blocks: margin,
+            fee,
         }
     }
 }
@@ -274,6 +283,32 @@ mod tests {
     // A plausible-length sp1 string for the shape check (not a real key; the BIP352 layer parses it).
     fn sp_addr() -> String {
         format!("sp1q{}", "q".repeat(110))
+    }
+
+    fn a_new_offer() -> NewOffer {
+        NewOffer {
+            sell_chain: Chain::Xbtc,
+            amount_sat: 50_000_000,
+            price: 1.0,
+            min_amount_sat: 50_000_000,
+        }
+    }
+
+    #[test]
+    fn an_offer_carries_fee_terms_only_when_the_fee_is_on() {
+        // Fee off (the default): the offer is fee-less.
+        assert!(a_new_offer().into_swap_offer(&Settings::default()).fee.is_none());
+        // Fee on: the offer carries the operator's rates and address, from settings.
+        let on = Settings {
+            fee_enabled: true,
+            fee_sp_address: sp_addr(),
+            fee_maker_bps: 20,
+            fee_taker_bps: 30,
+            ..Default::default()
+        };
+        let terms = a_new_offer().into_swap_offer(&on).fee.expect("fee terms");
+        assert_eq!((terms.maker_bps, terms.taker_bps), (20, 30));
+        assert_eq!(terms.sp_address, sp_addr());
     }
 
     #[test]
