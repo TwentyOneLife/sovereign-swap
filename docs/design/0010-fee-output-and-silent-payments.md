@@ -209,3 +209,84 @@ No coordinator, no fee quote request or response, no account key, no volume ledg
 watching, no Fulcrum or Shulcrum Electrum connection for fees. The static voluntary model needs none
 of them. If volume tiers ever return (they were considered and set aside in 7.5), they are a
 coordinator service and a separate design, not a change to this path.
+
+## Addendum (2026-11-06): wiring the fee onto the live swap
+
+Review of the wiring plan surfaced four points that change the integration (not the crypto, which is
+built and vector-tested). They are recorded here before the state machine is touched.
+
+### 1. Fee terms travel in the Offer, not in each side's Settings
+
+`verify_fee` must check against terms both sides agreed, not against the verifier's local `Settings`.
+If the taker verified against its own `fee_*` settings, an opted-out maker, a different rate, or a
+fork with another address would fail the taker's check **after the maker has already locked**,
+stranding the maker's coins until the timelock. So the Offer carries the terms:
+
+```
+Offer { ..., fee: Option<FeeTerms { maker_bps: u16, taker_bps: u16, sp_address: String }> }
+```
+
+The maker fills `fee` from its own settings when it publishes; the taker accepts those terms by
+bidding; both sides pay and verify against the **offer's** terms. `Settings.fee_*` become the
+operator's defaults for the offers this client creates, not an input to verification. The Offer (and
+the new `FeeProof` message, below) are a wire-format change and are versioned together.
+
+Open sub-decision (owner): should a default client bid on, or publish, **fee-less** offers
+(`fee: None`)? Allowing them makes the fee trivially avoidable inside the default network; refusing
+them gives the voluntary fee teeth among default clients. Until fees are enabled (pending the legal
+opinion) every offer is fee-less and the question is moot; it is settled before the switch is turned
+on. The verifier treats `fee: None` as "no fee output expected" (no check); `fee: Some` requires the
+output.
+
+### 2. The counterparty gate has three states, and never wraps the claim-continuation path
+
+A boolean `fee_ok` conflates "proof not yet arrived" with "fee missing", which would either abandon a
+good swap the instant the lock gets deep, or (worse) gate a claim. The gate is three-valued:
+
+- `Failed`  -> abandon, alongside `!amount_ok` (before this side commits its own lock).
+- `Pending` -> do nothing this tick; the existing `lock_deadline` already bounds the wait.
+- `Verified` -> proceed.
+
+Placement is exact:
+- Taker, before funding: fund only on `Verified`; `Failed` abandons; `Pending` waits. The taker's
+  `learned_secret` claim path (swap.rs) gets **no** fee gate.
+- Maker, before claiming: the fee is one term of the pre-claim conjunction only,
+  `go = phase == Claiming || (amount_ok && fee == Verified && deep && time_left)`. It must never wrap
+  the whole expression: once the secret is public the maker keeps re-claiming regardless, or the
+  taker can take both legs.
+
+Unit tests must cover: proof arrives after the lock is deep (no abandon); proof never arrives
+(abandon at the deadline); proof arrives after the maker entered `Claiming` (claim continues).
+
+### 3. Verification needs prevout scriptPubKeys, so the payer ships the prevout transactions
+
+`input_pubkey` reads the prevout scriptPubKey, which a lock transaction does not contain (a taproot
+key-path witness is only a signature). Rather than require `-txindex` on the verifier's node, the
+payer includes the **full prevout transactions** in the `FeeProof` message; the verifier checks each
+hashes to its outpoint's txid, then classifies eligibility from the prevout it just authenticated.
+Trustless, and works on any node. On the payer side, `NoEligibleInputs` at fund time is a hard error
+(never fund without the fee, or the counterparty abandons); coin selection is restricted to eligible
+input types (P2WPKH / P2TR) so this does not arise in practice.
+
+### 4. The fee proof is persisted and re-sent
+
+The `FeePayment` (share, proof, prevouts) is written in the same atomic `Record` as the signed
+`funding`, before the first broadcast, so a restart resends the same share rather than asking a cold
+signer to regenerate it. The `FeeProof` message is re-sent each tick until the counterparty's lock
+appears, since the relay may drop it; receiving it twice is harmless.
+
+### Regtest notes
+
+- `WalletSigner` key access: recent Bitcoin Core has no legacy wallets, so not `dumpprivkey`. Derive
+  each input key from `listdescriptors true` plus `getaddressinfo(addr).hdkeypath`, reusing the bip32
+  code in `keys.rs`; or fund the e2e from an imported known single-key descriptor.
+- Silent payment address network: regtest uses the `sprt` HRP, which `parse` and `looks_like_sp_address`
+  must accept, and the parsed network is checked against the chain on both BTC and xBTC.
+
+### Order of work
+
+1. This addendum.
+2. Step-1 plumbing: `fund(.., fee: Option<(Amount, &SilentPaymentAddress)>)`, the BIP352-aware signer
+   seam returning the signed PSBT and the `FeePayment`, and persistence in `Record`.
+3. The `FeeProof` message (with prevouts) and the three-state gate in `decide`.
+4. Regtest end to end, with the key-access and HRP points above.
