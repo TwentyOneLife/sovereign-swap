@@ -267,6 +267,16 @@ async function loadSettings() {
   f.fee_sp_address.value = s.fee_sp_address || "";
   if (s.fee_maker_bps != null) f.fee_maker_bps.value = s.fee_maker_bps;
   if (s.fee_taker_bps != null) f.fee_taker_bps.value = s.fee_taker_bps;
+  // When StartOS owns the config (config_locked), the web view is read-only: the one source of truth
+  // is the package action, and the public page never edits node or relay settings.
+  const st = await api("GET", "/status").catch(() => null);
+  const locked = !!(st && st.config_locked);
+  [...f.elements].forEach((el) => {
+    el.disabled = locked;
+  });
+  $("#settings-msg").textContent = locked
+    ? "Node and relay settings are managed in StartOS (Actions and Config); this view is read-only."
+    : "";
 }
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
