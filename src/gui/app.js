@@ -263,6 +263,10 @@ async function loadSettings() {
   f.xbtc_conf.value = s.xbtc_conf;
   f.margin_blocks.value = s.margin_blocks;
   f.price_reference.checked = !!s.price_reference;
+  f.fee_enabled.checked = !!s.fee_enabled;
+  f.fee_sp_address.value = s.fee_sp_address || "";
+  if (s.fee_maker_bps != null) f.fee_maker_bps.value = s.fee_maker_bps;
+  if (s.fee_taker_bps != null) f.fee_taker_bps.value = s.fee_taker_bps;
 }
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -276,6 +280,10 @@ $("#settings-form").addEventListener("submit", async (e) => {
     xbtc_conf: +f.xbtc_conf.value,
     margin_blocks: +f.margin_blocks.value,
     price_reference: f.price_reference.checked,
+    fee_enabled: f.fee_enabled.checked,
+    fee_sp_address: f.fee_sp_address.value.trim(),
+    fee_maker_bps: +f.fee_maker_bps.value,
+    fee_taker_bps: +f.fee_taker_bps.value,
   };
   try {
     await api("PUT", "/settings", body);
