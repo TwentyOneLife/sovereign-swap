@@ -347,6 +347,11 @@ impl<T: Transport> Engine<T> {
             received_fee: None,
             swap,
         };
+        let id: String = record.swap.id.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "swap {id} ({:?}) started: maker {}, taker {}, phase {:?}",
+            record.swap.role, record.swap.maker_part, record.swap.taker_part, record.swap.phase
+        );
         self.save(&record)?;
         self.records.push(record);
         self.save_state()
@@ -484,8 +489,18 @@ impl<T: Transport> Engine<T> {
             ) {
                 continue;
             }
+            let before = self.records[i].swap.phase;
             if let Err(e) = self.advance(i) {
                 errors.push((self.records[i].swap.id, e));
+            }
+            // Log every phase transition so an operator can follow a swap in `package logs`, not only
+            // in the web UI: the engine store and the API remain the record of truth, this is the
+            // monitoring trail. No secrets are logged, only the swap id, role, and phase.
+            let after = self.records[i].swap.phase;
+            if after != before {
+                let swap = &self.records[i].swap;
+                let id: String = swap.id.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("swap {id} ({:?}): {before:?} -> {after:?}", swap.role);
             }
         }
         errors

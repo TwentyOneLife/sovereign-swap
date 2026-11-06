@@ -224,11 +224,30 @@ impl Daemon {
         Ok((addr, token))
     }
 
+    /// Bound on concurrent API connections. This is a single-user local API, so a handful of
+    /// connections is the norm and this is generous headroom; its purpose is to stop a flood (over
+    /// the onion, every connection arrives from the Tor proxy, so per-client limiting is impossible)
+    /// from spawning unbounded threads and exhausting memory. The relay server has the same guard.
+    const MAX_CONNECTIONS: usize = 128;
+
     fn accept_loop(self, listener: TcpListener) {
         let me = Arc::new(self);
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for stream in listener.incoming().flatten() {
+            // At capacity, drop the connection without spawning a thread: a connection flood cannot
+            // exhaust threads or memory, and a legitimate client simply retries. Accepting then
+            // closing is cheaper than the work a served request would do.
+            if active.load(std::sync::atomic::Ordering::Relaxed) >= Self::MAX_CONNECTIONS {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let me = Arc::clone(&me);
-            std::thread::spawn(move || me.serve_connection(stream));
+            let active = Arc::clone(&active);
+            std::thread::spawn(move || {
+                me.serve_connection(stream);
+                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
         }
     }
 
