@@ -117,23 +117,30 @@ impl Daemon {
             "swap-{}",
             self.identity_seed[..4].to_hex_string(Case::Lower)
         );
-        let open_node = |addr: &str, user: &str, pass: &str| {
-            ChainNode::open(Client::new(addr, user, pass), &wallet).map_err(|e| format!("{e:?}"))
+        // Tor-first: an .onion node or relay is dialed through the configured SOCKS5 proxy; a plain
+        // host is direct. An https node is verified against its Root CA, an onion accepts its cert
+        // (design 0011). All the rules are enforced in Client::connect.
+        let tor_socks = settings.tor_socks.as_str();
+        let open_node = |addr: &str, user: &str, pass: &str, ca: &str| {
+            let socks = addr.contains(".onion").then_some(tor_socks);
+            let ca = (!ca.trim().is_empty()).then_some(ca);
+            let client = Client::connect(addr, user, pass, ca, socks)
+                .map_err(|e| format!("node {addr}: {e:?}"))?;
+            ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}"))
         };
         let btc = open_node(
             &settings.btc_node,
             &settings.btc_rpc_user,
             &settings.btc_rpc_pass,
+            &settings.btc_rpc_ca,
         )?;
         let xbtc = open_node(
             &settings.xbtc_node,
             &settings.xbtc_rpc_user,
             &settings.xbtc_rpc_pass,
+            &settings.xbtc_rpc_ca,
         )?;
-        // Tor-first: an .onion relay is dialed through a local SOCKS5 proxy; a plain host is direct.
-        let socks = relay
-            .contains(".onion")
-            .then(|| "127.0.0.1:9050".to_owned());
+        let socks = relay.contains(".onion").then(|| tor_socks.to_owned());
         let conn = WsConn::connect(relay, socks.as_deref()).map_err(|e| format!("relay: {e:?}"))?;
         let transport = RelayTransport::new(
             Identity::from_seed(&self.identity_seed),
