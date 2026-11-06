@@ -5,6 +5,63 @@ planes: the **message plane** (offers, bids, swap steps, over Nostr relays) and 
 plane** (the actual coins, in HTLCs on the two chains). The message plane is untrusted end to end;
 the settlement plane is where value moves.
 
+## Who runs what: the three pieces
+
+sovereign-swap is peer to peer and non-custodial. No one, not even the operator who runs the relay,
+ever holds another person's coins or keys. There are three pieces, and it helps to be clear about
+who runs each one.
+
+```
+   MAKER (any user)                                         TAKER (any user)
+  ┌───────────────────────┐       ┌───────────────┐       ┌───────────────────────┐
+  │ sovereign-swap-client │       │ sovereign-    │       │ sovereign-swap-client │
+  │  (StartOS package)    │       │ swap-relay    │       │  (StartOS package)    │
+  │                       │ kind  │ (the operator │ kind  │                       │
+  │  web GUI (loopback)   │ 4859  │  runs this)   │ 4859  │  web GUI (loopback)   │
+  │  swap engine          │<─────>│               │<─────>│  swap engine          │
+  │  their own BTC + xBTC │  E2E  │ hardened      │  E2E  │  their own BTC + xBTC │
+  │  nodes                │encrypt│ Nostr relay:  │encrypt│  nodes                │
+  │  their keys (cold)    │       │ no funds,     │       │  their keys (cold)    │
+  └───────────┬───────────┘       │ no keys,      │       └───────────┬───────────┘
+              │                   │ no matching,  │                   │
+              │                   │ no wallet;    │                   │
+              │                   │ just forwards │                   │
+              │                   │ opaque msgs   │                   │
+              │                   └───────────────┘                   │
+              │     the swap settles DIRECTLY between the two peers:   │
+              └────────── HTLC locks on the BTC and xBTC chains ───────┘
+```
+
+1. **The relay (`sovereign-swap-relay`)**, run by the operator, usually as one public StartOS
+   service reachable over Tor. It is a hardened Nostr relay: a message post office. It stores and
+   forwards opaque, end-to-end-encrypted messages (event kind 4859) so a maker and a taker can find
+   each other and exchange the steps of a swap. It holds no funds, no keys, has no wallet, sees no
+   plaintext, and does no order matching. Users point their clients at it (and may add others; it is
+   the flagship meeting point, not a single point of control).
+
+2. **The client (`sovereign-swap-client`)**, run by **each user on their own node**. This is the
+   daemon plus the web GUI. It binds to loopback on that user's own machine, talks to that user's own
+   BTC and xBTC (Bitcoin Blake2b) nodes, holds that user's own keys (cold by default), and runs the
+   swap engine. There is no shared, multi-user website that strangers log into: the maker runs their
+   client, the taker runs their client, and each person sees only their own.
+
+3. **The two chains**, where the coins actually move. A swap is a pair of hash-timelocked contracts
+   (HTLCs), one on each chain. It is atomic: either both legs complete or both refund. Neither the
+   counterparty nor the relay operator can take the coins; the relay could at worst drop a message,
+   which just sends the swap down the always-safe refund path.
+
+**The fee, and how the operator earns.** Because the operator is never in the path of anyone's funds,
+the fee is not skimmed from passing swaps. Instead, each client (the default build) adds a small,
+**voluntary** fee output to **its own** lock transaction, paying the operator's published silent
+payment address (BIP352): a fresh, unlinkable on-chain address every swap. The operator collects by
+scanning that address on chain, off the swap path entirely. Being open-source and peer to peer, the
+fee is enforced by the clients, not by cryptography: two modified clients on their own relay can swap
+without paying, and that is accepted. The fee funds the relay and development, alongside a commercial
+licence for organisations that want proprietary terms. See design 0010; the fee ships off by default.
+
+The rest of this document is the developer view: how a single message and a single swap move through
+the pieces above, and which technology handles each hop.
+
 ## Components
 
 ```

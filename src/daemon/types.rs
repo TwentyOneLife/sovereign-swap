@@ -106,17 +106,6 @@ impl Settings {
     }
 }
 
-/// A scaffold offer record. The live version is published to the relays and discovered from them;
-/// here it is held in memory so the API is coherent and testable before the engine is wired.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Offer {
-    pub id: String,
-    pub sell_chain: Chain,
-    pub amount_sat: u64,
-    pub price: f64,
-    pub min_amount_sat: u64,
-}
-
 /// What a `POST /offers` body must contain. Validated before an offer is created.
 #[derive(Deserialize)]
 pub(crate) struct NewOffer {
