@@ -55,5 +55,9 @@ Bitcoin-family chains since 2020. This project is a separate implementation, not
 
 ## License
 
-GNU Affero General Public License v3.0 or later, see `LICENSE`. Anyone who runs a modified version as
-a network service has to publish their changes, so improvements to a swap relay or engine stay open.
+Dual-licensed. For everyone: **GNU Affero General Public License v3.0 or later** (see `LICENSE`).
+Anyone who runs a modified version as a network service has to publish their changes, so improvements
+to a swap relay or engine stay open, and self-hosting is always free. For organisations that need
+proprietary terms (a closed product, an unattributed service, or removing the default voluntary fee),
+a **commercial license** is available, see [`COMMERCIAL.md`](COMMERCIAL.md). Contributions are under
+the CLA in [`CLA.md`](CLA.md), which is what lets the project be offered under both.
