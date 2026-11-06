@@ -70,6 +70,17 @@ pub struct Settings {
     /// Taker fee, basis points (default 30 = 0.30 %).
     #[serde(default = "default_fee_taker_bps")]
     pub fee_taker_bps: u16,
+    /// PEM Root CA to verify an HTTPS node against (the node's StartOS Root CA). Required for an
+    /// https:// LAN address; ignored for plain http and accepted-but-unused for an onion, where Tor
+    /// authenticates the endpoint (design 0011). Empty by default.
+    #[serde(default)]
+    pub btc_rpc_ca: String,
+    #[serde(default)]
+    pub xbtc_rpc_ca: String,
+    /// Tor SOCKS5 proxy used to dial an `.onion` node RPC and an `.onion` relay. One setting for both,
+    /// replacing the former hardcoded default (design 0011). The StartOS Tor proxy on a node install.
+    #[serde(default = "default_tor_socks")]
+    pub tor_socks: String,
 }
 
 /// The largest fee a setting may ask for: a guard against a fat-finger, not a policy (spec 7.5 sets
@@ -82,12 +93,15 @@ fn default_fee_maker_bps() -> u16 {
 fn default_fee_taker_bps() -> u16 {
     30
 }
+fn default_tor_socks() -> String {
+    "127.0.0.1:9050".to_owned()
+}
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
-            btc_node: "127.0.0.1:8332".to_owned(),
-            xbtc_node: "127.0.0.1:8442".to_owned(),
+            btc_node: "http://127.0.0.1:8332".to_owned(),
+            xbtc_node: "http://127.0.0.1:8442".to_owned(),
             relays: Vec::new(),
             signer: Signer::Cold,
             btc_conf: 1,
@@ -102,6 +116,9 @@ impl Default for Settings {
             fee_sp_address: String::new(),
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
+            btc_rpc_ca: String::new(),
+            xbtc_rpc_ca: String::new(),
+            tor_socks: default_tor_socks(),
         }
     }
 }
@@ -112,9 +129,12 @@ impl Settings {
     /// here so it never reaches the engine and so the GUI can show the reasons.
     pub fn validate(&self) -> Vec<String> {
         let mut e = Vec::new();
-        for (name, addr) in [("btc_node", &self.btc_node), ("xbtc_node", &self.xbtc_node)] {
-            if !valid_host_port(addr) {
-                e.push(format!("{name}: expected host:port"));
+        for (name, addr, ca) in [
+            ("btc_node", &self.btc_node, &self.btc_rpc_ca),
+            ("xbtc_node", &self.xbtc_node, &self.xbtc_rpc_ca),
+        ] {
+            if let Err(msg) = validate_node(addr, ca, &self.tor_socks) {
+                e.push(format!("{name}: {msg}"));
             }
         }
         for relay in &self.relays {
@@ -259,7 +279,22 @@ pub fn parse_btc_to_sats(input: &str) -> Option<u64> {
     whole.checked_mul(100_000_000)?.checked_add(frac)
 }
 
-pub(crate) fn valid_host_port(s: &str) -> bool {
+/// Validates a node address against its CA and the configured Tor proxy, by the design-0011 rules:
+/// a bare `host:port` or `http://` is fine; `https://` to a plain host needs a Root CA; any `.onion`
+/// (which forces SOCKS) needs a Tor proxy address. Returns the reason a setting is refused.
+pub(crate) fn validate_node(addr: &str, ca: &str, tor_socks: &str) -> Result<(), String> {
+    let endpoint =
+        crate::rpc::parse_endpoint(addr).map_err(|_| "expected host:port or http(s):// URL")?;
+    if endpoint.is_onion() && !valid_host_port(tor_socks) {
+        return Err("an .onion node needs a valid tor_socks host:port".to_owned());
+    }
+    if endpoint.is_https() && !endpoint.is_onion() && ca.trim().is_empty() {
+        return Err("an https node needs a Root CA (paste the node's StartOS Root CA)".to_owned());
+    }
+    Ok(())
+}
+
+fn valid_host_port(s: &str) -> bool {
     match s.rsplit_once(':') {
         Some((host, port)) => {
             !host.is_empty()

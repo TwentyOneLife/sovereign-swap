@@ -16,6 +16,7 @@ pub mod replay;
 pub mod routing;
 pub mod rpc;
 pub mod silentpayments;
+pub mod socks;
 pub mod store;
 pub mod swap;
 pub mod transport;

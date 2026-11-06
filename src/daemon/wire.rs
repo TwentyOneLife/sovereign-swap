@@ -153,13 +153,24 @@ pub(crate) fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-pub(crate) fn reachable(host_port: &str) -> bool {
+/// A cheap health hint for the GUI: can we open a TCP connection to the node. Accepts a node address
+/// in any form (bare `host:port`, `http://`, `https://`). An `.onion` is never probed directly (that
+/// would resolve and leak the name outside Tor), so it is reported reachable and the real check is the
+/// first RPC call through the proxy.
+pub(crate) fn reachable(addr: &str) -> bool {
     use std::net::ToSocketAddrs;
-    host_port
+    let Ok(endpoint) = crate::rpc::parse_endpoint(addr) else {
+        return false;
+    };
+    if endpoint.is_onion() {
+        return true;
+    }
+    endpoint
+        .host_port()
         .to_socket_addrs()
         .ok()
         .and_then(|mut a| a.next())
-        .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok())
+        .map(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
         .unwrap_or(false)
 }
 

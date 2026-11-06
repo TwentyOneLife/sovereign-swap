@@ -45,7 +45,10 @@ impl WsConn {
     pub fn connect(url: &str, socks: Option<&str>) -> Result<WsConn, WsError> {
         let (host, port, _path) = parse_ws_url(url)?;
         let stream = match socks {
-            Some(proxy) => socks5_connect(proxy, &host, port)?,
+            Some(proxy) => {
+                crate::socks::socks5_connect(proxy, &host, port, Duration::from_secs(30))
+                    .map_err(|e| WsError::Socks(e.to_string()))?
+            }
             None => TcpStream::connect((host.as_str(), port)).map_err(WsError::Io)?,
         };
         stream
@@ -151,49 +154,6 @@ fn parse_ws_url(url: &str) -> Result<(String, u16, String), WsError> {
         .ok_or_else(|| WsError::Url("host:port required".into()))?;
     let port = port.parse().map_err(|_| WsError::Url("bad port".into()))?;
     Ok((host.to_owned(), port, path))
-}
-
-/// Minimal SOCKS5 client: no auth, CONNECT to a domain (so Tor resolves an `.onion`).
-fn socks5_connect(proxy: &str, host: &str, port: u16) -> Result<TcpStream, WsError> {
-    let mut s = TcpStream::connect(proxy).map_err(WsError::Io)?;
-    // Greeting: version 5, one method, no authentication.
-    s.write_all(&[0x05, 0x01, 0x00]).map_err(WsError::Io)?;
-    let mut reply = [0u8; 2];
-    s.read_exact(&mut reply).map_err(WsError::Io)?;
-    if reply != [0x05, 0x00] {
-        return Err(WsError::Socks("proxy rejected no-auth".into()));
-    }
-    // CONNECT, address type domain.
-    let host = host.as_bytes();
-    if host.len() > 255 {
-        return Err(WsError::Socks("host too long".into()));
-    }
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
-    req.extend_from_slice(host);
-    req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).map_err(WsError::Io)?;
-    // Reply: version, status, reserved, then a bound address we read and discard.
-    let mut head = [0u8; 4];
-    s.read_exact(&mut head).map_err(WsError::Io)?;
-    if head[1] != 0x00 {
-        return Err(WsError::Socks(format!(
-            "CONNECT failed, status {}",
-            head[1]
-        )));
-    }
-    let bound = match head[3] {
-        0x01 => 4 + 2,
-        0x04 => 16 + 2,
-        0x03 => {
-            let mut len = [0u8; 1];
-            s.read_exact(&mut len).map_err(WsError::Io)?;
-            len[0] as usize + 2
-        }
-        _ => return Err(WsError::Socks("unknown bound address type".into())),
-    };
-    let mut discard = vec![0u8; bound];
-    s.read_exact(&mut discard).map_err(WsError::Io)?;
-    Ok(s)
 }
 
 #[cfg(test)]
