@@ -95,9 +95,10 @@ fn settings_round_trip_and_validate() {
 }
 
 #[test]
-fn offers_are_validated_then_stored() {
+fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
-    // Below dust, out-of-band price, min above amount: each rejected.
+    // Input validation runs regardless of engine state: below dust, out-of-band price, min above
+    // amount are each rejected with reasons (422).
     let bad = r#"{"sell_chain":"xbtc","amount_sat":100,"price":9.9,"min_amount_sat":999999999}"#;
     let (code, body) = request(&addr, "POST", "/offers", Some(&token), bad);
     assert_eq!(code, 422, "bad offer not rejected: {body}");
@@ -106,14 +107,19 @@ fn offers_are_validated_then_stored() {
         "no reasons: {body}"
     );
 
-    // A good offer is created and then listed.
+    // A well-formed offer still cannot be published without a live engine: the daemon never
+    // fabricates offers, so it returns 503 rather than storing a placeholder.
     let good =
         r#"{"sell_chain":"xbtc","amount_sat":50000000,"price":0.997,"min_amount_sat":50000000}"#;
     let (code, body) = request(&addr, "POST", "/offers", Some(&token), good);
-    assert_eq!(code, 200, "good offer rejected: {body}");
-    assert!(body.contains("offer_id"), "no id: {body}");
-    let (_, list) = request(&addr, "GET", "/offers", Some(&token), "");
-    assert!(list.contains("50000000"), "offer not listed: {list}");
+    assert_eq!(code, 503, "offer should need a running engine: {body}");
+    assert!(body.contains("engine not running"), "wrong reason: {body}");
+
+    // Listing offers or swaps with no engine says so plainly; it never returns empty or fake data.
+    for path in ["/offers", "/swaps"] {
+        let (code, body) = request(&addr, "GET", path, Some(&token), "");
+        assert_eq!(code, 503, "{path} should need a running engine: {body}");
+    }
 }
 
 #[test]
