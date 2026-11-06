@@ -64,37 +64,6 @@ fn every_route_needs_the_token() {
 }
 
 #[test]
-fn settings_round_trip_and_validate() {
-    let (addr, token) = daemon();
-    // A clean default is readable.
-    assert_eq!(request(&addr, "GET", "/settings", Some(&token), "").0, 200);
-
-    // A valid update is accepted and then reflected.
-    let good = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":["ws://a.onion:7777"],"signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
-    assert_eq!(
-        request(&addr, "PUT", "/settings", Some(&token), good).0,
-        200
-    );
-    let (_, body) = request(&addr, "GET", "/settings", Some(&token), "");
-    assert!(body.contains("a.onion"), "update not reflected: {body}");
-
-    // A bad node address and a non-ws relay are each refused with reasons.
-    let bad = r#"{"btc_node":"not-a-host","xbtc_node":"127.0.0.1:8442","relays":["http://nope"],"signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
-    let (code, body) = request(&addr, "PUT", "/settings", Some(&token), bad);
-    assert_eq!(code, 422, "bad settings not rejected: {body}");
-    assert!(
-        body.contains("btc_node") && body.contains("relay"),
-        "no field reasons: {body}"
-    );
-
-    // Not even JSON: 400.
-    assert_eq!(
-        request(&addr, "PUT", "/settings", Some(&token), "nonsense").0,
-        400
-    );
-}
-
-#[test]
 fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
     // Input validation runs regardless of engine state: below dust, out-of-band price, min above
@@ -139,7 +108,9 @@ fn an_oversized_body_is_refused() {
     let (addr, token) = daemon();
     let huge = "a".repeat(128 * 1024);
     let body = format!(r#"{{"junk":"{huge}"}}"#);
-    let code = request(&addr, "PUT", "/settings", Some(&token), &body).0;
+    // The size cap is in the request reader, before any route; POST /offers carries a body, so it is a
+    // fine probe. The daemon refuses the oversized request with 413 rather than growing a buffer.
+    let code = request(&addr, "POST", "/offers", Some(&token), &body).0;
     assert_eq!(code, 413, "oversized body not refused");
 }
 

@@ -87,10 +87,6 @@ pub struct Daemon {
     /// present, the page and its assets (which carry the API token) are served only to a browser that
     /// passes HTTP Basic auth, so knowing the onion is no longer enough to reach the swaps.
     basic_auth: Option<(String, String)>,
-    /// When set (`SWAP_CONFIG_LOCKED=1`, the StartOS package), node/relay config is owned by the
-    /// package action: the web UI shows it read-only and `PUT /settings` is refused. This keeps the
-    /// one config source authoritative and off the public page.
-    config_locked: bool,
 }
 
 impl Daemon {
@@ -98,10 +94,16 @@ impl Daemon {
     /// token (`token`, mode 600).
     pub fn open(data_dir: &Path) -> std::io::Result<Daemon> {
         std::fs::create_dir_all(data_dir)?;
-        let settings = match std::fs::read(data_dir.join("settings.json")) {
+        let settings: Settings = match std::fs::read(data_dir.join("settings.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => Settings::default(),
         };
+        // Config is owned by StartOS (the package action writes settings.json, which the daemon reads
+        // here on each start). A malformed value cannot be fixed from the web UI, so surface it in the
+        // log rather than failing silently; a blank default is not an error (just unconfigured).
+        for issue in settings.validate() {
+            eprintln!("settings issue: {issue}");
+        }
         let token = load_or_make_token(data_dir)?;
         let basic_auth = match (
             std::env::var("SWAP_USERNAME"),
@@ -110,7 +112,6 @@ impl Daemon {
             (Ok(u), Ok(p)) if !u.is_empty() && !p.is_empty() => Some((u, p)),
             _ => None,
         };
-        let config_locked = std::env::var("SWAP_CONFIG_LOCKED").as_deref() == Ok("1");
         let daemon = Daemon {
             state: Arc::new(Mutex::new(DaemonState { settings })),
             token,
@@ -121,12 +122,10 @@ impl Daemon {
             events: Arc::new(Mutex::new(Vec::new())),
             reference: Reference::default(),
             basic_auth,
-            config_locked,
         };
-        // If the saved settings are already complete, bring the engine up; otherwise it starts after
-        // the first complete PUT /settings. A failure here is not fatal (the GUI learns it from GET
-        // /status), but it is logged: a silently swallowed reason is very hard to diagnose in the
-        // field, where the nodes or the relay may be the cause.
+        // If the saved settings are already complete, bring the engine up. A failure here is not fatal
+        // (the GUI learns it from GET /status), but it is logged: a silently swallowed reason is very
+        // hard to diagnose in the field, where the nodes or the relay may be the cause.
         if let Err(e) = daemon.start_engine() {
             eprintln!("engine not started on open: {e}");
         }
@@ -389,11 +388,6 @@ impl Daemon {
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/status") => (200, self.status()),
             ("GET", "/reference-rate") => self.reference_rate(),
-            ("GET", "/settings") => (
-                200,
-                serde_json::to_value(&self.state.lock().unwrap().settings).unwrap(),
-            ),
-            ("PUT", "/settings") => self.put_settings(&req.body),
             ("GET", "/offers") => self.get_offers(),
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
@@ -473,7 +467,6 @@ impl Daemon {
             "relays": settings.relays.len(),
             "engine": running,
             "active_swaps": active,
-            "config_locked": self.config_locked,
         })
     }
 
@@ -556,36 +549,6 @@ impl Daemon {
         }
     }
 
-    fn put_settings(&self, body: &[u8]) -> (u16, Value) {
-        if self.config_locked {
-            return (
-                403,
-                json!({"error": "configuration is managed by StartOS; edit it in Actions and Config"}),
-            );
-        }
-        let Ok(settings) = serde_json::from_slice::<Settings>(body) else {
-            return (
-                400,
-                json!({"error": "settings must be a valid JSON object"}),
-            );
-        };
-        let errors = settings.validate();
-        if !errors.is_empty() {
-            return (422, json!({"error": "invalid settings", "fields": errors}));
-        }
-        if self.save_settings(&settings).is_err() {
-            return (500, json!({"error": "could not persist settings"}));
-        }
-        self.state.lock().unwrap().settings = settings;
-        // Bring the engine up (or restart it) now the settings may be complete. A failure here just
-        // means it is not running yet; the GUI learns that from GET /status, and the settings are
-        // saved regardless. Logged so the reason (a node or the relay) is visible in the service logs.
-        if let Err(e) = self.start_engine() {
-            eprintln!("engine not started after settings update: {e}");
-        }
-        (200, json!({"ok": true}))
-    }
-
     fn post_offer(&self, body: &[u8]) -> (u16, Value) {
         let Ok(new) = serde_json::from_slice::<NewOffer>(body) else {
             return (400, json!({"error": "offer must be a valid JSON object"}));
@@ -604,12 +567,5 @@ impl Daemon {
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }
-    }
-
-    fn save_settings(&self, settings: &Settings) -> std::io::Result<()> {
-        std::fs::write(
-            self.data_dir.join("settings.json"),
-            serde_json::to_vec_pretty(settings).unwrap(),
-        )
     }
 }

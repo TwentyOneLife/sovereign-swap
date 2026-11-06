@@ -250,60 +250,6 @@ setInterval(() => {
   if (el) el.textContent = `· refreshing in ${Math.max(0, Math.round((detailNext - Date.now()) / 1000))}s`;
 }, 1000);
 
-// --- settings ---
-async function loadSettings() {
-  const s = await api("GET", "/settings").catch(() => null);
-  if (!s) return;
-  const f = $("#settings-form");
-  f.btc_node.value = s.btc_node || "";
-  f.xbtc_node.value = s.xbtc_node || "";
-  f.relays.value = (s.relays || []).join("\n");
-  f.signer.value = s.signer || "cold";
-  f.btc_conf.value = s.btc_conf;
-  f.xbtc_conf.value = s.xbtc_conf;
-  f.margin_blocks.value = s.margin_blocks;
-  f.price_reference.checked = !!s.price_reference;
-  f.fee_enabled.checked = !!s.fee_enabled;
-  f.fee_sp_address.value = s.fee_sp_address || "";
-  if (s.fee_maker_bps != null) f.fee_maker_bps.value = s.fee_maker_bps;
-  if (s.fee_taker_bps != null) f.fee_taker_bps.value = s.fee_taker_bps;
-  // When StartOS owns the config (config_locked), the web view is read-only: the one source of truth
-  // is the package action, and the public page never edits node or relay settings.
-  const st = await api("GET", "/status").catch(() => null);
-  const locked = !!(st && st.config_locked);
-  [...f.elements].forEach((el) => {
-    el.disabled = locked;
-  });
-  $("#settings-msg").textContent = locked
-    ? "Node and relay settings are managed in StartOS (Actions and Config); this view is read-only."
-    : "";
-}
-$("#settings-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = e.target;
-  const body = {
-    btc_node: f.btc_node.value.trim(),
-    xbtc_node: f.xbtc_node.value.trim(),
-    relays: f.relays.value.split("\n").map((x) => x.trim()).filter(Boolean),
-    signer: f.signer.value,
-    btc_conf: +f.btc_conf.value,
-    xbtc_conf: +f.xbtc_conf.value,
-    margin_blocks: +f.margin_blocks.value,
-    price_reference: f.price_reference.checked,
-    fee_enabled: f.fee_enabled.checked,
-    fee_sp_address: f.fee_sp_address.value.trim(),
-    fee_maker_bps: +f.fee_maker_bps.value,
-    fee_taker_bps: +f.fee_taker_bps.value,
-  };
-  try {
-    await api("PUT", "/settings", body);
-    $("#settings-msg").textContent = "saved";
-    loadStatus();
-  } catch (err) {
-    $("#settings-msg").textContent = (err.data && (err.data.error || (err.data.fields || []).join("; "))) || "rejected";
-  }
-});
-
 // --- live updates (fetch stream keeps auth in the header) ---
 async function subscribe() {
   try {
@@ -337,7 +283,6 @@ function onEvent() {
 function refresh(tab) {
   if (tab === "market") loadMarket();
   else if (tab === "swaps") loadSwaps();
-  else if (tab === "settings") loadSettings();
 }
 
 loadStatus();

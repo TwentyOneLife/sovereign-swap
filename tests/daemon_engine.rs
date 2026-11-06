@@ -16,11 +16,27 @@ use sovereign_swap::relay_server::{RelayConfig, RelayServer};
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
-fn daemon() -> (String, String) {
+fn daemon(btc: &str, xbtc: &str, relay: &str) -> (String, String) {
     let n = NEXT.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("sovswap-dengine-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    Daemon::open(&dir).unwrap().spawn().unwrap()
+    std::fs::create_dir_all(&dir).unwrap();
+    // Config is seeded the way StartOS does it: write settings.json, then the daemon reads it on open
+    // and brings the engine up. There is no runtime settings endpoint.
+    let settings = format!(
+        r#"{{"btc_node":"{btc}","xbtc_node":"{xbtc}","relays":["{relay}"],"signer":"hot",
+            "btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+            "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p"}}"#
+    );
+    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+    // The engine starts synchronously on open when the settings are complete; confirm it is up.
+    let (_, status) = request(&addr, "GET", "/status", &token, "");
+    assert!(
+        status.contains("\"engine\":true"),
+        "engine did not start: {status}"
+    );
+    (addr, token)
 }
 
 fn request(addr: &str, method: &str, path: &str, token: &str, body: &str) -> (u16, String) {
@@ -55,25 +71,6 @@ fn request(addr: &str, method: &str, path: &str, token: &str, body: &str) -> (u1
     )
 }
 
-fn configure(addr: &str, token: &str, btc: &str, xbtc: &str, relay: &str) {
-    let body = format!(
-        r#"{{"btc_node":"{btc}","xbtc_node":"{xbtc}","relays":["{relay}"],"signer":"hot",
-            "btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
-            "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p"}}"#
-    );
-    assert_eq!(
-        request(addr, "PUT", "/settings", token, &body).0,
-        200,
-        "configure failed"
-    );
-    // The engine starts synchronously on a complete PUT; confirm it is up.
-    let (_, status) = request(addr, "GET", "/status", token, "");
-    assert!(
-        status.contains("\"engine\":true"),
-        "engine did not start: {status}"
-    );
-}
-
 #[test]
 fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
     let Some((btc, xbtc)) = binaries() else {
@@ -91,10 +88,8 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
         core.rpc.host_port().to_owned(),
         knots.rpc.host_port().to_owned(),
     );
-    let (maker, maker_tok) = daemon();
-    let (taker, taker_tok) = daemon();
-    configure(&maker, &maker_tok, &btc_addr, &xbtc_addr, &relay);
-    configure(&taker, &taker_tok, &btc_addr, &xbtc_addr, &relay);
+    let (maker, maker_tok) = daemon(&btc_addr, &xbtc_addr, &relay);
+    let (taker, taker_tok) = daemon(&btc_addr, &xbtc_addr, &relay);
 
     // Let both engines' relay subscriptions register before the offer is published.
     std::thread::sleep(Duration::from_millis(500));

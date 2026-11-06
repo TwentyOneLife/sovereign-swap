@@ -13,7 +13,6 @@
   <nav>
     <button class="tab active" data-tab="market" title="Offers from other people">Market</button>
     <button class="tab" data-tab="swaps" title="Your swaps, live and past">Swaps</button>
-    <button class="tab" data-tab="settings" title="Your nodes, relays and limits">Settings</button>
   </nav>
   <div id="status" class="status" title="Node and Tor connectivity">…</div>
 </header>
@@ -53,43 +52,6 @@
     <div id="swap-detail"></div>
   </section>
 
-  <!-- SETTINGS -->
-  <section id="settings" class="view">
-    <h1>Settings</h1>
-    <form id="settings-form" class="card">
-      <label>BTC node <input name="btc_node" placeholder="127.0.0.1:8332"></label>
-      <label>xBTC node <input name="xbtc_node" placeholder="127.0.0.1:8442"></label>
-      <label>Relays (one per line, ws:// or wss://)
-        <textarea name="relays" rows="2" placeholder="ws://…onion:7777"></textarea></label>
-      <label>Signer
-        <select name="signer" title="Cold keeps your spending keys offline; Hot is for regtest only">
-          <option value="cold">Cold / watch-only</option>
-          <option value="hot">Hot (regtest only)</option>
-        </select></label>
-      <label title="Fetch nonkyc's BTCB2/BTC price over Tor as a hint; off by default, never relied on"><input type="checkbox" name="price_reference"> External price reference (nonkyc, over Tor) - a hint only</label>
-      <div class="row">
-        <label title="Confirmations we wait on a BTC lock">BTC conf <input name="btc_conf" type="number" min="1" value="1"></label>
-        <label title="Confirmations we wait on an xBTC lock">xBTC conf <input name="xbtc_conf" type="number" min="1" value="2"></label>
-        <label title="Safety gap between the two legs' timelocks">Margin <input name="margin_blocks" type="number" min="1" value="2"></label>
-      </div>
-      <details class="fee-advanced">
-        <summary title="A voluntary fee to a silent payment address. Off by default; see design 0010">Fee (advanced, off by default)</summary>
-        <label title="Turn on a voluntary fee. Off keeps swaps with no fee output at all"><input type="checkbox" name="fee_enabled"> Add a voluntary fee to each swap</label>
-        <label title="A BIP352 silent payment address; each swap pays a fresh, unlinkable output to it">Fee address (silent payment)
-          <input name="fee_sp_address" placeholder="sp1..."></label>
-        <div class="row">
-          <label title="Maker fee in basis points (20 = 0.20%)">Maker bps <input name="fee_maker_bps" type="number" min="0" max="100" value="20"></label>
-          <label title="Taker fee in basis points (30 = 0.30%)">Taker bps <input name="fee_taker_bps" type="number" min="0" max="100" value="30"></label>
-        </div>
-      </details>
-      <div class="row between">
-        <span id="settings-msg" class="muted"></span>
-        <button class="primary" type="submit">Save</button>
-      </div>
-    </form>
-    <p class="muted">On a StartOS node the BTC/xBTC node connection comes from the package config; here
-      these fields apply to a plain daemon.</p>
-  </section>
 </main>
 
 <footer>
