@@ -231,12 +231,11 @@ bidding; both sides pay and verify against the **offer's** terms. `Settings.fee_
 operator's defaults for the offers this client creates, not an input to verification. The Offer (and
 the new `FeeProof` message, below) are a wire-format change and are versioned together.
 
-Open sub-decision (owner): should a default client bid on, or publish, **fee-less** offers
-(`fee: None`)? Allowing them makes the fee trivially avoidable inside the default network; refusing
-them gives the voluntary fee teeth among default clients. Until fees are enabled (pending the legal
-opinion) every offer is fee-less and the question is moot; it is settled before the switch is turned
-on. The verifier treats `fee: None` as "no fee output expected" (no check); `fee: Some` requires the
-output.
+Fee-less offers (owner decision 2026-11-06): a default client **publishes fee-bearing offers but
+accepts fee-less ones too**, surfacing or down-ranking them. Liquidity is never blocked; the fee
+stays voluntary and is avoidable by anyone posting a fee-less offer, which is accepted. The verifier
+treats `fee: None` as "no fee output expected" (no check); `fee: Some` requires the output. Until
+fees are enabled (pending the legal opinion) every offer is fee-less in any case.
 
 ### 2. The counterparty gate has three states, and never wraps the claim-continuation path
 
