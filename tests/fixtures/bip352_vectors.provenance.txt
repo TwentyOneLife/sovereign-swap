@@ -1,0 +1,4 @@
+BIP-352 send and receive test vectors.
+Source: https://github.com/bitcoin/bips bip-0352/send_and_receive_test_vectors.json
+Pinned commit: 3c68d3f3a19b9ed3ee1e9129147541a15f1603cb
+SHA256: 2faa899c480fea1fb13b06fb669e9cfdd11738a5140ec516f46a46e68e2c2ad8
