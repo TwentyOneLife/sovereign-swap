@@ -1,7 +1,14 @@
 # Contributing
 
-Issues and pull requests are welcome. Everything here is AGPL-3.0-or-later, and contributions are
-accepted under that licence.
+Issues and pull requests are welcome.
+
+## Licensing
+
+This project is **dual-licensed**: the GNU Affero General Public Licence v3.0-or-later for everyone
+(see `LICENSE`), and a separate **commercial licence** for organisations that need proprietary terms
+(see `COMMERCIAL.md`). So the project can offer both, contributions are accepted under the Contributor
+Licence Agreement in `CLA.md`: you keep your copyright and grant TwentyOne.Life the right to license
+your contribution under both licences. By opening a pull request you agree to that CLA.
 
 ## Ground rules
 
