@@ -65,6 +65,10 @@ verify.
 - **Verified live** (through the deployed daemon): the page with no credentials returns `401` with
   `WWW-Authenticate: Basic`; with the generated password returns `200`; `PUT /settings` returns `403`;
   the API with no token returns `401`.
+- **Auth boundary does not depend on where the request comes from.** The daemon binds a non-loopback
+  address only with `SWAP_API_TRUST_NETWORK=1`, and that flag is a bind permission, not an auth bypass
+  (`sovereign-swap-daemon.rs`). Every request is gated by the same password and token regardless of
+  origin, which is what makes the LAN front door in section 8 safe to expose.
 
 ## 5. Malicious-counterparty harness
 
@@ -92,7 +96,8 @@ Verified end to end on the operator's StartOS node (details in the private infra
 Most of the conventional web-attack toolset (`nikto`, `sqlmap`, `ffuf`/`gobuster`, `wpscan`, `hydra`) is
 low-yield here: a hand-rolled HTTP server with a handful of fixed routes, no database, a 20-char random
 password, and rustls TLS. Mapped to our actual surface (a custom Rust P2P swap daemon + Nostr relay +
-bitcoind RPC, all exposed only over Tor):
+bitcoind RPC; the swap daemon API is reached over Tor by default and, since client package 0.2.0:5,
+also over a StartOS-terminated HTTPS LAN address, see section 8):
 
 | Surface | Best tool | Status |
 |---|---|---|
@@ -101,13 +106,38 @@ bitcoind RPC, all exposed only over Tor):
 | Tor anonymity of a long-lived onion | Vanguards | recommended |
 | DoS resilience | slowhttptest | covered by the cap + `daemon_dos.rs` |
 | Nostr relay / swap wire (black-box) | boofuzz / radamsa | complements the coverage-guided fuzzers |
-| Node RPC TLS | testssl.sh / sslyze | recommended, low risk (rustls) |
+| Node RPC TLS, and the web-UI TLS LAN address | testssl.sh / sslyze | low risk (StartOS rustls proxy); the LAN address is now a direct target, no Tor host needed |
+| The web UI auth over the LAN (off Tor) | `hydra` / `medusa`, an `nmap` service scan | reachable since 0.2.0:5; blocked by the 20-char random password, rate-limiting is the open item (section 9) |
 | The swap protocol itself | the malicious-counterparty harness | primitive done, extend live |
 
-## 8. Open items
+## 8. LAN HTTPS front door (added in client package 0.2.0:5)
+
+To make the StartOS "Open UI" button work, the web UI is exported with `protocol: 'http'`, which has
+StartOS provision a TLS LAN address (its reverse proxy terminates with the node leaf certificate) in
+addition to the Tor onion. The onion stays the default address; the LAN address is the new surface.
+
+- **Trust boundary, verified in source:** adding the LAN address does not open unauthenticated access.
+  `SWAP_API_TRUST_NETWORK=1` only permits the non-loopback bind; it is not an auth bypass. The page and
+  its assets stay behind HTTP Basic (the web password), every API route is token-gated before any work,
+  and the token is never served without the password, so a LAN client faces the same `401`s as an onion
+  client.
+- **Reverse proxy:** `protocol: 'http'` makes StartOS add `X-Forwarded-For` / `X-Forwarded-Proto` and do
+  HTTP-aware proxying. The daemon makes no security decision from those headers (auth is the password and
+  the token, constant-time compared; there is no IP allowlist and no `X-Forwarded-User` trust), so a
+  spoofed forwarded header changes nothing. A regression check worth keeping when that path is touched.
+- **What it changes for testing:** TLS and port-scan tools that previously needed a Tor-capable host now
+  have a direct LAN target (section 7). Brute-force against the auth is reachable off Tor, which raises
+  the priority of auth-attempt rate-limiting below.
+- **Testing discipline:** passive audits (testssl.sh / sslyze, an `nmap` service scan) are fine against
+  the operator's own node. Brute-force and DoS against the live funds-handling endpoint are not run here:
+  the connection cap bounds flooding and the random password defeats guessing.
+
+## 9. Open items
 
 - Wire the fuzz targets into CI and add targets for the remaining parsers.
-- Auth-attempt rate-limiting on the web UI (defense in depth; the random password already makes
-  brute-force infeasible).
+- Auth-attempt rate-limiting on the web UI. Now higher priority: the LAN front door (section 8) makes the
+  login reachable without Tor, so brute-force no longer pays the Tor latency cost (the random password
+  still makes it infeasible, this is defense in depth).
+- Passive TLS and service-scan audit (testssl.sh / sslyze / `nmap`) of the LAN HTTPS address.
 - Run OnionScan + Vanguards against the live onions from a Tor-capable host.
 - The two-party regtest wiring of the malicious-counterparty harness (enhanced during live testing).
