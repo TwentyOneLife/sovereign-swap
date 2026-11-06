@@ -120,9 +120,16 @@ impl Daemon {
         // Tor-first: an .onion node or relay is dialed through the configured SOCKS5 proxy; a plain
         // host is direct. An https node is verified against its Root CA, an onion accepts its cert
         // (design 0011). All the rules are enforced in Client::connect.
-        let tor_socks = settings.tor_socks.as_str();
+        //
+        // `SWAP_TOR_SOCKS`, when set, overrides the settings value: on StartOS the container has no
+        // Tor at a fixed address, so the package resolves the proxy bridge address and injects it
+        // here, and the user never has to guess it. The settings field stays the manual fallback.
+        let tor_socks = std::env::var("SWAP_TOR_SOCKS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| settings.tor_socks.clone());
         let open_node = |addr: &str, user: &str, pass: &str, ca: &str| {
-            let socks = addr.contains(".onion").then_some(tor_socks);
+            let socks = addr.contains(".onion").then_some(tor_socks.as_str());
             let ca = (!ca.trim().is_empty()).then_some(ca);
             let client = Client::connect(addr, user, pass, ca, socks)
                 .map_err(|e| format!("node {addr}: {e:?}"))?;
