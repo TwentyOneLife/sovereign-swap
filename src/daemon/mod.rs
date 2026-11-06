@@ -1,8 +1,10 @@
 //! `sovereign-swap-daemon`: the long-running client service (design 0009, M4a). It owns the engine
 //! and the config and exposes a small local HTTP+JSON API on `127.0.0.1` for a GUI to drive. This
-//! module is the API surface and the config; wiring every endpoint to a live engine (publishing to
-//! relays, driving swaps) is the next M4a step, so offers and swaps here are an in-memory scaffold
-//! with the real validation and auth already in place.
+//! module is the API surface and the config; every offer and swap it serves comes from the live
+//! engine (publishing to and discovering from relays, driving swaps on the user's own nodes). The
+//! daemon never fabricates data: until the user's nodes and a relay are configured and the engine
+//! is running, the data endpoints return "engine not running" rather than empty or placeholder
+//! results.
 //!
 //! Security posture, because this is an API a browser talks to:
 //! - binds `127.0.0.1` only (never a routable address);
@@ -41,10 +43,10 @@ pub use types::{parse_btc_to_sats, Chain, Settings, Signer};
 
 use engine::{engine_config, offer_to_json, run_engine, EngineCmd};
 use reference::Reference;
-use types::{NewOffer, Offer};
+use types::NewOffer;
 use wire::{
-    constant_time_eq, load_or_make_seed, load_or_make_token, offer_id_of, random_hex, reachable,
-    read_request, reason, valid_id, Request,
+    constant_time_eq, load_or_make_seed, load_or_make_token, offer_id_of, reachable, read_request,
+    reason, valid_id, Request,
 };
 
 /// The GUI (design 0009), embedded in the binary and served on the loopback API. `index.html` carries
@@ -55,7 +57,6 @@ const APP_JS: &str = include_str!("../gui/app.js");
 
 struct DaemonState {
     settings: Settings,
-    offers: Vec<Offer>,
 }
 
 pub struct Daemon {
@@ -87,10 +88,7 @@ impl Daemon {
         };
         let token = load_or_make_token(data_dir)?;
         let daemon = Daemon {
-            state: Arc::new(Mutex::new(DaemonState {
-                settings,
-                offers: Vec::new(),
-            })),
+            state: Arc::new(Mutex::new(DaemonState { settings })),
             token,
             data_dir: data_dir.to_owned(),
             engine: Arc::new(Mutex::new(None)),
@@ -374,9 +372,19 @@ impl Daemon {
         })
     }
 
+    /// The one response for every data path when no engine is running: the daemon never fabricates
+    /// offers or swaps, so until the user's nodes are connected it says so plainly rather than
+    /// returning empty or placeholder data (design 0009; all data comes from the live engine).
+    fn not_running() -> (u16, Value) {
+        (
+            503,
+            json!({ "error": "engine not running; connect your BTC and xBTC nodes in Settings" }),
+        )
+    }
+
     fn get_offers(&self) -> (u16, Value) {
         if !self.engine_running() {
-            return (200, json!(self.state.lock().unwrap().offers));
+            return Self::not_running();
         }
         match self.engine_call(EngineCmd::Offers) {
             Ok(offers) => (
@@ -389,7 +397,7 @@ impl Daemon {
 
     fn get_swaps(&self) -> (u16, Value) {
         if !self.engine_running() {
-            return (200, json!([]));
+            return Self::not_running();
         }
         match self.engine_call(EngineCmd::Swaps) {
             Ok(swaps) => (
@@ -405,7 +413,7 @@ impl Daemon {
             return (404, json!({"error": "no such swap"}));
         };
         if !self.engine_running() {
-            return (404, json!({"error": "no such swap"}));
+            return Self::not_running();
         }
         match self.engine_call(move |reply| EngineCmd::Detail(id, reply)) {
             Ok(Some(detail)) => (200, detail),
@@ -426,7 +434,7 @@ impl Daemon {
             return (400, json!({"error": "take needs amount_sat"}));
         };
         if !self.engine_running() {
-            return (503, json!({"error": "engine not running"}));
+            return Self::not_running();
         }
         let maker_part = Amount::from_sat(take.amount_sat);
         match self.engine_call(move |reply| EngineCmd::Take {
@@ -473,26 +481,16 @@ impl Daemon {
         if !errors.is_empty() {
             return (422, json!({"error": "invalid offer", "fields": errors}));
         }
-        if self.engine_running() {
-            let offer = new.into_swap_offer(&self.state.lock().unwrap().settings);
-            let id = offer.id.to_hex_string(Case::Lower);
-            return match self.engine_call(move |reply| EngineCmd::Publish(offer, reply)) {
-                Ok(Ok(())) => (200, json!({ "offer_id": id })),
-                Ok(Err(e)) => (422, json!({ "error": e })),
-                Err(e) => (503, json!({ "error": e })),
-            };
+        if !self.engine_running() {
+            return Self::not_running();
         }
-        // Scaffold path when no engine is configured: validate and remember, so the API is usable
-        // and testable without live nodes.
-        let id = random_hex(8);
-        self.state.lock().unwrap().offers.push(Offer {
-            id: id.clone(),
-            sell_chain: new.sell_chain,
-            amount_sat: new.amount_sat,
-            price: new.price,
-            min_amount_sat: new.min_amount_sat,
-        });
-        (200, json!({ "offer_id": id }))
+        let offer = new.into_swap_offer(&self.state.lock().unwrap().settings);
+        let id = offer.id.to_hex_string(Case::Lower);
+        match self.engine_call(move |reply| EngineCmd::Publish(offer, reply)) {
+            Ok(Ok(())) => (200, json!({ "offer_id": id })),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
     }
 
     fn save_settings(&self, settings: &Settings) -> std::io::Result<()> {
