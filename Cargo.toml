@@ -8,7 +8,7 @@ description = "Peer-to-peer atomic swaps between BTC and xBTC (Bitcoin Blake2b)"
 publish = false
 
 [dependencies]
-bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "serde"] }
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "serde", "base64"] }
 # Already in the tree via bitcoin; promoted to a direct, pinned dep for silent payment (BIP352)
 # address bech32m encode/decode. No new crate enters the lockfile.
 bech32 = { version = "=0.11.1", default-features = false, features = ["alloc"] }

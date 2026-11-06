@@ -18,7 +18,7 @@ use bitcoin::key::TweakedPublicKey;
 use bitcoin::secp256k1::{
     Parity, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification, XOnlyPublicKey,
 };
-use bitcoin::{Amount, OutPoint, Script, ScriptBuf, TxOut, Witness};
+use bitcoin::{Amount, Network, OutPoint, Script, ScriptBuf, TxOut, Witness};
 
 use crate::dleq;
 
@@ -154,17 +154,21 @@ pub fn verify_fee<C: Signing + Verification>(
 pub struct SilentPaymentAddress {
     pub scan: PublicKey,
     pub spend: PublicKey,
-    pub testnet: bool,
+    /// The network the address is for, from its human-readable prefix (`sp`, `tsp`, `sprt`). The
+    /// engine checks this against the chain before paying, so a mainnet address is never used to pay
+    /// a fee on a test chain or the reverse.
+    pub network: Network,
 }
 
 impl SilentPaymentAddress {
-    /// Parses a `sp1`/`tsp1` address. Only version 0 (a 66-byte scan||spend payload) is accepted;
-    /// a higher version, wrong length, or a bad point is rejected rather than guessed.
+    /// Parses a `sp1`/`tsp1`/`sprt1` address. Only version 0 (a 66-byte scan||spend payload) is
+    /// accepted; a higher version, wrong length, or a bad point is rejected rather than guessed.
     pub fn parse(s: &str) -> Result<SilentPaymentAddress, Error> {
         let checked = CheckedHrpstring::new::<Bech32m>(s).map_err(|_| Error::Address)?;
-        let testnet = match checked.hrp().as_str() {
-            "sp" => false,
-            "tsp" => true,
+        let network = match checked.hrp().as_str() {
+            "sp" => Network::Bitcoin,
+            "tsp" => Network::Testnet,
+            "sprt" => Network::Regtest,
             _ => return Err(Error::Address),
         };
         let mut fes = checked.fe32_iter::<core::iter::Empty<u8>>();
@@ -179,13 +183,18 @@ impl SilentPaymentAddress {
         Ok(SilentPaymentAddress {
             scan: PublicKey::from_slice(&payload[..33]).map_err(|_| Error::Key)?,
             spend: PublicKey::from_slice(&payload[33..]).map_err(|_| Error::Key)?,
-            testnet,
+            network,
         })
     }
 
     /// The bech32m string form, the inverse of `parse`.
     pub fn encode(&self) -> String {
-        let hrp = Hrp::parse(if self.testnet { "tsp" } else { "sp" }).expect("static hrp");
+        let prefix = match self.network {
+            Network::Bitcoin => "sp",
+            Network::Regtest => "sprt",
+            _ => "tsp",
+        };
+        let hrp = Hrp::parse(prefix).expect("static hrp");
         let mut payload = Vec::with_capacity(66);
         payload.extend_from_slice(&self.scan.serialize());
         payload.extend_from_slice(&self.spend.serialize());
@@ -528,6 +537,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn address_encodes_and_parses_each_network_hrp() {
+        let secp = Secp256k1::new();
+        let scan = PublicKey::from_secret_key(&secp, &sk(1));
+        let spend = PublicKey::from_secret_key(&secp, &sk(2));
+        for (network, prefix) in [
+            (Network::Bitcoin, "sp1"),
+            (Network::Testnet, "tsp1"),
+            (Network::Regtest, "sprt1"),
+        ] {
+            let addr = SilentPaymentAddress {
+                scan,
+                spend,
+                network,
+            };
+            let s = addr.encode();
+            assert!(s.starts_with(prefix), "{network}: {s}");
+            assert_eq!(SilentPaymentAddress::parse(&s), Ok(addr));
+        }
+    }
+
     // The operator's address, two eligible inputs, and the fee the payer should pay.
     fn fixture(
         secp: &Secp256k1<bitcoin::secp256k1::All>,
@@ -543,7 +573,7 @@ mod tests {
         let recipient = SilentPaymentAddress {
             scan: PublicKey::from_secret_key(secp, &scan),
             spend: PublicKey::from_secret_key(secp, &spend),
-            testnet: false,
+            network: Network::Bitcoin,
         };
         let keys = [sk(21), sk(22)];
         let inputs: Vec<InputKey> = keys
@@ -621,7 +651,7 @@ mod tests {
         let other = SilentPaymentAddress {
             scan: PublicKey::from_secret_key(&secp, &sk(31)),
             spend: PublicKey::from_secret_key(&secp, &sk(32)),
-            testnet: false,
+            network: Network::Bitcoin,
         };
         let elsewhere = pay_fee(&secp, &inputs, &outpoints, &other, &[7u8; 32]).unwrap();
         let wrong = [TxOut {

@@ -6,7 +6,8 @@ mod common;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bitcoin::Amount;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Amount, Network};
 use serde_json::json;
 
 use common::{binaries, Node};
@@ -14,7 +15,8 @@ use sovereign_swap::engine::{Config, Engine, EngineError};
 use sovereign_swap::node::{ChainNode, NodeError};
 use sovereign_swap::policy::Policy;
 use sovereign_swap::replay::ReplayError;
-use sovereign_swap::swap::{BidError, Chain, Offer, Phase};
+use sovereign_swap::silentpayments::SilentPaymentAddress;
+use sovereign_swap::swap::{BidError, Chain, FeeTerms, Offer, Phase};
 use sovereign_swap::transport::{memory_pair, Memory};
 
 /// Shallow depths keep regtest runs short; `Policy::standard` is tested on its own.
@@ -164,13 +166,22 @@ impl World {
 
     /// As `parties`, with the taker bidding for `maker_part` of the offer.
     fn parties_for(&self, maker_chain: Chain, maker_part: Amount) -> (Party, Party) {
+        self.parties_offer(offer(maker_chain), maker_chain, maker_part)
+    }
+
+    /// The shared setup: fund both parties, publish `offer`, have the taker see and bid for it.
+    fn parties_offer(
+        &self,
+        offer: Offer,
+        maker_chain: Chain,
+        maker_part: Amount,
+    ) -> (Party, Party) {
         let (a, b) = memory_pair();
         let mut maker = Party::new("maker", a, &self.btc, &self.xbtc);
         let mut taker = Party::new("taker", b, &self.btc, &self.xbtc);
         maker.deposit(self.node(maker_chain), 2.0);
         taker.deposit(self.node(maker_chain.other()), 2.0);
         self.mine();
-        let offer = offer(maker_chain);
         maker.engine().publish(offer.clone()).unwrap();
         taker.tick();
         assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));
@@ -225,6 +236,33 @@ fn always(_: &Party, _: &Party) -> (bool, bool) {
 fn swap_maker_sells_xbtc() {
     let Some(w) = World::start() else { return };
     let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+}
+
+/// The full voluntary-fee path (design 0010): a fee-bearing offer, both sides pay a silent payment
+/// fee output, exchange the share and proof, and verify each other's before proceeding. Reaching
+/// Done proves the gate saw both fees as Verified (a missing or bad fee would stall the swap), so
+/// this exercises the signer, the FeeProof message, verify_fee and the three-state gate together.
+#[test]
+fn swap_with_fees_completes_end_to_end() {
+    let Some(w) = World::start() else { return };
+    let secp = Secp256k1::new();
+    let recipient = SilentPaymentAddress {
+        scan: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap()),
+        spend: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x44; 32]).unwrap()),
+        network: Network::Regtest,
+    };
+    let fee = FeeTerms {
+        maker_bps: 20,
+        taker_bps: 30,
+        sp_address: recipient.encode(),
+    };
+    let fee_offer = Offer {
+        fee: Some(fee),
+        ..offer(Chain::Xbtc)
+    };
+    let (mut maker, mut taker) =
+        w.parties_offer(fee_offer.clone(), Chain::Xbtc, fee_offer.maker_amount);
     w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
 }
 
