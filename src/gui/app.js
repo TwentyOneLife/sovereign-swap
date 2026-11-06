@@ -90,7 +90,7 @@ function offerForm(o) {
   const hint = o ? null : rateHint(sell);
   const price = o ? (o.counter_amount_sat / o.amount_sat).toFixed(4) : (hint ? hint.mid.toFixed(4) : "0.997");
   const hintLine = hint
-    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${hint.min.toFixed(4)}–${hint.max.toFixed(4)}. You set your own price.</p>`
+    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${hint.min.toFixed(4)} - ${hint.max.toFixed(4)}. You set your own price.</p>`
     : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
   return `<h2>${o ? "Take offer" : "Create offer"}</h2>
     <label>I am selling
@@ -146,7 +146,7 @@ function createSheet() {
     const ref = sell === "xbtc" ? refRate : 1 / refRate;
     const p = parseFloat($("#f-price").value.replace(",", "."));
     const off = isFinite(p) && ref > 0 ? Math.abs(p - ref) / ref : 0;
-    w.textContent = off > 0.05 ? `⚠ ${(off * 100).toFixed(0)}% from the reference — check the price.` : "";
+    w.textContent = off > 0.05 ? `⚠ ${(off * 100).toFixed(0)}% from the reference - check the price.` : "";
   }
   $("#f-price").addEventListener("input", checkDeviation);
   showReference();
