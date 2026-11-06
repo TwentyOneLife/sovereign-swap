@@ -6,12 +6,15 @@
 use std::collections::HashSet;
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::htlc::{extract_preimage, Contract};
 use crate::replay::{check_inputs, ReplayError, UtxoLookup};
 use crate::rpc::{Client, RpcError};
+use crate::silentpayments::{FeePayment, SilentPaymentAddress};
 use crate::swap::{LockView, SpendView};
 
 #[derive(Debug)]
@@ -33,6 +36,33 @@ impl From<RpcError> for NodeError {
 /// for the user's balance. `WalletSigner` (the node wallet) is the hot default for regtest and tests.
 pub trait FundingSigner: Send + Sync {
     fn sign(&self, unsigned_psbt: &str) -> Result<String, NodeError>;
+
+    /// Sign a funding PSBT that carries a placeholder fee output at `fee_vout`, replacing that
+    /// output's script with the fresh silent payment output for `recipient` (design 0010). Returns
+    /// the signed PSBT and the [`FeePayment`] (the output, the ECDH share and the BIP374 proof). The
+    /// signer needs the input keys, which is why this is its job. The default is to refuse: a signer
+    /// that is not BIP352-aware cannot add the fee, and the daemon refuses to enable fees against it.
+    fn sign_with_silent_fee(
+        &self,
+        _unsigned_psbt: &str,
+        _recipient: &SilentPaymentAddress,
+        _fee_vout: u32,
+    ) -> Result<(String, FeePayment), NodeError> {
+        Err(NodeError::Unexpected(
+            "signer is not BIP352-aware; cannot add a silent payment fee".into(),
+        ))
+    }
+}
+
+/// The payer's voluntary fee output as a counterparty needs to check it (design 0010): the ECDH
+/// share `a*B_scan`, the BIP374 proof that it matches the lock's input-key sum, and the prevout
+/// transactions of the lock's inputs, so the counterparty can authenticate the input public keys
+/// without a transaction index. Persisted with the lock and sent to the counterparty.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FeeProof {
+    pub share: PublicKey,
+    pub proof: Vec<u8>,
+    pub prevouts: Vec<Transaction>,
 }
 
 /// Signs with a bitcoind wallet that holds the keys. Hot: only for test and regtest use, never the
@@ -235,20 +265,61 @@ impl ChainNode {
         fee_rate_sat_vb: u64,
         minconf: u32,
         other_chain: &impl UtxoLookup<Error = RpcError>,
-    ) -> Result<Transaction, NodeError> {
-        let outputs = json!([{ self.address(contract).to_string(): amount.to_btc() }]);
+        fee: Option<(Amount, &SilentPaymentAddress)>,
+    ) -> Result<(Transaction, Option<FeeProof>), NodeError> {
+        let mut outputs = vec![json!({ self.address(contract).to_string(): amount.to_btc() })];
+        // When a fee is due, add a placeholder P2TR output the signer rewrites into the fresh silent
+        // payment output. P2TR so its size, and so the miner fee, matches the final transaction.
+        let placeholder_spk = match fee {
+            Some((fee_amount, _)) => {
+                let addr = self.wallet.call("getnewaddress", json!(["", "bech32m"]))?;
+                let addr = addr
+                    .as_str()
+                    .ok_or_else(|| NodeError::Unexpected("no placeholder address".into()))?;
+                outputs.push(json!({ addr: fee_amount.to_btc() }));
+                let info = self.wallet.call("getaddressinfo", json!([addr]))?;
+                Some(
+                    info["scriptPubKey"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            }
+            None => None,
+        };
         let options =
             json!({ "fee_rate": fee_rate_sat_vb, "replaceable": true, "minconf": minconf });
         let funded = self
             .wallet
-            .call("walletcreatefundedpsbt", json!([[], outputs, 0, options]))?;
+            .call("walletcreatefundedpsbt", json!([[], json!(outputs), 0, options]))?;
         let psbt = funded["psbt"]
             .as_str()
             .ok_or_else(|| NodeError::Unexpected("no psbt".into()))?;
         let decoded = self.rpc.call("decodepsbt", json!([psbt]))?;
         check_inputs(&inputs_of(&decoded["tx"])?, other_chain).map_err(NodeError::Replay)?;
+
         // Delegate signing: the engine never holds the funding keys (cold in production).
-        let signed_psbt = self.signer.sign(psbt)?;
+        let (signed_psbt, fee_proof) = match (fee, placeholder_spk) {
+            (Some((_, recipient)), Some(spk)) => {
+                // Funding may insert a change output, so find the placeholder by its script.
+                let fee_vout = find_vout(&decoded["tx"], &spk).ok_or_else(|| {
+                    NodeError::Unexpected("placeholder fee output not in the funded psbt".into())
+                })?;
+                let (signed, pay) = self.signer.sign_with_silent_fee(psbt, recipient, fee_vout)?;
+                let share = PublicKey::from_slice(&pay.share)
+                    .map_err(|_| NodeError::Unexpected("bad fee share".into()))?;
+                let prevouts = self.input_prevouts(&decoded["tx"])?;
+                (
+                    signed,
+                    Some(FeeProof {
+                        share,
+                        proof: pay.proof.to_vec(),
+                        prevouts,
+                    }),
+                )
+            }
+            _ => (self.signer.sign(psbt)?, None),
+        };
         let finalized = self.rpc.call("finalizepsbt", json!([signed_psbt]))?;
         if finalized["complete"] != true {
             return Err(NodeError::Unexpected(
@@ -259,7 +330,21 @@ impl ChainNode {
         contract
             .find_lock_output(&tx, amount)
             .map_err(|e| NodeError::Unexpected(format!("funded lock: {e:?}")))?;
-        Ok(tx)
+        Ok((tx, fee_proof))
+    }
+
+    /// The prevout transactions of a decoded PSBT's inputs, fetched from this node, so a counterparty
+    /// can authenticate the input public keys the fee proof is built over.
+    fn input_prevouts(&self, tx: &Value) -> Result<Vec<Transaction>, NodeError> {
+        let mut out = Vec::new();
+        for vin in tx["vin"].as_array().into_iter().flatten() {
+            let txid = vin["txid"]
+                .as_str()
+                .ok_or_else(|| NodeError::Unexpected("input without a txid".into()))?;
+            let raw = self.rpc.call("getrawtransaction", json!([txid]))?;
+            out.push(parse(&raw)?);
+        }
+        Ok(out)
     }
 
     /// Broadcasts `tx`; a transaction the node already has counts as success.
@@ -274,6 +359,13 @@ impl ChainNode {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// The vout of the output of `decodepsbt`'s transaction whose scriptPubKey is `spk_hex`, if any.
+fn find_vout(tx: &Value, spk_hex: &str) -> Option<u32> {
+    tx["vout"].as_array()?.iter().find_map(|o| {
+        (o["scriptPubKey"]["hex"].as_str() == Some(spk_hex)).then(|| o["n"].as_u64().unwrap_or(0) as u32)
+    })
 }
 
 /// The inputs of `decodepsbt`'s transaction, as a transaction the replay guard can read.

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
-use crate::node::{ChainNode, NodeError};
+use crate::node::{ChainNode, FeeProof, NodeError};
 use crate::policy::{Policy, PolicyError};
 use crate::store::write_atomic;
 use crate::swap::{Action, BidError, Chain, ChainView, Message, Offer, Phase, Role, Swap};
@@ -34,6 +34,11 @@ pub struct Record {
     pub refund_to: ScriptBuf,
     /// Our signed lock, stored before its first broadcast so a restart sends the same one again.
     pub funding: Option<Transaction>,
+    /// The voluntary fee output's share and proof, stored with the lock so a restart resends the
+    /// same proof to the counterparty (design 0010). `None` when no fee is due. Absent in older
+    /// records, hence `serde(default)`.
+    #[serde(default)]
+    pub fee: Option<FeeProof>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -320,6 +325,7 @@ impl<T: Transport> Engine<T> {
             claim_to: self.nodes[&claim_chain].new_destination()?,
             refund_to: self.nodes[&refund_chain].new_destination()?,
             funding: None,
+            fee: None,
             swap,
         };
         self.save(&record)?;
@@ -410,14 +416,18 @@ impl<T: Transport> Engine<T> {
                 Some(tx) => (own_chain, tx),
                 None => {
                     let other = &self.nodes[&own_chain.other()].rpc;
-                    let tx = self.nodes[&own_chain].fund(
+                    // The fee is wired through here; the terms come from the offer in a later step
+                    // (design 0010), so for now no fee is requested.
+                    let (tx, fee_proof) = self.nodes[&own_chain].fund(
                         own_contract,
                         self.lock_amount_override.unwrap_or(own_amount),
                         self.config.fee_rate_sat_vb,
                         self.config.policy.funding_minconf(own_chain),
                         other,
+                        None,
                     )?;
                     self.records[i].funding = Some(tx.clone());
+                    self.records[i].fee = fee_proof;
                     self.save(&self.records[i])?;
                     (own_chain, tx)
                 }

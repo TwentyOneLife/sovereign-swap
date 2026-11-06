@@ -91,8 +91,8 @@ fn the_engine_wallet_holds_no_keys_and_an_external_signer_funds_the_lock() {
         lock_blocks: 20,
     };
     let amount = Amount::from_sat(500_000);
-    let tx = chain
-        .fund(&contract, amount, 2, 1, &NoOtherChain)
+    let (tx, _fee) = chain
+        .fund(&contract, amount, 2, 1, &NoOtherChain, None)
         .expect("external signer funds the lock");
     chain
         .broadcast(&tx)
