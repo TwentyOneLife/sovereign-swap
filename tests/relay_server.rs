@@ -258,6 +258,12 @@ fn a_browser_get_gets_the_landing_page_not_a_websocket() {
         "funds warning missing"
     );
     assert!(text.contains("4859"), "kind missing");
+    // The whole page must arrive, not a truncated prefix (it was cut off over Tor when the socket
+    // closed with the peeked request still unread; serve_landing now drains and half-closes).
+    assert!(
+        text.trim_end().ends_with("</html>"),
+        "landing page truncated"
+    );
 }
 
 #[test]
