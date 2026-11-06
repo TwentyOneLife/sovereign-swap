@@ -4,16 +4,19 @@
 //! spends, confirmations and reorgs for us.
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
+use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use bitcoin::key::TapTweak;
+use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
 use crate::htlc::{extract_preimage, Contract};
 use crate::replay::{check_inputs, ReplayError, UtxoLookup};
 use crate::rpc::{Client, RpcError};
-use crate::silentpayments::{FeePayment, SilentPaymentAddress};
+use crate::silentpayments::{pay_fee, FeePayment, InputKey, SilentPaymentAddress};
 use crate::swap::{FeeProof, FeeState, LockView, SpendView};
 
 #[derive(Debug)]
@@ -74,6 +77,157 @@ impl FundingSigner for WalletSigner {
             .map(str::to_owned)
             .ok_or_else(|| NodeError::Unexpected("no psbt in sign result".into()))
     }
+
+    /// Hot (regtest) BIP352 signing: derive each input's key from the wallet's own descriptors,
+    /// compute the silent payment fee output, share and proof, place the output in the PSBT and
+    /// sign (design 0010). The production path is an external BIP352-aware cold signer, not this.
+    fn sign_with_silent_fee(
+        &self,
+        unsigned_psbt: &str,
+        recipient: &SilentPaymentAddress,
+        fee_vout: u32,
+    ) -> Result<(String, FeePayment), NodeError> {
+        let secp = Secp256k1::new();
+        let account_keys = self.account_keys()?;
+        let decoded = self.wallet.call("decodepsbt", json!([unsigned_psbt]))?;
+        let vin = decoded["tx"]["vin"]
+            .as_array()
+            .ok_or_else(|| NodeError::Unexpected("psbt has no inputs".into()))?;
+        let psin = decoded["inputs"].as_array();
+
+        let mut inputs = Vec::new();
+        let mut all_outpoints = Vec::new();
+        for (i, v) in vin.iter().enumerate() {
+            all_outpoints.push(OutPoint {
+                txid: v["txid"]
+                    .as_str()
+                    .and_then(|t| t.parse().ok())
+                    .ok_or_else(|| NodeError::Unexpected("input txid".into()))?,
+                vout: v["vout"].as_u64().unwrap_or_default() as u32,
+            });
+            let spk = &psin.and_then(|p| p.get(i)).unwrap_or(&Value::Null)["witness_utxo"]
+                ["scriptPubKey"];
+            let addr = spk["address"]
+                .as_str()
+                .ok_or_else(|| NodeError::Unexpected("input is not ours to sign".into()))?;
+            let taproot = spk["type"].as_str() == Some("witness_v1_taproot");
+            let info = self.wallet.call("getaddressinfo", json!([addr]))?;
+            let hdkeypath = info["hdkeypath"]
+                .as_str()
+                .ok_or_else(|| NodeError::Unexpected("no hdkeypath for input".into()))?;
+            let key = derive_input_key(&secp, &account_keys, hdkeypath, taproot)?;
+            inputs.push(InputKey { key, taproot });
+        }
+
+        let pay = pay_fee(&secp, &inputs, &all_outpoints, recipient, &os_random())
+            .map_err(|e| NodeError::Unexpected(format!("fee derivation: {e:?}")))?;
+        let signed = self.place_fee_output_and_sign(unsigned_psbt, fee_vout, &pay.output)?;
+        Ok((signed, pay))
+    }
+}
+
+impl WalletSigner {
+    /// The wallet's private single-sig account keys by kind (taproot or not), from
+    /// `listdescriptors true`. Receive and change descriptors share an account key, so one per kind.
+    fn account_keys(&self) -> Result<Vec<(bool, Xpriv)>, NodeError> {
+        let listed = self.wallet.call("listdescriptors", json!([true]))?;
+        let mut out: Vec<(bool, Xpriv)> = Vec::new();
+        for d in listed["descriptors"].as_array().into_iter().flatten() {
+            let desc = d["desc"].as_str().unwrap_or("");
+            let taproot = desc.starts_with("tr(");
+            if !taproot && !desc.starts_with("wpkh(") {
+                continue; // only single-sig segwit v0 / taproot
+            }
+            // The key is the extended private key, derived to under the full hdkeypath; take it from
+            // its start up to the first path element. (Regtest descriptors carry no origin bracket.)
+            let Some(start) = desc.find("tprv").or_else(|| desc.find("xprv")) else {
+                continue;
+            };
+            let xprv_str: String = desc[start..].chars().take_while(|c| *c != '/').collect();
+            if let Ok(xprv) = Xpriv::from_str(&xprv_str) {
+                if !out.iter().any(|(t, _)| *t == taproot) {
+                    out.push((taproot, xprv));
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(NodeError::Unexpected(
+                "wallet has no private wpkh/tr descriptors to sign a silent payment fee".into(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Replace the placeholder output at `fee_vout` with the silent payment output, then sign. The
+    /// value and P2TR size are unchanged, so the funded miner fee still holds; the stale wallet
+    /// metadata for the rewritten output is cleared so signing is unaffected.
+    fn place_fee_output_and_sign(
+        &self,
+        unsigned_psbt: &str,
+        fee_vout: u32,
+        spk: &ScriptBuf,
+    ) -> Result<String, NodeError> {
+        let mut psbt = Psbt::from_str(unsigned_psbt)
+            .map_err(|e| NodeError::Unexpected(format!("psbt: {e}")))?;
+        let vout = fee_vout as usize;
+        if vout >= psbt.unsigned_tx.output.len() {
+            return Err(NodeError::Unexpected("fee vout out of range".into()));
+        }
+        psbt.unsigned_tx.output[vout].script_pubkey = spk.clone();
+        if let Some(o) = psbt.outputs.get_mut(vout) {
+            o.bip32_derivation.clear();
+            o.tap_key_origins.clear();
+            o.tap_internal_key = None;
+        }
+        let signed = self
+            .wallet
+            .call("walletprocesspsbt", json!([psbt.to_string()]))?;
+        if signed["complete"] != true {
+            return Err(NodeError::Unexpected(
+                "signer did not fully sign the fee psbt".into(),
+            ));
+        }
+        signed["psbt"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| NodeError::Unexpected("no psbt in sign result".into()))
+    }
+}
+
+/// Derive an input's signing key from the matching account key and its `m/.../chain/index` path,
+/// applying the taproot key-path tweak for a taproot input so the key matches the output key.
+fn derive_input_key(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    keys: &[(bool, Xpriv)],
+    hdkeypath: &str,
+    taproot: bool,
+) -> Result<SecretKey, NodeError> {
+    let xprv = keys
+        .iter()
+        .find(|(tr, _)| *tr == taproot)
+        .map(|(_, x)| x)
+        .ok_or_else(|| NodeError::Unexpected("no master key for the input's type".into()))?;
+    // The key is the wallet master; derive the input's full hdkeypath from it.
+    let path = DerivationPath::from_str(hdkeypath.trim_start_matches("m/"))
+        .map_err(|_| NodeError::Unexpected("bad hdkeypath".into()))?;
+    let derived = xprv
+        .derive_priv(secp, &path)
+        .map_err(|_| NodeError::Unexpected("derive".into()))?
+        .private_key;
+    if taproot {
+        let kp = Keypair::from_secret_key(secp, &derived);
+        Ok(kp.tap_tweak(secp, None).to_keypair().secret_key())
+    } else {
+        Ok(derived)
+    }
+}
+
+fn os_random() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = std::io::Read::read_exact(&mut f, &mut b);
+    }
+    b
 }
 
 pub struct ChainNode {
