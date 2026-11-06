@@ -55,12 +55,13 @@ rate band in 0009 layer 2), so a mis-set rate cannot produce a fee larger than t
 ## Silent payments on the funding path
 
 A silent payment address `sp1...` carries two public keys, scan and spend. The payer, who holds the
-inputs it is spending, computes a shared secret from (sum of the eligible input private keys) and the
-recipient's scan key, and derives a fresh P2TR output from it. Anyone who holds the address and sees
-the transaction's inputs can recompute that same output script and recognise the payment; only the
-holder of the scan key can detect it as theirs, and only the spend key can spend it. This is exactly
-the property we want: the payer needs no interaction, the counterparty can verify (below), and the
-output links to nothing.
+inputs it is spending, computes a shared secret from (the sum `a` of the eligible input private keys)
+and the recipient's scan key `B_scan`, and derives a fresh P2TR output from it. By the ECDH identity
+`a * B_scan = b_scan * A` (where `A = a*G` is the public input sum), the output can be computed by the
+payer (who knows `a`) or the recipient (who knows the scan private key `b_scan`), **and by no one
+else**: a third party sees only `A` and cannot recover the shared secret. Only the scan key detects
+the output, only the spend key can spend it. This third-party unlinkability is the property we want on
+chain; it is also, deliberately, why the counterparty cannot by itself verify the payment (see below).
 
 The difficulty is that the output script depends on the inputs, and the inputs are chosen by
 `walletcreatefundedpsbt`, and the shared secret needs the inputs' private keys, which in production
@@ -96,19 +97,44 @@ signer that is not BIP352-aware returns `Unsupported`, and the daemon refuses to
 it with a clear message rather than silently dropping the fee. So the signer's capability gates the
 feature; it never corrupts a transaction.
 
-## The counterparty check
+## The counterparty check (open owner decision)
 
 Spec 7.3 requires that each client verify the other side's lock transaction carries the fee output
-before continuing, and otherwise take the refund path, which is always safe. Silent payments make
-this checkable without any secret: the counterparty sees the other lock's inputs (public) and holds
-the published silent payment address, so it recomputes the expected output script the same way the
-payer did and checks that an output with that script and value at least the required `fee` is present.
-If it is missing or short, the client does not proceed to its own lock; it stops, and the swap unwinds
-through the normal refund. No funds are ever at risk from a missing fee, because the check happens
-before this side commits.
+before continuing, and otherwise take the refund path, which is always safe. That mutual check is
+what makes 7.3's claim true, that skipping the fee takes *two* modified clients: without it, one
+modified client can omit its own fee while trading against a stock client that still pays.
 
-This verification is pure public-data computation, so it lives in the engine (not the signer) and is
-covered by BIP352 test vectors.
+An earlier draft of this document claimed the counterparty could recompute the expected fee output
+from public data. **That was wrong**, and it is wrong for the exact reason silent payments are
+private: the output needs either the payer's input-key sum `a` or the operator's scan key `b_scan`,
+and the counterparty holds neither. So the check cannot be a silent recomputation. Three ways to
+restore it, a decision for the owner (as 7.5a was):
+
+- **(A) The payer reveals its ECDH share.** The payer sends, over the already encrypted swap channel,
+  the point `S = a * B_scan` for its lock, optionally with a DLEQ proof (BIP374) that `S` matches the
+  lock's public input sum `A`. The counterparty rebuilds `A` from the lock's inputs, (verifies the
+  proof,) derives `B_spend + hash(S‖k)*G`, and checks that output is present with value at least
+  `fee`. Without the DLEQ proof a dishonest payer can at most send a wrong `S` and so burn its own
+  fee to an output the operator cannot find by scanning; it cannot redirect the counterparty's funds,
+  because every candidate output is still `B_spend + t*G`, spendable only with the operator's spend
+  key. So the cheap no-proof variant is safe for the counterparty and only weakens "the operator can
+  always find its fee"; DLEQ can be added later. This is the recommended path and matches the
+  direction hardware signers are taking (BIP375, silent payments in PSBTs). It adds **one versioned
+  field to the swap message** (the share, and later the proof).
+- **(B) Drop the check.** Accept that a fee is one-sided-skippable by a modified client and amend spec
+  7.3. Simplest, and defensible given the fee is already voluntary and unenforceable against two
+  modified clients; the cost is that it is now unenforceable against *one*.
+- **(C) Xpub with a deterministic per-swap index.** The only mechanism that needs no reveal: both
+  sides derive the same fee address from the operator's xpub at an index fixed by the swap id, so the
+  counterparty recomputes it directly. It costs exactly the on-chain linkability (one xpub clusters
+  all fees) that 7.5a chose silent payments to avoid.
+
+Whatever is chosen, no funds are ever at risk from a missing or wrong fee: the check runs before this
+side commits its own lock, and a failure takes the always-safe refund path.
+
+Until the owner decides, this document specifies only the parts every option shares (below): the
+BIP352 core and the fee output. The counterparty check and any new swap-message field are held, and
+the swap message format is versioned when the field is added.
 
 ## Settings
 
@@ -132,37 +158,46 @@ This is **not** the node RPC connection, which is unchanged and already present 
 mockup shows cookie auth for the node, but `Settings` only has user/pass. Cookie auth is tracked
 separately (it belongs with the StartOS dependency-wired node selection, M4c), not in this document.
 
-## BIP352 dependency
+## BIP352 implementation
 
-We need a BIP352 implementation for output derivation and the counterparty check. Options: a
-reviewed Rust silent-payments crate pinned by `Cargo.lock` hash, or a minimal in-tree implementation
-of just sender-side output derivation and receiver-side scanning against the published test vectors.
-The input-eligibility rules (which input types contribute to the shared secret) follow BIP352
-exactly. Decision deferred to the implementation PR, where the dependency can be weighed against the
-sovereign-code preference in GUARDRAILS; either way it is pinned and verified.
+Decided (2026-11-06): a **minimal in-tree** implementation, not an external crate. The primitives it
+needs (`secp256k1`, tagged SHA256, bech32m) are already in the dependency tree via the `bitcoin`
+crate, so an external silent-payments crate would add no capability we lack while pulling its own,
+possibly mismatched, `bitcoin`/`secp256k1` versions (a second `secp256k1` in a wallet is a real
+footgun) and an unaudited dependency onto the money path. In-tree keeps the one pinned `secp256k1`,
+matches the sovereign-code preference in GUARDRAILS, and is bounded: address parse and encode, tagged
+hashes, sender output derivation, and receiver scanning, roughly a few hundred lines. Its correctness
+gate is the official BIP352 `send_and_receive_test_vectors.json`, checked in under `tests/fixtures/`
+pinned to a bips commit with a recorded SHA256. The input-eligibility rules (which input types
+contribute to the shared secret) follow BIP352 exactly.
 
 ## Build order
 
-1. **Settings + validation + off-switch** (this PR's code): the four fields, layer-2 validation, and
-   the engine wiring that does nothing when `fee_enabled` is false. Ships in v0.2.0.
+1. **Settings + validation + off-switch** (done, PR #27): the four fields, layer-2 validation, and no
+   engine change while `fee_enabled` is false. Ships in v0.2.0.
 2. **Fee amount + placeholder output**: `FeePolicy` computing `fee` from amount, side and rate with
    the floor and the min-trade refusal; `fund()` adds the placeholder P2TR output when enabled.
-3. **BIP352 derivation**: the `sign_with_silent_fee` seam, `WalletSigner`'s implementation, and the
-   engine-side counterparty check, all against BIP352 test vectors.
-4. **Regtest end to end with fees on**: a full swap that pays both fee outputs and verifies each side,
-   plus the refund path when a fee output is absent.
+3. **BIP352 core (in-tree)**: address parse/encode, tagged hashes, sender derivation and receiver
+   scanning, all against the pinned test vectors. Needed by every counterparty-check option, so it is
+   built before that decision; the `sign_with_silent_fee` signer seam uses it.
+4. **Counterparty check**: held until the owner decides (A/B/C above). When it is A, this adds the
+   revealed ECDH share (and later the DLEQ proof) as a versioned swap-message field, plus the
+   verifier; when B, nothing; when C, the xpub derivation replaces the SP path here.
+5. **Regtest end to end with fees on**: a full swap that pays both fee outputs, the operator scans and
+   finds them, and the refund path when a fee output is absent or (under A) its share fails to verify.
 
-Steps 1 and 2 are mechanical and safe. Step 3 is the real cryptographic work and sits on the
-funding-PSBT path the cold signer approves, so it is the one that needs the test vectors and careful
-review before fees are ever switched on in anger.
+Steps 1 and 2 are mechanical and safe. Steps 3 and 4 are the real cryptographic work and sit on the
+funding-PSBT path the cold signer approves, so they need the test vectors and careful review before
+fees are ever switched on in anger.
 
 ## Test plan
 
 - **Unit**: fee amount (rate, floor, rounding), min-trade refusal, the sanity band, and that a
   disabled fee adds no output and changes no byte of today's path.
 - **BIP352 vectors**: sender output derivation and receiver scanning match the BIP352 test vectors.
-- **Counterparty check**: accepts a correct fee output, rejects a missing one, rejects a short one,
-  rejects one to the wrong script, and in each rejection the swap takes the safe refund path.
+- **Counterparty check** (once the owner picks A/B/C): under A, a correct revealed share verifies and
+  locates the output; a missing output, a short one, or a share that fails its proof is rejected and
+  the swap takes the safe refund path.
 - **Signer capability**: enabling fees against a non-BIP352 signer is refused at validation, not at
   transaction build.
 - **Regtest e2e**: a full swap with fees on pays and verifies both outputs; the operator scans and
