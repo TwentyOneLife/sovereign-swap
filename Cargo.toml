@@ -33,3 +33,7 @@ rustls-pemfile = "=2.2.0"
 # Mints a throwaway CA + localhost leaf (with an IP SAN) in-process for the TLS transport tests, so
 # no certificate or key material is committed to this public repo. `ring` provider, no cmake/C.
 rcgen = { version = "=0.13.2", default-features = false, features = ["pem", "ring"] }
+
+[features]
+# Exposes internal parsers (HTTP reader) to the fuzz targets only; never set in a normal build.
+fuzzing = []

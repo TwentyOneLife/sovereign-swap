@@ -1,0 +1,30 @@
+[package]
+name = "sovereign-swap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+sovereign-swap = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "swap_message"
+path = "fuzz_targets/swap_message.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the main workspace.
+[workspace]

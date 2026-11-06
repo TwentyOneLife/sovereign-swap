@@ -55,6 +55,14 @@ const INDEX_HTML: &str = include_str!("../gui/index.html");
 const APP_CSS: &str = include_str!("../gui/app.css");
 const APP_JS: &str = include_str!("../gui/app.js");
 
+/// Fuzz entry: run the HTTP request reader over arbitrary bytes (a `Cursor` stands in for the socket).
+/// Exposed only under the `fuzzing` feature so the normal build keeps the parser crate-private. The
+/// reader takes fully untrusted client input, so a panic here is a remote DoS; the fuzzer hunts them.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_read_request(data: &[u8]) {
+    let _ = wire::read_request(&mut std::io::Cursor::new(data));
+}
+
 struct DaemonState {
     settings: Settings,
 }
