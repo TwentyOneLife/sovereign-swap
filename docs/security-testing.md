@@ -53,18 +53,21 @@ verify.
 - Done responsibly: demonstrated and fixed against a local instance, not by flooding the production
   node (real-value downtime is not hardening).
 
-## 4. Web UI authentication and config lock
+## 4. Web UI authentication and the config boundary
 
 - **Finding:** the web UI served the page (and the API token embedded in it) with no auth, so knowing
-  the onion was enough to drive the swaps.
-- **Fix:** HTTP Basic auth on the page and its assets, with a password generated randomly per install
-  (StartOS package) and changeable by the operator; the token is never served without the password, so
-  the whole UI is behind it. Constant-time credential comparison. `SWAP_CONFIG_LOCKED` makes node/relay
-  config read-only in the page (`PUT /settings` -> 403), leaving the package action the single config
-  source.
+  the onion was enough to drive the swaps; the Settings view also read back the full config, including
+  the node RPC passwords, to the web layer.
+- **Fix (auth):** HTTP Basic auth on the page and its assets, with a password generated randomly per
+  install (StartOS package) and changeable by the operator; the token is never served without the
+  password, so the whole UI is behind it. Constant-time credential comparison.
+- **Fix (config off the web entirely):** configuration lives only in the StartOS package actions, which
+  write `settings.json`; the daemon reads it on start. The web UI is **swaps-only** (Market and Swaps):
+  the Settings tab/form and the `GET`/`PUT /settings` endpoints were removed, so node credentials are
+  never serialized to the web layer and there is no config-editing surface to lock or misconfigure.
 - **Verified live** (through the deployed daemon): the page with no credentials returns `401` with
-  `WWW-Authenticate: Basic`; with the generated password returns `200`; `PUT /settings` returns `403`;
-  the API with no token returns `401`.
+  `WWW-Authenticate: Basic`; with the generated password returns `200`; the API with no token returns
+  `401`.
 - **Auth boundary does not depend on where the request comes from.** The daemon binds a non-loopback
   address only with `SWAP_API_TRUST_NETWORK=1`, and that flag is a bind permission, not an auth bypass
   (`sovereign-swap-daemon.rs`). Every request is gated by the same password and token regardless of
@@ -84,9 +87,11 @@ real-funds testing (lock-and-vanish, replayed `Accept`, mismatched `secret_hash`
 Verified end to end on the operator's StartOS node (details in the private infra notes):
 
 - The client reaches both nodes over verified HTTPS (Root CA) and the relay over Tor; `getblockcount`,
-  wallet creation, and an authenticated RPC round trip all succeed.
+  wallet creation, and an authenticated RPC round trip all succeed. Node RPC auth is a **static
+  `rpcauth` user** generated on each node (not the rotating `.cookie`), so the credential survives node
+  restarts; a wrong password returns 401.
 - The engine starts (`/status` reports it), with node and relay connectivity true.
-- The web UI auth and config lock behave as in section 4.
+- The web UI auth and the swaps-only boundary behave as in section 4.
 - Swap-lifecycle logging now records a new swap and every phase transition to the service log, so a swap
   can be followed in `package logs`, not only the web UI (added for operator monitoring; no secrets are
   logged).
@@ -102,8 +107,8 @@ also over a StartOS-terminated HTTPS LAN address, see section 8):
 | Surface | Best tool | Status |
 |---|---|---|
 | Our parsers (HTTP, `Message`, Nostr, DLEQ, bech32m) | `cargo-fuzz` + `afl.rs` (coverage-guided) | **done** for the two riskiest; more to add |
-| The onion services | OnionScan / onionscout | recommended (run from a Tor-capable host) |
-| Tor anonymity of a long-lived onion | Vanguards | recommended |
+| The onion services | OnionScan / onionscout | **done** (onion audit from a Tor host: no address/IP leak, auth holds over Tor) |
+| Tor anonymity of a long-lived onion | Vanguards | **done** (Vanguards-Lite active via the node's Tor 0.4.9.x) |
 | DoS resilience | slowhttptest | covered by the cap + `daemon_dos.rs` |
 | Nostr relay / swap wire (black-box) | boofuzz / radamsa | complements the coverage-guided fuzzers |
 | Node RPC TLS, and the web-UI TLS LAN address | testssl.sh / sslyze | low risk (StartOS rustls proxy); the LAN address is now a direct target, no Tor host needed |
@@ -139,5 +144,4 @@ addition to the Tor onion. The onion stays the default address; the LAN address 
   login reachable without Tor, so brute-force no longer pays the Tor latency cost (the random password
   still makes it infeasible, this is defense in depth).
 - Passive TLS and service-scan audit (testssl.sh / sslyze / `nmap`) of the LAN HTTPS address.
-- Run OnionScan + Vanguards against the live onions from a Tor-capable host.
 - The two-party regtest wiring of the malicious-counterparty harness (enhanced during live testing).
