@@ -124,11 +124,10 @@ fn wallet_signer_pays_a_silent_payment_fee_that_verifies_and_scans() {
     let tx_outputs: Vec<_> = tx
         .output
         .iter()
-        .filter_map(|o| {
-            o.script_pubkey.is_p2tr().then(|| {
-                bitcoin::secp256k1::XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..34])
-                    .unwrap()
-            })
+        .filter(|o| o.script_pubkey.is_p2tr())
+        .map(|o| {
+            bitcoin::secp256k1::XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..34])
+                .unwrap()
         })
         .collect();
     let found = scan_outputs(

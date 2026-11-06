@@ -88,7 +88,7 @@ impl FundingSigner for WalletSigner {
         fee_vout: u32,
     ) -> Result<(String, FeePayment), NodeError> {
         let secp = Secp256k1::new();
-        let account_keys = self.account_keys()?;
+        let master = self.master_key()?;
         let decoded = self.wallet.call("decodepsbt", json!([unsigned_psbt]))?;
         let vin = decoded["tx"]["vin"]
             .as_array()
@@ -98,15 +98,21 @@ impl FundingSigner for WalletSigner {
         let mut inputs = Vec::new();
         let mut all_outpoints = Vec::new();
         for (i, v) in vin.iter().enumerate() {
-            all_outpoints.push(OutPoint {
+            let outpoint = OutPoint {
                 txid: v["txid"]
                     .as_str()
                     .and_then(|t| t.parse().ok())
                     .ok_or_else(|| NodeError::Unexpected("input txid".into()))?,
                 vout: v["vout"].as_u64().unwrap_or_default() as u32,
-            });
-            let spk = &psin.and_then(|p| p.get(i)).unwrap_or(&Value::Null)["witness_utxo"]
-                ["scriptPubKey"];
+            };
+            all_outpoints.push(outpoint);
+            // The prevout's scriptPubKey is under witness_utxo (segwit) or non_witness_utxo (legacy).
+            let pin = psin.and_then(|p| p.get(i)).unwrap_or(&Value::Null);
+            let spk = if pin["witness_utxo"].is_object() {
+                &pin["witness_utxo"]["scriptPubKey"]
+            } else {
+                &pin["non_witness_utxo"]["vout"][outpoint.vout as usize]["scriptPubKey"]
+            };
             let addr = spk["address"]
                 .as_str()
                 .ok_or_else(|| NodeError::Unexpected("input is not ours to sign".into()))?;
@@ -115,7 +121,7 @@ impl FundingSigner for WalletSigner {
             let hdkeypath = info["hdkeypath"]
                 .as_str()
                 .ok_or_else(|| NodeError::Unexpected("no hdkeypath for input".into()))?;
-            let key = derive_input_key(&secp, &account_keys, hdkeypath, taproot)?;
+            let key = derive_input_key(&secp, &master, hdkeypath, taproot)?;
             inputs.push(InputKey { key, taproot });
         }
 
@@ -127,35 +133,24 @@ impl FundingSigner for WalletSigner {
 }
 
 impl WalletSigner {
-    /// The wallet's private single-sig account keys by kind (taproot or not), from
-    /// `listdescriptors true`. Receive and change descriptors share an account key, so one per kind.
-    fn account_keys(&self) -> Result<Vec<(bool, Xpriv)>, NodeError> {
+    /// The wallet's master extended private key, taken from any of its private descriptors (they all
+    /// descend from the one wallet seed, so each input's full hdkeypath derives from it). This is the
+    /// hot regtest signer; production holds no such key here.
+    fn master_key(&self) -> Result<Xpriv, NodeError> {
         let listed = self.wallet.call("listdescriptors", json!([true]))?;
-        let mut out: Vec<(bool, Xpriv)> = Vec::new();
         for d in listed["descriptors"].as_array().into_iter().flatten() {
             let desc = d["desc"].as_str().unwrap_or("");
-            let taproot = desc.starts_with("tr(");
-            if !taproot && !desc.starts_with("wpkh(") {
-                continue; // only single-sig segwit v0 / taproot
-            }
-            // The key is the extended private key, derived to under the full hdkeypath; take it from
-            // its start up to the first path element. (Regtest descriptors carry no origin bracket.)
-            let Some(start) = desc.find("tprv").or_else(|| desc.find("xprv")) else {
-                continue;
-            };
-            let xprv_str: String = desc[start..].chars().take_while(|c| *c != '/').collect();
-            if let Ok(xprv) = Xpriv::from_str(&xprv_str) {
-                if !out.iter().any(|(t, _)| *t == taproot) {
-                    out.push((taproot, xprv));
+            // The key runs from `tprv`/`xprv` up to the first path element (`/`).
+            if let Some(start) = desc.find("tprv").or_else(|| desc.find("xprv")) {
+                let s: String = desc[start..].chars().take_while(|c| *c != '/').collect();
+                if let Ok(xprv) = Xpriv::from_str(&s) {
+                    return Ok(xprv);
                 }
             }
         }
-        if out.is_empty() {
-            return Err(NodeError::Unexpected(
-                "wallet has no private wpkh/tr descriptors to sign a silent payment fee".into(),
-            ));
-        }
-        Ok(out)
+        Err(NodeError::Unexpected(
+            "wallet exposes no private key to sign a silent payment fee".into(),
+        ))
     }
 
     /// Replace the placeholder output at `fee_vout` with the silent payment output, then sign. The
@@ -194,23 +189,19 @@ impl WalletSigner {
     }
 }
 
-/// Derive an input's signing key from the matching account key and its `m/.../chain/index` path,
-/// applying the taproot key-path tweak for a taproot input so the key matches the output key.
+/// Derive an input's signing key from the wallet master and the input's full `m/...` hdkeypath,
+/// applying the taproot key-path tweak for a taproot input so the key matches the output key. Works
+/// for every BIP352-eligible input type (P2PKH, P2WPKH, P2SH-P2WPKH, P2TR), since the kind is encoded
+/// in the path and only taproot needs the tweak.
 fn derive_input_key(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
-    keys: &[(bool, Xpriv)],
+    master: &Xpriv,
     hdkeypath: &str,
     taproot: bool,
 ) -> Result<SecretKey, NodeError> {
-    let xprv = keys
-        .iter()
-        .find(|(tr, _)| *tr == taproot)
-        .map(|(_, x)| x)
-        .ok_or_else(|| NodeError::Unexpected("no master key for the input's type".into()))?;
-    // The key is the wallet master; derive the input's full hdkeypath from it.
     let path = DerivationPath::from_str(hdkeypath.trim_start_matches("m/"))
         .map_err(|_| NodeError::Unexpected("bad hdkeypath".into()))?;
-    let derived = xprv
+    let derived = master
         .derive_priv(secp, &path)
         .map_err(|_| NodeError::Unexpected("derive".into()))?
         .private_key;
