@@ -7,7 +7,7 @@ use bitcoin::{Amount, OutPoint, PubkeyHash, Txid};
 use sovereign_swap::htlc::Contract;
 use sovereign_swap::policy::Depths;
 use sovereign_swap::swap::{
-    Action, Chain, ChainView, LockView, Offer, Phase, Role, SpendView, Swap,
+    Action, Chain, ChainView, FeeState, LockView, Offer, Phase, Role, SpendView, Swap,
 };
 
 struct Rng(u64);
@@ -102,6 +102,14 @@ fn random_lock(rng: &mut Rng, n: u8, height: u32) -> Option<LockView> {
         amount_ok: !rng.chance(4),
         confirmed_height,
         spend,
+        // Arbitrary fee state too, so the gate is fuzzed for the never-panic / never-both invariant.
+        fee: if rng.chance(4) {
+            FeeState::Failed
+        } else if rng.chance(3) {
+            FeeState::Pending
+        } else {
+            FeeState::Verified
+        },
     })
 }
 
@@ -187,6 +195,7 @@ impl SimLock {
                 depth,
                 ours,
             }),
+            fee: FeeState::NotRequired,
         })
     }
     fn spend_once(&mut self, ours: bool, has_secret: bool) {

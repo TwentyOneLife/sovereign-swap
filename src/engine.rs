@@ -4,17 +4,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, ScriptBuf, Transaction};
+use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
 use crate::fee::{self, FeeRates};
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
-use crate::node::{ChainNode, FeeProof, NodeError};
+use crate::node::{ChainNode, NodeError};
 use crate::policy::{Policy, PolicyError};
-use crate::silentpayments::SilentPaymentAddress;
+use crate::silentpayments::{self, SilentPaymentAddress};
 use crate::store::write_atomic;
-use crate::swap::{Action, BidError, Chain, ChainView, Message, Offer, Phase, Role, Swap};
+use crate::swap::{
+    Action, BidError, Chain, ChainView, FeeProof, FeeState, Message, Offer, Phase, Role, Swap,
+};
 use crate::transport::Transport;
 
 /// Maker-chain blocks a taker waits, beyond the required depth, for the maker's lock before giving up.
@@ -41,6 +43,10 @@ pub struct Record {
     /// records, hence `serde(default)`.
     #[serde(default)]
     pub fee: Option<FeeProof>,
+    /// The counterparty's fee proof, received over the swap channel, used to verify their lock's
+    /// fee output (design 0010). Absent until it arrives, hence `serde(default)`.
+    #[serde(default)]
+    pub received_fee: Option<FeeProof>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -310,6 +316,16 @@ impl<T: Transport> Engine<T> {
                 self.state.bids.remove(pos);
                 self.start(swap)?;
             }
+            Message::FeeProof { swap_id, proof } => {
+                // Store the counterparty's fee proof so `view` can verify their lock's fee output
+                // (design 0010). Keep the first one; a resend of a different proof is ignored.
+                if let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) {
+                    if self.records[i].received_fee.is_none() {
+                        self.records[i].received_fee = Some(proof);
+                        self.save(&self.records[i])?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -328,6 +344,7 @@ impl<T: Transport> Engine<T> {
             refund_to: self.nodes[&refund_chain].new_destination()?,
             funding: None,
             fee: None,
+            received_fee: None,
             swap,
         };
         self.save(&record)?;
@@ -351,12 +368,101 @@ impl<T: Transport> Engine<T> {
             &self.nodes[&swap.offer.maker_chain.other()],
         );
         let ours = [record.claim_to.clone(), record.refund_to.clone()];
+        let mut maker_lock = a.lock_view(&swap.maker_contract, swap.maker_part, &ours)?;
+        let mut taker_lock = b.lock_view(&swap.taker_contract, swap.taker_part, &ours)?;
+        // Set the counterparty lock's voluntary-fee state (design 0010). The maker's counterparty is
+        // the taker (taker_lock, on the other chain) and the reverse for the taker; our own lock's
+        // fee is never checked.
+        match swap.role {
+            Role::Maker => {
+                if let Some(lock) = taker_lock.as_mut() {
+                    lock.fee = self.fee_state(record, lock.outpoint.txid, b);
+                }
+            }
+            Role::Taker => {
+                if let Some(lock) = maker_lock.as_mut() {
+                    lock.fee = self.fee_state(record, lock.outpoint.txid, a);
+                }
+            }
+        }
         Ok(ChainView {
             maker_chain_height: a.height()?,
             taker_chain_height: b.height()?,
-            maker_lock: a.lock_view(&swap.maker_contract, swap.maker_part, &ours)?,
-            taker_lock: b.lock_view(&swap.taker_contract, swap.taker_part, &ours)?,
+            maker_lock,
+            taker_lock,
         })
+    }
+
+    /// The fee state of the counterparty's lock `lock_txid` on `cp_chain` (design 0010): no fee set
+    /// in the offer is `NotRequired`; no proof yet or the lock not readable is `Pending`; a present,
+    /// proven fee output of at least the required amount is `Verified`; anything else is `Failed`.
+    fn fee_state(&self, record: &Record, lock_txid: Txid, cp_chain: &ChainNode) -> FeeState {
+        let swap = &record.swap;
+        let Some(terms) = &swap.offer.fee else {
+            return FeeState::NotRequired;
+        };
+        let Some(proof) = &record.received_fee else {
+            return FeeState::Pending;
+        };
+        let cp_role = swap.role.other();
+        let cp_locked = match cp_role {
+            Role::Maker => swap.maker_part,
+            Role::Taker => swap.taker_part,
+        };
+        let rates = FeeRates {
+            maker_bps: terms.maker_bps,
+            taker_bps: terms.taker_bps,
+        };
+        let Ok(required) = fee::fee_amount(rates, cp_role, cp_locked) else {
+            return FeeState::Failed;
+        };
+        let Ok(recipient) = SilentPaymentAddress::parse(&terms.sp_address) else {
+            return FeeState::Failed;
+        };
+        let Ok(proof_bytes) = <[u8; 64]>::try_from(proof.proof.as_slice()) else {
+            return FeeState::Failed;
+        };
+        let Ok(lock_tx) = cp_chain.get_tx(lock_txid) else {
+            return FeeState::Pending; // not on chain yet, or not readable: wait
+        };
+        // Authenticate each input's public key from the proof's prevout transactions.
+        let mut pubkeys = Vec::new();
+        let mut outpoints = Vec::new();
+        for input in &lock_tx.input {
+            outpoints.push(input.previous_output);
+            let Some(prevout) = proof
+                .prevouts
+                .iter()
+                .find(|t| t.compute_txid() == input.previous_output.txid)
+            else {
+                return FeeState::Failed;
+            };
+            let Some(txout) = prevout.output.get(input.previous_output.vout as usize) else {
+                return FeeState::Failed;
+            };
+            if let Some(pk) = silentpayments::input_pubkey(
+                &txout.script_pubkey,
+                &input.script_sig,
+                &input.witness,
+            ) {
+                pubkeys.push(pk);
+            }
+        }
+        let share = proof.share.serialize();
+        if silentpayments::verify_fee(
+            self.keys.secp(),
+            &pubkeys,
+            &outpoints,
+            &recipient,
+            &share,
+            &proof_bytes,
+            &lock_tx.output,
+            required,
+        ) {
+            FeeState::Verified
+        } else {
+            FeeState::Failed
+        }
     }
 
     /// One round: messages in, then every unfinished swap decided, stored and acted on. Errors of a
@@ -384,6 +490,14 @@ impl<T: Transport> Engine<T> {
 
     fn advance(&mut self, i: usize) -> Result<(), EngineError> {
         let view = self.view(&self.records[i])?;
+        // Re-send our fee proof each tick while the swap is live (design 0010); the relay may drop
+        // it, and the counterparty needs it to verify our lock. Receiving it twice is harmless.
+        if let Some(proof) = self.records[i].fee.clone() {
+            self.transport.send(&Message::FeeProof {
+                swap_id: self.records[i].swap.id,
+                proof,
+            });
+        }
         let secret = (self.records[i].swap.role == Role::Maker)
             .then(|| self.keys.secret(self.records[i].swap.key_index));
         let actions = self.records[i].swap.decide(&view, secret);

@@ -8,14 +8,13 @@ use std::collections::HashSet;
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction, Txid};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::htlc::{extract_preimage, Contract};
 use crate::replay::{check_inputs, ReplayError, UtxoLookup};
 use crate::rpc::{Client, RpcError};
 use crate::silentpayments::{FeePayment, SilentPaymentAddress};
-use crate::swap::{LockView, SpendView};
+use crate::swap::{FeeProof, FeeState, LockView, SpendView};
 
 #[derive(Debug)]
 pub enum NodeError {
@@ -52,17 +51,6 @@ pub trait FundingSigner: Send + Sync {
             "signer is not BIP352-aware; cannot add a silent payment fee".into(),
         ))
     }
-}
-
-/// The payer's voluntary fee output as a counterparty needs to check it (design 0010): the ECDH
-/// share `a*B_scan`, the BIP374 proof that it matches the lock's input-key sum, and the prevout
-/// transactions of the lock's inputs, so the counterparty can authenticate the input public keys
-/// without a transaction index. Persisted with the lock and sent to the counterparty.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FeeProof {
-    pub share: PublicKey,
-    pub proof: Vec<u8>,
-    pub prevouts: Vec<Transaction>,
 }
 
 /// Signs with a bitcoind wallet that holds the keys. Hot: only for test and regtest use, never the
@@ -152,6 +140,15 @@ impl ChainNode {
             .call("getblockcount", json!([]))?
             .as_u64()
             .unwrap_or_default() as u32)
+    }
+
+    /// A transaction the watch wallet knows (it pays a watched contract), by txid: used to read a
+    /// counterparty lock's inputs and outputs when checking its fee (design 0010).
+    pub fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
+        let got = self
+            .watch
+            .call("gettransaction", json!([txid.to_string(), true]))?;
+        parse(&got["hex"])
     }
 
     pub fn new_destination(&self) -> Result<ScriptBuf, NodeError> {
@@ -252,6 +249,9 @@ impl ChainNode {
             amount_ok: exact.is_some(),
             confirmed_height,
             spend,
+            // The node does not know a swap's fee terms; the engine sets the counterparty lock's
+            // fee state after verifying it (design 0010). Our own lock stays NotRequired.
+            fee: FeeState::NotRequired,
         }))
     }
 
