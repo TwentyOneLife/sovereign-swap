@@ -278,20 +278,16 @@ impl ChainNode {
                     .ok_or_else(|| NodeError::Unexpected("no placeholder address".into()))?;
                 outputs.push(json!({ addr: fee_amount.to_btc() }));
                 let info = self.wallet.call("getaddressinfo", json!([addr]))?;
-                Some(
-                    info["scriptPubKey"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                )
+                Some(info["scriptPubKey"].as_str().unwrap_or_default().to_owned())
             }
             None => None,
         };
         let options =
             json!({ "fee_rate": fee_rate_sat_vb, "replaceable": true, "minconf": minconf });
-        let funded = self
-            .wallet
-            .call("walletcreatefundedpsbt", json!([[], json!(outputs), 0, options]))?;
+        let funded = self.wallet.call(
+            "walletcreatefundedpsbt",
+            json!([[], json!(outputs), 0, options]),
+        )?;
         let psbt = funded["psbt"]
             .as_str()
             .ok_or_else(|| NodeError::Unexpected("no psbt".into()))?;
@@ -305,7 +301,9 @@ impl ChainNode {
                 let fee_vout = find_vout(&decoded["tx"], &spk).ok_or_else(|| {
                     NodeError::Unexpected("placeholder fee output not in the funded psbt".into())
                 })?;
-                let (signed, pay) = self.signer.sign_with_silent_fee(psbt, recipient, fee_vout)?;
+                let (signed, pay) = self
+                    .signer
+                    .sign_with_silent_fee(psbt, recipient, fee_vout)?;
                 let share = PublicKey::from_slice(&pay.share)
                     .map_err(|_| NodeError::Unexpected("bad fee share".into()))?;
                 let prevouts = self.input_prevouts(&decoded["tx"])?;
@@ -364,7 +362,8 @@ impl ChainNode {
 /// The vout of the output of `decodepsbt`'s transaction whose scriptPubKey is `spk_hex`, if any.
 fn find_vout(tx: &Value, spk_hex: &str) -> Option<u32> {
     tx["vout"].as_array()?.iter().find_map(|o| {
-        (o["scriptPubKey"]["hex"].as_str() == Some(spk_hex)).then(|| o["n"].as_u64().unwrap_or(0) as u32)
+        (o["scriptPubKey"]["hex"].as_str() == Some(spk_hex))
+            .then(|| o["n"].as_u64().unwrap_or(0) as u32)
     })
 }
 

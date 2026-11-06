@@ -141,7 +141,10 @@ impl Settings {
         // checked where the live signer is known (the engine wiring), not in this pure validation; a
         // non-BIP352 signer refuses to enable fees there with a clear message (design 0010).
         if self.fee_enabled && !looks_like_sp_address(&self.fee_sp_address) {
-            e.push("fee_sp_address: a silent payment address is required when the fee is enabled".to_owned());
+            e.push(
+                "fee_sp_address: a silent payment address is required when the fee is enabled"
+                    .to_owned(),
+            );
         }
         e
     }
@@ -297,7 +300,10 @@ mod tests {
     #[test]
     fn an_offer_carries_fee_terms_only_when_the_fee_is_on() {
         // Fee off (the default): the offer is fee-less.
-        assert!(a_new_offer().into_swap_offer(&Settings::default()).fee.is_none());
+        assert!(a_new_offer()
+            .into_swap_offer(&Settings::default())
+            .fee
+            .is_none());
         // Fee on: the offer carries the operator's rates and address, from settings.
         let on = Settings {
             fee_enabled: true,
@@ -335,7 +341,10 @@ mod tests {
             "enabled fee with no address must be refused"
         );
         s.fee_sp_address = sp_addr();
-        assert!(s.validate().is_empty(), "a well-formed sp address is accepted");
+        assert!(
+            s.validate().is_empty(),
+            "a well-formed sp address is accepted"
+        );
         // Disabled again, the address is irrelevant and a blank one is fine.
         s.fee_enabled = false;
         s.fee_sp_address = String::new();

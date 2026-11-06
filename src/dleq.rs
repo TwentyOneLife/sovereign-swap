@@ -90,7 +90,15 @@ fn challenge(
         r2.serialize(),
     );
     let empty = [];
-    let parts: [&[u8]; 7] = [&as_, &bs, &cs, &gs, &r1s, &r2s, m.map_or(&empty, |m| &m[..])];
+    let parts: [&[u8]; 7] = [
+        &as_,
+        &bs,
+        &cs,
+        &gs,
+        &r1s,
+        &r2s,
+        m.map_or(&empty, |m| &m[..]),
+    ];
     reduce_mod_n(tagged_hash("BIP0374/challenge", &parts))
 }
 
@@ -111,7 +119,12 @@ pub fn prove<C: Verification>(
     let empty = [];
     let rand = tagged_hash(
         "BIP0374/nonce",
-        &[&t, &big_a.serialize(), &big_c.serialize(), m.map_or(&empty, |m| &m[..])],
+        &[
+            &t,
+            &big_a.serialize(),
+            &big_c.serialize(),
+            m.map_or(&empty, |m| &m[..]),
+        ],
     );
     let k = SecretKey::from_slice(&reduce_mod_n(rand)).ok()?; // k == 0 is rejected here
     let r1 = g.mul_tweak(secp, &scalar(&k)).ok()?;

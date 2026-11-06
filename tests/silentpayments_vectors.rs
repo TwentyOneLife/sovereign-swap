@@ -108,10 +108,11 @@ fn sending_vectors_match() {
                 .map(|group| xonly_set(group.as_array().unwrap()))
                 .collect();
 
-            let got: BTreeSet<String> = match create_outputs(&secp, &all_outpoints, &inputs, &recipients) {
-                Ok(outs) => outs.iter().map(|x| x.to_string()).collect(),
-                Err(_) => BTreeSet::new(), // no eligible inputs: an empty output set
-            };
+            let got: BTreeSet<String> =
+                match create_outputs(&secp, &all_outpoints, &inputs, &recipients) {
+                    Ok(outs) => outs.iter().map(|x| x.to_string()).collect(),
+                    Err(_) => BTreeSet::new(), // no eligible inputs: an empty output set
+                };
             assert!(
                 acceptable.contains(&got),
                 "sending `{}`: got {:?}, acceptable {:?}",
@@ -122,7 +123,10 @@ fn sending_vectors_match() {
             checked += 1;
         }
     }
-    assert!(checked > 20, "expected many sending sub-vectors, got {checked}");
+    assert!(
+        checked > 20,
+        "expected many sending sub-vectors, got {checked}"
+    );
 }
 
 #[test]
@@ -197,5 +201,8 @@ fn receiving_vectors_match_without_labels() {
             checked += 1;
         }
     }
-    assert!(checked > 15, "expected many label-free receiving sub-vectors, got {checked}");
+    assert!(
+        checked > 15,
+        "expected many label-free receiving sub-vectors, got {checked}"
+    );
 }

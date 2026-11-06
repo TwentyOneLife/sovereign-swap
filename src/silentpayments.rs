@@ -97,7 +97,8 @@ pub fn pay_fee<C: Signing + Verification>(
         .mul_tweak(secp, &scalar_of(&a)?)
         .map_err(|_| Error::Scalar)?
         .serialize();
-    let proof = dleq::prove(secp, &generator(), &a, &recipient.scan, aux, None).ok_or(Error::Dleq)?;
+    let proof =
+        dleq::prove(secp, &generator(), &a, &recipient.scan, aux, None).ok_or(Error::Dleq)?;
     Ok(FeePayment {
         output: p2tr(out_key),
         share,
@@ -312,7 +313,11 @@ fn output_key<C: Signing>(
 ) -> Result<XOnlyPublicKey, Error> {
     let t = SecretKey::from_slice(&output_tweak(ecdh, k)).map_err(|_| Error::Key)?;
     let t_point = PublicKey::from_secret_key(secp, &t);
-    Ok(spend.combine(&t_point).map_err(|_| Error::Key)?.x_only_public_key().0)
+    Ok(spend
+        .combine(&t_point)
+        .map_err(|_| Error::Key)?
+        .x_only_public_key()
+        .0)
 }
 
 /// Sender side: the fresh P2TR output keys this transaction pays to `recipients`. Recipients that
@@ -427,11 +432,7 @@ fn sum_pubkeys(pubkeys: &[PublicKey]) -> Result<PublicKey, Error> {
 
 /// The compressed public key an input contributes to the shared secret, or `None` if the input is
 /// not eligible (BIP352). `spk` is the prevout script, `script_sig`/`witness` the spend data.
-pub fn input_pubkey(
-    spk: &Script,
-    script_sig: &Script,
-    witness: &Witness,
-) -> Option<PublicKey> {
+pub fn input_pubkey(spk: &Script, script_sig: &Script, witness: &Witness) -> Option<PublicKey> {
     if spk.is_p2tr() {
         if taproot_internal_is_nums(witness) {
             return None;
@@ -530,7 +531,13 @@ mod tests {
     // The operator's address, two eligible inputs, and the fee the payer should pay.
     fn fixture(
         secp: &Secp256k1<bitcoin::secp256k1::All>,
-    ) -> (SilentPaymentAddress, SecretKey, Vec<InputKey>, Vec<PublicKey>, Vec<OutPoint>) {
+    ) -> (
+        SilentPaymentAddress,
+        SecretKey,
+        Vec<InputKey>,
+        Vec<PublicKey>,
+        Vec<OutPoint>,
+    ) {
         let scan = sk(11);
         let spend = sk(12);
         let recipient = SilentPaymentAddress {

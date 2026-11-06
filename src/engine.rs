@@ -7,12 +7,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Transaction};
 use serde::{Deserialize, Serialize};
 
+use crate::fee::{self, FeeRates};
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
-use crate::fee::{self, FeeRates};
 use crate::node::{ChainNode, FeeProof, NodeError};
-use crate::silentpayments::SilentPaymentAddress;
 use crate::policy::{Policy, PolicyError};
+use crate::silentpayments::SilentPaymentAddress;
 use crate::store::write_atomic;
 use crate::swap::{Action, BidError, Chain, ChainView, Message, Offer, Phase, Role, Swap};
 use crate::transport::Transport;
@@ -426,16 +426,16 @@ impl<T: Transport> Engine<T> {
                     let fee = match &swap.offer.fee {
                         None => None,
                         Some(terms) => {
-                            let addr = SilentPaymentAddress::parse(&terms.sp_address).map_err(
-                                |e| NodeError::Unexpected(format!("fee address: {e:?}")),
-                            )?;
+                            let addr =
+                                SilentPaymentAddress::parse(&terms.sp_address).map_err(|e| {
+                                    NodeError::Unexpected(format!("fee address: {e:?}"))
+                                })?;
                             let rates = FeeRates {
                                 maker_bps: terms.maker_bps,
                                 taker_bps: terms.taker_bps,
                             };
-                            let amount = fee::fee_amount(rates, swap.role, lock_amount).map_err(
-                                |e| NodeError::Unexpected(format!("fee amount: {e:?}")),
-                            )?;
+                            let amount = fee::fee_amount(rates, swap.role, lock_amount)
+                                .map_err(|e| NodeError::Unexpected(format!("fee amount: {e:?}")))?;
                             Some((amount, addr))
                         }
                     };
