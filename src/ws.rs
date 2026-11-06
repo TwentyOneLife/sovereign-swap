@@ -51,14 +51,24 @@ impl WsConn {
             }
             None => TcpStream::connect((host.as_str(), port)).map_err(WsError::Io)?,
         };
+        // A generous timeout for the handshake: over a Tor onion the server's upgrade response can
+        // take several seconds, far longer than the 100 ms the worker loop wants. Setting the short
+        // timeout here (as before) silently failed every relay reached through Tor, because the
+        // handshake read timed out before the 101 arrived. The short timeout is set below, once the
+        // handshake is done and the worker needs non-blocking polling.
         stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(WsError::Io)?;
         // Bound total message size (memory) but leave the frame size at the library default: a
         // too-small frame cap makes tungstenite assert rather than error on an oversized frame.
         let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
         let (mut socket, _resp) = client_with_config(url, stream, Some(config))
             .map_err(|e| WsError::Handshake(e.to_string()))?;
+        // The worker reads with a short timeout so it checks the outgoing queue often.
+        socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(WsError::Io)?;
 
         // Subscribe to our event kind; we filter and route client-side.
         let req = format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#);

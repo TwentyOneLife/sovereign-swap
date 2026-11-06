@@ -98,8 +98,12 @@ impl Daemon {
             reference: Reference::default(),
         };
         // If the saved settings are already complete, bring the engine up; otherwise it starts after
-        // the first complete PUT /settings.
-        let _ = daemon.start_engine();
+        // the first complete PUT /settings. A failure here is not fatal (the GUI learns it from GET
+        // /status), but it is logged: a silently swallowed reason is very hard to diagnose in the
+        // field, where the nodes or the relay may be the cause.
+        if let Err(e) = daemon.start_engine() {
+            eprintln!("engine not started on open: {e}");
+        }
         Ok(daemon)
     }
 
@@ -482,8 +486,10 @@ impl Daemon {
         self.state.lock().unwrap().settings = settings;
         // Bring the engine up (or restart it) now the settings may be complete. A failure here just
         // means it is not running yet; the GUI learns that from GET /status, and the settings are
-        // saved regardless.
-        let _ = self.start_engine();
+        // saved regardless. Logged so the reason (a node or the relay) is visible in the service logs.
+        if let Err(e) = self.start_engine() {
+            eprintln!("engine not started after settings update: {e}");
+        }
         (200, json!({"ok": true}))
     }
 
