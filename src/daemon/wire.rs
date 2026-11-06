@@ -48,7 +48,7 @@ pub(crate) struct Request {
 }
 
 /// Reads one HTTP/1.1 request, size-capped. `Err(code)` is the status to answer with.
-pub(crate) fn read_request(stream: &mut TcpStream) -> Result<Request, u16> {
+pub(crate) fn read_request<R: Read>(stream: &mut R) -> Result<Request, u16> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     // Read until the header terminator, bounded by the cap.
