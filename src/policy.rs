@@ -164,6 +164,7 @@ mod tests {
             maker_lock_depth: 0,
             taker_lock_depth: 0,
             margin_blocks: 6,
+            fee: None,
         }
     }
 

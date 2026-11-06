@@ -266,6 +266,7 @@ mod tests {
             amount_ok: true,
             confirmed_height: Some(100),
             spend: None,
+            fee: crate::swap::FeeState::NotRequired,
         };
         let view = ChainView {
             maker_chain_height: 105,

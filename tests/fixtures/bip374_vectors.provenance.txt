@@ -1,0 +1,6 @@
+BIP-374 DLEQ test vectors.
+Source: https://github.com/bitcoin/bips bip-0374/
+Pinned commit: fc874dd5d34239e070c0fdb8c4ed6a1dd2a94147
+SHA256:
+d5c23db2eca645f63502de45802bd9b5630ff2213bd9c5874dc23df5c275ce35  bip374_test_vectors_generate_proof.csv
+e3b10044308a4fe4947abc1cb0e49e02910c97a489a88f4b2dfdacd6f1a9a508  bip374_test_vectors_verify_proof.csv

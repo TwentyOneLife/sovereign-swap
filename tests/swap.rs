@@ -123,6 +123,7 @@ fn offer(maker_chain: Chain) -> Offer {
         maker_lock_depth: 2,
         taker_lock_depth: 2,
         margin_blocks: 3,
+        fee: None,
     }
 }
 

@@ -4,11 +4,39 @@
 //! is level-triggered: given the same chains it returns the same actions, so a restart, a dropped
 //! broadcast or a reorg is handled by deciding again, not by remembering what happened.
 
-use bitcoin::{Amount, OutPoint, PubkeyHash};
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Amount, OutPoint, PubkeyHash, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::htlc::{Contract, PREIMAGE_LEN};
 use crate::policy::Depths;
+
+/// The payer's voluntary fee output as a counterparty needs to check it (design 0010): the ECDH
+/// share `a*B_scan`, the BIP374 proof that it matches the lock's input-key sum, and the prevout
+/// transactions of the lock's inputs, so the counterparty can authenticate the input public keys
+/// without a transaction index. Persisted with the lock and sent to the counterparty in a
+/// `Message::FeeProof`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeProof {
+    pub share: PublicKey,
+    pub proof: Vec<u8>,
+    pub prevouts: Vec<Transaction>,
+}
+
+/// Where the counterparty's lock stands on the voluntary fee (design 0010). The gate in `decide`
+/// reads this on the counterparty's lock: `Failed` abandons before we commit, `Pending` waits, and
+/// `Verified` or `NotRequired` lets us proceed. It is never read on our own lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeState {
+    /// The offer sets no fee, or the lock is our own: nothing to check.
+    NotRequired,
+    /// A fee is due but the proof or the lock is not yet verifiable.
+    Pending,
+    /// The fee output is present and its proof checks out.
+    Verified,
+    /// The fee output is missing, short, or its proof failed.
+    Failed,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Chain {
@@ -28,6 +56,16 @@ impl Chain {
 /// Below this a swap output is not worth making; also keeps both sides clear of dust.
 pub const MIN_SWAP_AMOUNT: Amount = Amount::from_sat(10_000);
 
+/// The voluntary fee terms an offer carries (design 0010). Both sides pay and verify against these,
+/// so the terms are never taken from one side's local settings; `None` on an offer means no fee.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeTerms {
+    pub maker_bps: u16,
+    pub taker_bps: u16,
+    /// The operator's silent payment (BIP352) address the fee output pays.
+    pub sp_address: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
     pub id: [u8; 16],
@@ -45,6 +83,10 @@ pub struct Offer {
     pub taker_lock_depth: u32,
     /// Blocks kept in reserve before any deadline.
     pub margin_blocks: u32,
+    /// Voluntary fee terms (design 0010); `None` means a fee-less offer. `serde(default)` so offers
+    /// from before the fee existed still deserialize.
+    #[serde(default)]
+    pub fee: Option<FeeTerms>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,12 +131,27 @@ pub enum Message {
         maker_claim_pkh: PubkeyHash,
         maker_refund_pkh: PubkeyHash,
     },
+    /// Sent after a side funds its lock with a voluntary fee (design 0010): the share and proof the
+    /// counterparty needs to verify the fee output, re-sent each tick until it is seen on chain.
+    FeeProof {
+        swap_id: [u8; 16],
+        proof: FeeProof,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Maker,
     Taker,
+}
+
+impl Role {
+    pub fn other(self) -> Role {
+        match self {
+            Role::Maker => Role::Taker,
+            Role::Taker => Role::Maker,
+        }
+    }
 }
 
 /// Which of the two locks: the maker's (on the maker chain) or the taker's.
@@ -151,6 +208,9 @@ pub struct LockView {
     /// None while unconfirmed.
     pub confirmed_height: Option<u32>,
     pub spend: Option<SpendView>,
+    /// The voluntary fee state of this lock (design 0010). Only meaningful on the counterparty's
+    /// lock, where the gate in `decide` reads it; our own lock is always `NotRequired`.
+    pub fee: FeeState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,7 +315,12 @@ impl Swap {
                 .remaining(Side::Taker, theirs, hb)
                 .is_some_and(|r| r > needed);
             // Once the secret has been broadcast it is public: keep claiming whatever the clock says.
-            let go = self.phase == Phase::Claiming || (theirs.amount_ok && deep && time_left);
+            // The taker's lock must carry its voluntary fee before we reveal the secret (design
+            // 0010). This is only one term of the pre-claim test: once we are Claiming the secret is
+            // public and we keep claiming whatever the fee state, or the taker could take both legs.
+            let fee_ok = matches!(theirs.fee, FeeState::Verified | FeeState::NotRequired);
+            let go =
+                self.phase == Phase::Claiming || (theirs.amount_ok && fee_ok && deep && time_left);
             if theirs.spend.is_none() && own.spend.is_none() && go {
                 self.phase = Phase::Claiming;
                 return vec![Action::Claim {
@@ -326,12 +391,17 @@ impl Swap {
             let time_left = self
                 .remaining(Side::Maker, theirs, ha)
                 .is_some_and(|r| r > needed);
-            if !theirs.amount_ok || theirs.spend.is_some() {
+            // The maker's lock must carry its voluntary fee before we lock (design 0010). A failed
+            // fee abandons, like a wrong amount. A pending fee (proof not yet arrived) is not a
+            // failure: we simply wait, bounded by the existing lock deadline, and never abandon a
+            // sound swap just because the proof is a little late.
+            let fee_ok = matches!(theirs.fee, FeeState::Verified | FeeState::NotRequired);
+            if !theirs.amount_ok || theirs.spend.is_some() || theirs.fee == FeeState::Failed {
                 self.phase = Phase::Abandoned;
-            } else if deep && time_left {
+            } else if deep && time_left && fee_ok {
                 self.phase = Phase::Locking;
                 return vec![Action::Fund];
-            } else if deep || ha > self.lock_deadline {
+            } else if ha > self.lock_deadline || (deep && !time_left) {
                 self.phase = Phase::Abandoned;
             }
             return vec![];
@@ -384,7 +454,17 @@ mod tests {
             maker_lock_depth: 2,
             taker_lock_depth: 2,
             margin_blocks: 3,
+            fee: None,
         }
+    }
+
+    #[test]
+    fn an_offer_from_before_the_fee_still_deserializes() {
+        // A pre-fee offer has no `fee` field; serde(default) fills it with None.
+        let mut v = serde_json::to_value(offer()).unwrap();
+        v.as_object_mut().unwrap().remove("fee");
+        let back: Offer = serde_json::from_value(v).unwrap();
+        assert!(back.fee.is_none());
     }
 
     fn contract(byte: u8) -> Contract {
@@ -435,6 +515,7 @@ mod tests {
             amount_ok: true,
             confirmed_height,
             spend: None,
+            fee: FeeState::NotRequired,
         }
     }
 
@@ -620,6 +701,98 @@ mod tests {
         let mut s = swap(Role::Taker);
         assert_eq!(s.decide(&view(111, 111, None, None), None), vec![]);
         assert_eq!(s.phase, Phase::Abandoned);
+    }
+
+    // --- voluntary fee gate (design 0010) ---
+
+    #[test]
+    fn taker_waits_for_a_pending_fee_then_locks_when_it_verifies() {
+        let mut s = swap(Role::Taker);
+        let maker = |fee| LockView {
+            fee,
+            ..lock(1, Some(100))
+        };
+        // The maker's lock is deep with time to spare, but its fee proof has not arrived yet: the
+        // taker neither locks nor abandons, it simply waits.
+        assert_eq!(
+            s.decide(&view(101, 101, Some(maker(FeeState::Pending)), None), None),
+            vec![]
+        );
+        assert_eq!(s.phase, Phase::Waiting);
+        // The proof arrives and verifies: now the taker locks.
+        assert_eq!(
+            s.decide(&view(101, 101, Some(maker(FeeState::Verified)), None), None),
+            vec![Action::Fund]
+        );
+        assert_eq!(s.phase, Phase::Locking);
+    }
+
+    #[test]
+    fn taker_abandons_a_fee_that_never_arrives_by_the_deadline() {
+        let mut s = swap(Role::Taker);
+        let maker = LockView {
+            fee: FeeState::Pending,
+            ..lock(1, Some(100))
+        };
+        // The deadline is 110; past it with the fee still pending, the taker gives up (and never
+        // locked, so there is nothing to recover).
+        assert_eq!(s.decide(&view(111, 111, Some(maker), None), None), vec![]);
+        assert_eq!(s.phase, Phase::Abandoned);
+    }
+
+    #[test]
+    fn taker_abandons_a_failed_maker_fee_at_once() {
+        let mut s = swap(Role::Taker);
+        let maker = LockView {
+            fee: FeeState::Failed,
+            ..lock(1, Some(100))
+        };
+        // A fee that is present but wrong (failed verification) is like a wrong amount: abandon.
+        assert_eq!(s.decide(&view(101, 101, Some(maker), None), None), vec![]);
+        assert_eq!(s.phase, Phase::Abandoned);
+    }
+
+    #[test]
+    fn maker_gates_its_claim_on_the_takers_fee_but_not_once_claiming() {
+        let own = Some(lock(1, Some(100)));
+        let taker = |fee| LockView {
+            fee,
+            ..lock(2, Some(100))
+        };
+        // A deep, correct taker lock with time left, but its fee failed: the maker does not reveal
+        // the secret (it will refund instead).
+        let mut s = swap(Role::Maker);
+        assert_eq!(
+            s.decide(
+                &view(105, 112, own.clone(), Some(taker(FeeState::Failed))),
+                SECRET
+            ),
+            vec![]
+        );
+        assert_ne!(s.phase, Phase::Claiming);
+        // With the fee verified, the same view claims.
+        let mut s = swap(Role::Maker);
+        assert_eq!(
+            s.decide(
+                &view(105, 112, own.clone(), Some(taker(FeeState::Verified))),
+                SECRET
+            ),
+            vec![Action::Claim {
+                lock: outpoint(2),
+                preimage: [9; 32]
+            }]
+        );
+        assert_eq!(s.phase, Phase::Claiming);
+        // Once claiming, the secret is public: the maker keeps claiming even if the fee now looks
+        // failed, or the taker could take both legs.
+        assert_eq!(
+            s.decide(&view(105, 112, own, Some(taker(FeeState::Failed))), SECRET),
+            vec![Action::Claim {
+                lock: outpoint(2),
+                preimage: [9; 32]
+            }]
+        );
+        assert_eq!(s.phase, Phase::Claiming);
     }
 
     #[test]

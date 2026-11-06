@@ -116,6 +116,20 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
                     seal(&self.me, &peer.1, &payload, &Self::os_random()),
                 )
             }
+            // The fee proof is directed to the swap's counterparty, sealed like an Accept.
+            Message::FeeProof { swap_id, .. } => {
+                let peer = self
+                    .swaps
+                    .lock()
+                    .unwrap()
+                    .get(swap_id)
+                    .cloned()
+                    .expect("fee proof for a known swap");
+                (
+                    vec![p_tag(&peer.0)],
+                    seal(&self.me, &peer.1, &payload, &Self::os_random()),
+                )
+            }
         };
         let event = Event::build(
             &self.secp,
@@ -167,6 +181,8 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
                         .insert(*swap_id, (event.pubkey, sender));
                 }
                 Message::Accept { .. } => {}
+                // The counterparty is already known for the swap; no routing bookkeeping needed.
+                Message::FeeProof { .. } => {}
             }
             out.push(message);
         }

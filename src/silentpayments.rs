@@ -14,10 +14,13 @@ use bech32::primitives::decode::CheckedHrpstring;
 use bech32::primitives::iter::{ByteIterExt, Fe32IterExt};
 use bech32::{Bech32m, Fe32, Hrp};
 use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::key::TweakedPublicKey;
 use bitcoin::secp256k1::{
-    Parity, PublicKey, Scalar, Secp256k1, SecretKey, Signing, XOnlyPublicKey,
+    Parity, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification, XOnlyPublicKey,
 };
-use bitcoin::{OutPoint, Script, Witness};
+use bitcoin::{Amount, OutPoint, Script, ScriptBuf, TxOut, Witness};
+
+use crate::dleq;
 
 /// Taproot NUMS point H (BIP341). A taproot input spent via a script path that reveals H as the
 /// internal key is not eligible (BIP352): the output key is provably not a normal key.
@@ -36,6 +39,114 @@ pub enum Error {
     NoEligibleInputs,
     /// A scalar landed outside the curve order (negligible; treated as a hard error, never guessed).
     Scalar,
+    /// The DLEQ proof could not be produced (a degenerate input).
+    Dleq,
+}
+
+/// secp256k1's generator G, compressed, for the DLEQ proofs over the input-key sum.
+fn generator() -> PublicKey {
+    PublicKey::from_slice(&[
+        0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+        0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16,
+        0xF8, 0x17, 0x98,
+    ])
+    .expect("valid secp256k1 generator")
+}
+
+/// What a payer puts on its lock to pay the fee, and reveals so a counterparty can check it.
+#[derive(Clone, Debug)]
+pub struct FeePayment {
+    /// The P2TR scriptPubKey of the fee output (a fresh silent payment output).
+    pub output: ScriptBuf,
+    /// The ECDH share `a * B_scan`, compressed: revealed over the swap channel.
+    pub share: [u8; 33],
+    /// A BIP374 proof that `share` shares the input-key sum's discrete log, so the counterparty can
+    /// trust it and the operator can locate the output.
+    pub proof: [u8; 64],
+}
+
+/// The fee the operator receives (index 0) always; a single fee output per lock.
+const FEE_OUTPUT_INDEX: u32 = 0;
+
+fn p2tr(out_key: XOnlyPublicKey) -> ScriptBuf {
+    ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(out_key))
+}
+
+/// Payer side: the fee output to add to this lock, plus the share and DLEQ proof to send the
+/// counterparty. `inputs` are the lock's eligible inputs (with their keys), `all_outpoints` every
+/// input it spends, `recipient` the operator's silent payment address, `aux` fresh randomness for
+/// the proof. Needs the input keys, so it runs in the signer.
+pub fn pay_fee<C: Signing + Verification>(
+    secp: &Secp256k1<C>,
+    inputs: &[InputKey],
+    all_outpoints: &[OutPoint],
+    recipient: &SilentPaymentAddress,
+    aux: &[u8; 32],
+) -> Result<FeePayment, Error> {
+    let (a, a_pub) = sum_input_keys(secp, inputs)?;
+    let smallest = all_outpoints
+        .iter()
+        .map(outpoint_bytes)
+        .min()
+        .ok_or(Error::NoEligibleInputs)?;
+    let ih = input_hash(&smallest, &a_pub)?;
+    let ecdh = ecdh_point(secp, &a, &ih, &recipient.scan)?;
+    let out_key = output_key(secp, &ecdh, &recipient.spend, FEE_OUTPUT_INDEX)?;
+    let share = recipient
+        .scan
+        .mul_tweak(secp, &scalar_of(&a)?)
+        .map_err(|_| Error::Scalar)?
+        .serialize();
+    let proof =
+        dleq::prove(secp, &generator(), &a, &recipient.scan, aux, None).ok_or(Error::Dleq)?;
+    Ok(FeePayment {
+        output: p2tr(out_key),
+        share,
+        proof,
+    })
+}
+
+/// Counterparty side: does `outputs` (the payer's lock outputs) contain the operator's fee output of
+/// at least `required_fee`? Verifies the DLEQ proof against `A` rebuilt from the lock's eligible
+/// input public keys, derives the expected output from the revealed `share`, and looks for it. Pure
+/// public-data computation: no secret, so it lives outside the signer.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fee<C: Signing + Verification>(
+    secp: &Secp256k1<C>,
+    input_pub_keys: &[PublicKey],
+    all_outpoints: &[OutPoint],
+    recipient: &SilentPaymentAddress,
+    share: &[u8; 33],
+    proof: &[u8; 64],
+    outputs: &[TxOut],
+    required_fee: Amount,
+) -> bool {
+    let Ok(a_pub) = sum_pubkeys(input_pub_keys) else {
+        return false;
+    };
+    let Ok(c) = PublicKey::from_slice(share) else {
+        return false;
+    };
+    if !dleq::verify(secp, &generator(), &a_pub, &recipient.scan, &c, proof, None) {
+        return false;
+    }
+    let Some(smallest) = all_outpoints.iter().map(outpoint_bytes).min() else {
+        return false;
+    };
+    let Ok(ih) = input_hash(&smallest, &a_pub) else {
+        return false;
+    };
+    // The counterparty's shared point is input_hash * share == (a * input_hash) * B_scan.
+    let Ok(ecdh) = c.mul_tweak(secp, &ih) else {
+        return false;
+    };
+    let Ok(out_key) = output_key(secp, &ecdh, &recipient.spend, FEE_OUTPUT_INDEX) else {
+        return false;
+    };
+    let expected = p2tr(out_key);
+    outputs
+        .iter()
+        .any(|o| o.script_pubkey == expected && o.value >= required_fee)
 }
 
 /// A parsed silent payment address: the recipient's scan and spend public keys, and its network.
@@ -398,5 +509,125 @@ fn single_push(script: &Script) -> Option<&[u8]> {
         Some(p[0])
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Txid;
+
+    fn sk(n: u8) -> SecretKey {
+        SecretKey::from_slice(&[n; 32]).unwrap()
+    }
+
+    fn outpoint(n: u8) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_byte_array([n; 32]),
+            vout: n as u32,
+        }
+    }
+
+    // The operator's address, two eligible inputs, and the fee the payer should pay.
+    fn fixture(
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+    ) -> (
+        SilentPaymentAddress,
+        SecretKey,
+        Vec<InputKey>,
+        Vec<PublicKey>,
+        Vec<OutPoint>,
+    ) {
+        let scan = sk(11);
+        let spend = sk(12);
+        let recipient = SilentPaymentAddress {
+            scan: PublicKey::from_secret_key(secp, &scan),
+            spend: PublicKey::from_secret_key(secp, &spend),
+            testnet: false,
+        };
+        let keys = [sk(21), sk(22)];
+        let inputs: Vec<InputKey> = keys
+            .iter()
+            .map(|k| InputKey {
+                key: *k,
+                taproot: false,
+            })
+            .collect();
+        let pubs: Vec<PublicKey> = keys
+            .iter()
+            .map(|k| PublicKey::from_secret_key(secp, k))
+            .collect();
+        let outpoints = vec![outpoint(1), outpoint(2)];
+        (recipient, scan, inputs, pubs, outpoints)
+    }
+
+    #[test]
+    fn payer_pays_counterparty_verifies_operator_scans() {
+        let secp = Secp256k1::new();
+        let (recipient, scan, inputs, pubs, outpoints) = fixture(&secp);
+        let fee = Amount::from_sat(1_000);
+
+        let pay = pay_fee(&secp, &inputs, &outpoints, &recipient, &[7u8; 32]).unwrap();
+        let lock = [TxOut {
+            value: fee,
+            script_pubkey: pay.output.clone(),
+        }];
+
+        // The counterparty, from public data plus the revealed share and proof, finds the fee.
+        assert!(verify_fee(
+            &secp, &pubs, &outpoints, &recipient, &pay.share, &pay.proof, &lock, fee
+        ));
+
+        // The operator, scanning with its scan key, locates the same output as its own.
+        let out_key = XOnlyPublicKey::from_slice(&pay.output.as_bytes()[2..34]).unwrap();
+        let found = scan_outputs(
+            &secp,
+            &scan,
+            &recipient.spend,
+            &pubs,
+            &outpoints,
+            &[out_key],
+        )
+        .unwrap();
+        assert_eq!(found, vec![out_key]);
+    }
+
+    #[test]
+    fn verify_rejects_a_short_missing_or_tampered_fee() {
+        let secp = Secp256k1::new();
+        let (recipient, _scan, inputs, pubs, outpoints) = fixture(&secp);
+        let fee = Amount::from_sat(1_000);
+        let pay = pay_fee(&secp, &inputs, &outpoints, &recipient, &[7u8; 32]).unwrap();
+        let lock = [TxOut {
+            value: fee,
+            script_pubkey: pay.output.clone(),
+        }];
+
+        let v = |s: &[u8; 33], p: &[u8; 64], out: &[TxOut], req: Amount| {
+            verify_fee(&secp, &pubs, &outpoints, &recipient, s, p, out, req)
+        };
+        // Requiring more than was paid, or an empty lock, fails.
+        assert!(!v(&pay.share, &pay.proof, &lock, Amount::from_sat(1_001)));
+        assert!(!v(&pay.share, &pay.proof, &[], fee));
+        // A tampered share makes the DLEQ fail.
+        let mut bad_share = pay.share;
+        bad_share[1] ^= 1;
+        assert!(!v(&bad_share, &pay.proof, &lock, fee));
+        // A tampered proof fails.
+        let mut bad_proof = pay.proof;
+        bad_proof[0] ^= 1;
+        assert!(!v(&pay.share, &bad_proof, &lock, fee));
+        // A fee output to a different address is not found.
+        let other = SilentPaymentAddress {
+            scan: PublicKey::from_secret_key(&secp, &sk(31)),
+            spend: PublicKey::from_secret_key(&secp, &sk(32)),
+            testnet: false,
+        };
+        let elsewhere = pay_fee(&secp, &inputs, &outpoints, &other, &[7u8; 32]).unwrap();
+        let wrong = [TxOut {
+            value: fee,
+            script_pubkey: elsewhere.output,
+        }];
+        assert!(!v(&pay.share, &pay.proof, &wrong, fee));
     }
 }
