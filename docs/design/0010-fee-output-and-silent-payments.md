@@ -46,7 +46,15 @@ fee = max(floor, locked * r / 10_000)          // floor = 1_000 sat
 
 The fee output is **extra**: it is funded from the payer's wallet alongside the HTLC output and the
 change, never carved out of `locked`. The counterparty receives the full agreed amount; the fee is
-the payer's own cost. A trade below the 0.001 BTC minimum is refused before any transaction is built.
+the payer's own cost. A trade below the minimum trade is refused before any transaction is built.
+
+The minimum trade is **configurable** (daemon setting `min_trade_sat`, default 100,000 sat = 0.001
+BTC), threaded into both the funding path and the counterparty's verify path so the two sides agree.
+Lowering it lets the fee apply to a small real-rate leg (xBTC is far cheaper than BTC, so a realistic
+swap's BTC side is tiny). It travels in the settings, not in the offer's `FeeTerms`, so both operators
+must set the same value; a mismatch fails safely (the verifier marks the fee `Failed`, or funding
+errors loudly, before anything commits) and never loses funds. The floor (1,000 sat) is **not**
+configurable: it guards Bitcoin's dust limit.
 
 Dust and sanity: `floor` (1,000 sat) is far above any dust limit, so a fee output is always
 spendable. The fee is checked to be a small fraction of `locked` (a sanity band, same spirit as the

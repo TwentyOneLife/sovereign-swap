@@ -220,3 +220,27 @@ fn reference_rate_is_token_guarded_and_off_by_default() {
         "reference must be off by default: {body}"
     );
 }
+
+/// A `min_swap_sat` below the safety floor is refused at engine bring-up (the config-load path), so
+/// the fund-handling engine never runs with a leg that would be unspendable after the spend fee. The
+/// gate is checked before any relay or node, so no binaries are needed.
+#[test]
+fn a_sub_floor_min_swap_sat_refuses_to_start_the_engine() {
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sovswap-floor-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":["ws://127.0.0.1:1"],
+            "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2,"min_swap_sat":2000}"#,
+    )
+    .unwrap();
+    let daemon = Daemon::open(&dir).unwrap();
+    let err = daemon.start_engine().unwrap_err();
+    assert!(
+        err.contains("min_swap_sat") && err.contains("safety floor"),
+        "expected a min_swap_sat floor refusal, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

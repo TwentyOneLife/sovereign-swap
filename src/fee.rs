@@ -11,8 +11,10 @@ use crate::swap::Role;
 /// The smallest fee output we will create, well above any dust limit so a fee is always spendable.
 pub const FLOOR_SAT: u64 = 1_000;
 
-/// The smallest trade the fee path will act on (0.001 BTC, spec 7.5). Below this the proportional
-/// fee is meaningless against the floor, so the fee is simply not applied.
+/// The default smallest trade the fee path will act on (0.001 BTC, spec 7.5). Below this the
+/// proportional fee is meaningless against the floor, so the fee is simply not applied. The runtime
+/// value is configurable (daemon setting `min_trade_sat`, threaded into the engine) and defaults to
+/// this. The floor above is deliberately NOT configurable: it guards Bitcoin's dust limit.
 pub const MIN_TRADE_SAT: u64 = 100_000;
 
 /// The static per-side rates, in basis points (hundredths of a percent). Defaults 20 / 30 (spec 7.5).
@@ -39,10 +41,23 @@ impl FeeRates {
 }
 
 /// The fee for locking `locked` as `role`: the greater of the floor and `locked * rate`, or an error
-/// if `locked` is below the minimum trade. A u128 intermediate keeps the product exact for any sat
-/// amount up to the supply cap.
+/// if `locked` is below the minimum trade. Uses the default [`MIN_TRADE_SAT`]; see [`fee_amount_min`]
+/// for the configurable form.
 pub fn fee_amount(rates: FeeRates, role: Role, locked: Amount) -> Result<Amount, FeeError> {
-    if locked.to_sat() < MIN_TRADE_SAT {
+    fee_amount_min(rates, role, locked, MIN_TRADE_SAT)
+}
+
+/// As [`fee_amount`], but with the minimum trade `min_trade_sat` passed in rather than read from the
+/// [`MIN_TRADE_SAT`] default, so a deployment can lower it through config. The floor ([`FLOOR_SAT`])
+/// is never configurable: it guards Bitcoin's dust limit. A u128 intermediate keeps the product exact
+/// for any sat amount up to the supply cap.
+pub fn fee_amount_min(
+    rates: FeeRates,
+    role: Role,
+    locked: Amount,
+    min_trade_sat: u64,
+) -> Result<Amount, FeeError> {
+    if locked.to_sat() < min_trade_sat {
         return Err(FeeError::BelowMinimum);
     }
     let proportional = (u128::from(locked.to_sat()) * u128::from(rates.bps(role)) / 10_000) as u64;
@@ -84,6 +99,25 @@ mod tests {
     fn below_the_minimum_is_refused() {
         assert_eq!(
             fee_amount(RATES, Role::Maker, Amount::from_sat(MIN_TRADE_SAT - 1)),
+            Err(FeeError::BelowMinimum)
+        );
+    }
+
+    #[test]
+    fn a_lowered_min_trade_applies_the_fee_to_a_small_trade() {
+        // A 200-sat trade is below the default minimum, so no fee is due.
+        assert_eq!(
+            fee_amount(RATES, Role::Maker, Amount::from_sat(200)),
+            Err(FeeError::BelowMinimum)
+        );
+        // Lower the configured minimum to 50 and the fee applies, hitting the floor on so small a trade.
+        assert_eq!(
+            fee_amount_min(RATES, Role::Maker, Amount::from_sat(200), 50),
+            Ok(Amount::from_sat(FLOOR_SAT))
+        );
+        // The floor is independent of the minimum: a trade just under the lowered minimum is refused.
+        assert_eq!(
+            fee_amount_min(RATES, Role::Maker, Amount::from_sat(49), 50),
             Err(FeeError::BelowMinimum)
         );
     }

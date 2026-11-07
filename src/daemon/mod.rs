@@ -146,6 +146,17 @@ impl Daemon {
     /// engine is replaced (the old thread ends when its channel drops).
     pub fn start_engine(&self) -> Result<(), String> {
         let settings = self.state.lock().unwrap().settings.clone();
+        // Safety floor on the configurable minimum leg: the engine handles funds, so it must never
+        // run with a `min_swap_sat` that would leave a leg unspendable after the claim/refund spend
+        // fee. A sub-floor value is logged at open (so the GUI can surface it) and refused here, so
+        // the bad value never reaches the engine; the daemon keeps serving `GET /status`.
+        if settings.min_swap_sat < types::MIN_SWAP_FLOOR_SAT {
+            return Err(format!(
+                "min_swap_sat {} below the safety floor {} (claim/refund subtract the 2000 sat spend fee; the remainder must clear dust)",
+                settings.min_swap_sat,
+                types::MIN_SWAP_FLOOR_SAT
+            ));
+        }
         let Some(relay) = settings.relays.first() else {
             return Err("no relay configured".to_owned());
         };
@@ -228,8 +239,10 @@ impl Daemon {
             conn,
         );
         let config = engine_config(&settings);
-        let engine = Engine::open(&self.data_dir.join("engine"), btc, xbtc, transport, config)
+        let mut engine = Engine::open(&self.data_dir.join("engine"), btc, xbtc, transport, config)
             .map_err(|e| format!("engine: {e:?}"))?;
+        engine.set_min_swap_sat(settings.min_swap_sat);
+        engine.set_min_trade_sat(settings.min_trade_sat);
 
         let (tx, rx) = mpsc::channel();
         let events = Arc::clone(&self.events);
@@ -608,7 +621,8 @@ impl Daemon {
         let Ok(new) = serde_json::from_slice::<NewOffer>(body) else {
             return (400, json!({"error": "offer must be a valid JSON object"}));
         };
-        let errors = new.validate();
+        let min_swap_sat = self.state.lock().unwrap().settings.min_swap_sat;
+        let errors = new.validate(min_swap_sat);
         if !errors.is_empty() {
             return (422, json!({"error": "invalid offer", "fields": errors}));
         }
