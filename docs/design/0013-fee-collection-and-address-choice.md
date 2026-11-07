@@ -89,9 +89,9 @@ normal, are byte-identical and the network check cannot tell them apart. Separat
 The daemon collects silent-payment fees without any external SP index, by scanning the chain through
 the node RPC it already holds:
 
-- **Feasibility, confirmed.** Both nodes expose input prevouts at `getblock <hash> 3` (btc-core Core
-  31.2.0; btc-blake Knots 29.5.0 BLAKE2b), so for each transaction the daemon has the input outpoints
-  and their scriptPubKeys, which is what the silent-payment shared secret needs. The receiver-side
+- **Feasibility, confirmed.** Both backends expose input prevouts at `getblock <hash> 3` (Bitcoin Core
+  31.2 and Bitcoin Knots BLAKE2b 29.5), so for each transaction the daemon has the input outpoints and
+  their scriptPubKeys, which is what the silent-payment shared secret needs. The receiver-side
   scan primitives already exist in `silentpayments.rs` (the module scans a transaction's taproot
   outputs for a recipient).
 - **Scan.** From a configured birthday height forward, for each new block the daemon walks each
