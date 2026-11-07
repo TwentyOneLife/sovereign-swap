@@ -11,7 +11,7 @@ use serde_json::json;
 
 use bitcoin::hashes::Hash;
 use sovereign_swap::htlc::Contract;
-use sovereign_swap::node::{ChainNode, FeeDest};
+use sovereign_swap::node::{ChainBackend, ChainNode, FeeDest};
 use sovereign_swap::replay::UtxoLookup;
 use sovereign_swap::rpc::RpcError;
 use sovereign_swap::silentpayments::{

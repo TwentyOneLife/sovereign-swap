@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::fee::{self, FeeRates};
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
-use crate::node::{ChainNode, FeeDest, NodeError};
+use crate::node::{ChainBackend, ChainNode, FeeDest, NodeError};
 use crate::policy::{Policy, PolicyError};
 use crate::silentpayments;
 use crate::store::write_atomic;
@@ -139,6 +139,13 @@ impl<T: Transport> Engine<T> {
     }
 
     pub fn node(&self, chain: Chain) -> &ChainNode {
+        &self.nodes[&chain]
+    }
+
+    /// The chain's node as the read/broadcast backend the engine depends on. Funding and signing
+    /// still need the concrete [`ChainNode`] (via `self.nodes`), so those call sites keep it; the
+    /// data and broadcast ones go through the trait (design 0014).
+    fn backend(&self, chain: Chain) -> &dyn ChainBackend {
         &self.nodes[&chain]
     }
 
@@ -306,7 +313,7 @@ impl<T: Transport> Engine<T> {
                         lock_blocks: offer.taker_lock_blocks,
                     },
                     depths,
-                    lock_deadline: self.nodes[&offer.maker_chain].height()?
+                    lock_deadline: self.backend(offer.maker_chain).height()?
                         + depths.maker_lock
                         + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
@@ -337,8 +344,10 @@ impl<T: Transport> Engine<T> {
             Role::Maker => (maker_chain.other(), maker_chain),
             Role::Taker => (maker_chain, maker_chain.other()),
         };
-        self.nodes[&maker_chain].watch_contract(&swap.maker_contract)?;
-        self.nodes[&maker_chain.other()].watch_contract(&swap.taker_contract)?;
+        self.backend(maker_chain)
+            .watch_contract(&swap.maker_contract)?;
+        self.backend(maker_chain.other())
+            .watch_contract(&swap.taker_contract)?;
         let record = Record {
             claim_to: self.nodes[&claim_chain].new_destination()?,
             refund_to: self.nodes[&refund_chain].new_destination()?,
@@ -369,8 +378,8 @@ impl<T: Transport> Engine<T> {
     fn view(&self, record: &Record) -> Result<ChainView, EngineError> {
         let swap = &record.swap;
         let (a, b) = (
-            &self.nodes[&swap.offer.maker_chain],
-            &self.nodes[&swap.offer.maker_chain.other()],
+            self.backend(swap.offer.maker_chain),
+            self.backend(swap.offer.maker_chain.other()),
         );
         let ours = [record.claim_to.clone(), record.refund_to.clone()];
         let mut maker_lock = a.lock_view(&swap.maker_contract, swap.maker_part, &ours)?;
@@ -403,7 +412,7 @@ impl<T: Transport> Engine<T> {
     /// payment fee, no proof yet) is `Pending`; a fee output of at least the required amount, paying
     /// the agreed address (directly for a normal address, or by the DLEQ proof for a silent payment),
     /// is `Verified`; anything else is `Failed`.
-    fn fee_state(&self, record: &Record, lock_txid: Txid, cp_chain: &ChainNode) -> FeeState {
+    fn fee_state(&self, record: &Record, lock_txid: Txid, cp_chain: &dyn ChainBackend) -> FeeState {
         let swap = &record.swap;
         let Some(terms) = &swap.offer.fee else {
             return FeeState::NotRequired;
@@ -650,6 +659,6 @@ impl<T: Transport> Engine<T> {
             self.drop_broadcasts -= 1;
             return Ok(());
         }
-        Ok(self.nodes[&chain].broadcast(&tx)?)
+        Ok(self.backend(chain).broadcast(&tx)?)
     }
 }
