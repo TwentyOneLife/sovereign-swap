@@ -153,10 +153,8 @@ impl Daemon {
         // `SWAP_TOR_SOCKS`, when set, overrides the settings value: on StartOS the container has no
         // Tor at a fixed address, so the package resolves the proxy bridge address and injects it
         // here, and the user never has to guess it. The settings field stays the manual fallback.
-        let tor_socks = std::env::var("SWAP_TOR_SOCKS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| settings.tor_socks.clone());
+        let tor_socks =
+            resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
         let open_node = |addr: &str, user: &str, pass: &str, ca: &str| {
             let socks = addr.contains(".onion").then_some(tor_socks.as_str());
             let ca = (!ca.trim().is_empty()).then_some(ca);
@@ -442,10 +440,14 @@ impl Daemon {
     /// The opt-in external price reference (nonkyc BTCB2/BTC, over Tor). `{enabled:false}` when off;
     /// a hint only, never a price the protocol relies on.
     fn reference_rate(&self) -> (u16, Value) {
-        if !self.state.lock().unwrap().settings.price_reference {
+        let settings = self.state.lock().unwrap().settings.clone();
+        if !settings.price_reference {
             return (200, json!({ "enabled": false }));
         }
-        match self.reference.get() {
+        // The reference must dial the same Tor proxy as the engine (SWAP_TOR_SOCKS, else the
+        // setting), not a hardcoded default: on StartOS the proxy is at an injected address.
+        let socks = resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
+        match self.reference.get(&socks) {
             Ok(r) => (
                 200,
                 json!({
@@ -577,6 +579,16 @@ impl Daemon {
     }
 }
 
+/// The Tor SOCKS proxy to dial through: `SWAP_TOR_SOCKS` wins when set and non-empty (StartOS
+/// injects the proxy bridge address there, as its container has no Tor at a fixed address),
+/// otherwise the `tor_socks` setting. Pure (the env value is passed in) so it is testable without
+/// touching process-global state. The node RPC, the relay, and the price reference all resolve the
+/// proxy this one way, so none of them can target a stale default the others do not.
+fn resolve_tor_socks(env: Option<String>, setting: &str) -> String {
+    env.filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| setting.to_owned())
+}
+
 /// True if `bind`'s host is a loopback address (reachable only from the same machine). `0.0.0.0` and
 /// `::` bind all interfaces and are reachable off-host, so they are not loopback.
 fn bind_is_loopback(bind: &str) -> bool {
@@ -600,7 +612,7 @@ fn serve_guard(bind: &str, has_basic_auth: bool) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_is_loopback, serve_guard};
+    use super::{bind_is_loopback, resolve_tor_socks, serve_guard};
 
     #[test]
     fn loopback_binds_are_recognised() {
@@ -626,5 +638,20 @@ mod tests {
         // Loopback is fine either way (reachable only locally).
         assert!(serve_guard("127.0.0.1:8787", false).is_ok());
         assert!(serve_guard("127.0.0.1:8787", true).is_ok());
+    }
+
+    #[test]
+    fn tor_socks_env_overrides_the_setting() {
+        // The injected env address wins, so the reference dials the same proxy as the engine.
+        assert_eq!(
+            resolve_tor_socks(Some("127.0.0.1:9150".to_owned()), "127.0.0.1:9050"),
+            "127.0.0.1:9150"
+        );
+        // Absent or blank env falls back to the setting (the manual fallback).
+        assert_eq!(resolve_tor_socks(None, "127.0.0.1:9050"), "127.0.0.1:9050");
+        assert_eq!(
+            resolve_tor_socks(Some("   ".to_owned()), "127.0.0.1:9050"),
+            "127.0.0.1:9050"
+        );
     }
 }

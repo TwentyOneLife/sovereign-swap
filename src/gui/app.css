@@ -22,6 +22,7 @@ header nav{display:flex;gap:.25rem;margin-left:.5rem}
 .status{margin-left:auto;font-size:.85rem;color:var(--dim)}
 .status .dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%;margin-right:.3rem;vertical-align:middle}
 .dot.on{background:var(--ok)} .dot.off{background:var(--bad)}
+.dot.err{background:var(--bad)} .dot.idle{background:var(--dim)}
 
 main{max-width:60rem;margin:0 auto;padding:1.25rem 1rem 3rem}
 .view{display:none} .view.active{display:block}
