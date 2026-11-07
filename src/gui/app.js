@@ -37,16 +37,50 @@ $$(".tab").forEach((t) =>
   })
 );
 
-// --- status ---
+// --- status + dependency dots ---
+// The connectivity dots come from /status (fast). The price dot comes from /reference-rate, which
+// may do a Tor fetch, so it is loaded separately and never delays the other dots. Both feed one
+// render from the last-known values.
+let statusData = null; // last GET /status, or null when the daemon is unreachable
+let priceState = "idle"; // "idle" (disabled) | "on" (rate available) | "err" (enabled, fetch failing)
+
+function renderStatus() {
+  const el = $("#status");
+  if (!statusData) return; // loadStatus owns the "unreachable" text; don't clobber it from here
+  const s = statusData;
+  const dot = (cls, title) => `<span class="dot ${cls}"${title ? ` title="${title}"` : ""}></span>`;
+  const onoff = (ok) => (ok ? "on" : "off");
+  const priceTitle =
+    priceState === "on"
+      ? "price reference: live"
+      : priceState === "err"
+        ? "price reference: enabled, but the fetch is failing"
+        : "price reference: off";
+  el.innerHTML =
+    `${dot(onoff(s.btc_node))}BTC ${dot(onoff(s.xbtc_node))}xBTC ${dot(onoff(s.engine))}engine ` +
+    `${dot(onoff(s.relays > 0))}relay ${dot(priceState, priceTitle)}price · ${s.active_swaps} active`;
+}
+
 async function loadStatus() {
   try {
-    const s = await api("GET", "/status");
-    const dot = (ok) => `<span class="dot ${ok ? "on" : "off"}"></span>`;
-    $("#status").innerHTML =
-      `${dot(s.btc_node)}BTC ${dot(s.xbtc_node)}xBTC ${dot(s.engine)}engine · ${s.active_swaps} active`;
+    statusData = await api("GET", "/status");
+    renderStatus();
   } catch (e) {
+    statusData = null;
     $("#status").textContent = "daemon unreachable";
   }
+}
+
+// The external price reference health, for the header dot: off (disabled), on (a rate), or err
+// (enabled but the fetch failed). A failing reference never blocks the other dots.
+async function loadReference() {
+  try {
+    const r = await api("GET", "/reference-rate");
+    priceState = !r.enabled ? "idle" : r.error ? "err" : "on";
+  } catch (e) {
+    priceState = "err";
+  }
+  renderStatus();
 }
 
 // --- market ---
@@ -286,6 +320,10 @@ function refresh(tab) {
 }
 
 loadStatus();
+loadReference();
 loadMarket();
 subscribe();
-setInterval(loadStatus, 15000);
+setInterval(() => {
+  loadStatus();
+  loadReference();
+}, 15000);
