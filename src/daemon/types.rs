@@ -31,6 +31,33 @@ pub enum Chain {
     Xbtc,
 }
 
+/// A secret string kept out of logs and Debug output (design 0013: a scan key is never logged). It
+/// serializes transparently, since it is persisted to the data dir with the rest of the settings, but
+/// its Debug shows only whether it is set, so a `{:?}` of `Settings` can never leak it.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_empty() {
+            "Secret(unset)"
+        } else {
+            "Secret(<redacted>)"
+        })
+    }
+}
+
 /// The user-facing settings, saved in the data dir and reloaded on start. Separate from the engine's
 /// internal `Config`/`Policy`: this is what a person edits, not the safety-critical invariants the
 /// engine enforces regardless.
@@ -86,6 +113,25 @@ pub struct Settings {
     /// replacing the former hardcoded default (design 0011). The StartOS Tor proxy on a node install.
     #[serde(default = "default_tor_socks")]
     pub tor_socks: String,
+    /// The operator's scan SECRET key (hex, 32 bytes) for the BTC fee silent-payment address. When
+    /// set together with a silent payment `fee_btc_address`, the daemon collects the operator's own
+    /// fees by scanning the chain (design 0013, stage 2). A secret: stored in the data dir like the
+    /// RPC credentials, never served to the web layer and never logged (the `Secret` newtype redacts
+    /// it). Empty means no scanning for this chain. Independent of `fee_enabled`: an operator may
+    /// collect fees from third-party installs without charging on its own swaps.
+    #[serde(default)]
+    pub fee_btc_scan_key: Secret,
+    /// The operator's scan secret key for the xBTC fee address. Kept separate from the BTC scan key
+    /// because the two chains share Bitcoin's address and key format (design 0013).
+    #[serde(default)]
+    pub fee_xbtc_scan_key: Secret,
+    /// The height the BTC fee scan starts from on a first run (the fee wallet's birthday). 0 means
+    /// unset: the scanner then starts at the current tip rather than sweeping from genesis.
+    #[serde(default)]
+    pub fee_btc_birthday_height: u32,
+    /// The height the xBTC fee scan starts from on a first run.
+    #[serde(default)]
+    pub fee_xbtc_birthday_height: u32,
 }
 
 /// The largest fee a setting may ask for: a guard against a fat-finger, not a policy (spec 7.5 sets
@@ -125,6 +171,10 @@ impl Default for Settings {
             btc_rpc_ca: String::new(),
             xbtc_rpc_ca: String::new(),
             tor_socks: default_tor_socks(),
+            fee_btc_scan_key: Secret::default(),
+            fee_xbtc_scan_key: Secret::default(),
+            fee_btc_birthday_height: 0,
+            fee_xbtc_birthday_height: 0,
         }
     }
 }
@@ -181,6 +231,28 @@ impl Settings {
                     e.push(format!(
                         "{name}: must be a silent payment or a normal address"
                     ));
+                }
+            }
+        }
+        // Fee scan keys (design 0013) are checked independently of `fee_enabled`: collecting fees
+        // from third-party installs does not require charging a fee here. A present scan key must be
+        // a valid secret key that matches its chain's silent payment fee address. The message never
+        // echoes the key. This only reports; the scanner enforces the same checks before it starts.
+        for (name, key, addr) in [
+            (
+                "fee_btc_scan_key",
+                &self.fee_btc_scan_key,
+                &self.fee_btc_address,
+            ),
+            (
+                "fee_xbtc_scan_key",
+                &self.fee_xbtc_scan_key,
+                &self.fee_xbtc_address,
+            ),
+        ] {
+            if !key.is_empty() {
+                if let Err(msg) = crate::feescan::ScanConfig::new(addr, key.as_str(), 0) {
+                    e.push(format!("{name}: {msg}"));
                 }
             }
         }

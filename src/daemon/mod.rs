@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 
 use crate::engine::Engine;
 use crate::envelope::Identity;
+use crate::feescan;
 use crate::node::ChainNode;
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
@@ -87,6 +88,11 @@ pub struct Daemon {
     /// present, the page and its assets (which carry the API token) are served only to a browser that
     /// passes HTTP Basic auth, so knowing the onion is no longer enough to reach the swaps.
     basic_auth: Option<(String, String)>,
+    /// The per-chain fee-scanner state (design 0013), updated by the scanner threads and read by
+    /// GET /status. Present (default, empty) even when no scanner runs, so /status always has the
+    /// fields. Scan-only: these are counts and sats, never a key.
+    scan_btc: Arc<Mutex<feescan::State>>,
+    scan_xbtc: Arc<Mutex<feescan::State>>,
 }
 
 impl Daemon {
@@ -122,6 +128,8 @@ impl Daemon {
             events: Arc::new(Mutex::new(Vec::new())),
             reference: Reference::default(),
             basic_auth,
+            scan_btc: Arc::new(Mutex::new(feescan::State::default())),
+            scan_xbtc: Arc::new(Mutex::new(feescan::State::default())),
         };
         // If the saved settings are already complete, bring the engine up. A failure here is not fatal
         // (the GUI learns it from GET /status), but it is logged: a silently swallowed reason is very
@@ -129,6 +137,9 @@ impl Daemon {
         if let Err(e) = daemon.start_engine() {
             eprintln!("engine not started on open: {e}");
         }
+        // Start the per-chain fee scanners for any chain configured with an SP fee address and a scan
+        // key (design 0013). Independent of the engine: a scanner needs only the node, not a relay.
+        daemon.start_scanners();
         Ok(daemon)
     }
 
@@ -156,10 +167,7 @@ impl Daemon {
         let tor_socks =
             resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
         let open_node = |addr: &str, user: &str, pass: &str, ca: &str| {
-            let socks = addr.contains(".onion").then_some(tor_socks.as_str());
-            let ca = (!ca.trim().is_empty()).then_some(ca);
-            let client = Client::connect(addr, user, pass, ca, socks)
-                .map_err(|e| format!("node {addr}: {e:?}"))?;
+            let client = connect_node(addr, user, pass, ca, &tor_socks)?;
             ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}"))
         };
         let btc = open_node(
@@ -206,6 +214,63 @@ impl Daemon {
 
     fn engine_running(&self) -> bool {
         self.engine.lock().unwrap().is_some()
+    }
+
+    /// Spawns one fee-scanner thread per chain configured with a silent payment fee address and a
+    /// matching scan key (design 0013, stage 2). A chain with no scan key, or a normal fee address,
+    /// is simply not scanned. A misconfigured scan key is logged (value-free) and skipped rather than
+    /// starting a scanner that would find nothing. Each thread owns its own RPC client and persists
+    /// its progress in the data dir, so it survives a restart without rescanning from the birthday.
+    fn start_scanners(&self) {
+        let settings = self.state.lock().unwrap().settings.clone();
+        let tor_socks =
+            resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
+        let chains = [
+            (
+                "btc",
+                &settings.btc_node,
+                &settings.btc_rpc_user,
+                &settings.btc_rpc_pass,
+                &settings.btc_rpc_ca,
+                &settings.fee_btc_address,
+                settings.fee_btc_scan_key.as_str(),
+                settings.fee_btc_birthday_height,
+                Arc::clone(&self.scan_btc),
+                "feescan-btc.json",
+            ),
+            (
+                "xbtc",
+                &settings.xbtc_node,
+                &settings.xbtc_rpc_user,
+                &settings.xbtc_rpc_pass,
+                &settings.xbtc_rpc_ca,
+                &settings.fee_xbtc_address,
+                settings.fee_xbtc_scan_key.as_str(),
+                settings.fee_xbtc_birthday_height,
+                Arc::clone(&self.scan_xbtc),
+                "feescan-xbtc.json",
+            ),
+        ];
+        for (label, addr, user, pass, ca, fee_addr, scan_key, birthday, shared, file) in chains {
+            let cfg = match feescan::ScanConfig::new(fee_addr, scan_key, birthday) {
+                Ok(None) => continue, // not configured to scan this chain
+                Ok(Some(cfg)) => cfg,
+                Err(e) => {
+                    eprintln!("fee-scanner {label}: not started: {e}");
+                    continue;
+                }
+            };
+            match connect_node(addr, user, pass, ca, &tor_socks) {
+                Ok(client) => {
+                    let state_file = self.data_dir.join(file);
+                    eprintln!("fee-scanner {label}: started (birthday {})", cfg.birthday);
+                    std::thread::spawn(move || {
+                        feescan::run(label, client, cfg, state_file, shared)
+                    });
+                }
+                Err(e) => eprintln!("fee-scanner {label}: not started: {e}"),
+            }
+        }
     }
 
     pub fn token(&self) -> &str {
@@ -470,12 +535,20 @@ impl Daemon {
         } else {
             0
         };
+        // Fee scanner totals, per chain (design 0013, scan-only): how many fee outputs the operator
+        // has collected and their total sats. Zero and present even when no scanner runs.
+        let btc_scan = self.scan_btc.lock().unwrap().clone();
+        let xbtc_scan = self.scan_xbtc.lock().unwrap().clone();
         json!({
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
             "relays": settings.relays.len(),
             "engine": running,
             "active_swaps": active,
+            "fees_found_btc": btc_scan.count(),
+            "fees_sat_btc": btc_scan.sats(),
+            "fees_found_xbtc": xbtc_scan.count(),
+            "fees_sat_xbtc": xbtc_scan.sats(),
         })
     }
 
@@ -587,6 +660,21 @@ impl Daemon {
 fn resolve_tor_socks(env: Option<String>, setting: &str) -> String {
     env.filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| setting.to_owned())
+}
+
+/// Builds an RPC client for a node from its settings, applying the design-0011 transport rules: an
+/// `.onion` is dialed through the Tor proxy, an `https` LAN node is verified against its Root CA.
+/// Shared by the engine's node setup and the fee scanner so both reach a node the same way.
+fn connect_node(
+    addr: &str,
+    user: &str,
+    pass: &str,
+    ca: &str,
+    tor_socks: &str,
+) -> Result<Client, String> {
+    let socks = addr.contains(".onion").then_some(tor_socks);
+    let ca = (!ca.trim().is_empty()).then_some(ca);
+    Client::connect(addr, user, pass, ca, socks).map_err(|e| format!("node {addr}: {e:?}"))
 }
 
 /// True if `bind`'s host is a loopback address (reachable only from the same machine). `0.0.0.0` and
