@@ -139,6 +139,9 @@ pub struct Client {
     socks: Option<String>,
     /// Present iff the scheme is HTTPS. Built once and shared across calls.
     tls: Option<Arc<ClientConfig>>,
+    /// Per-call read/write budget. Defaults to `TIMEOUT`; the remote signer sets a tighter bound
+    /// (design 0012). The connect budget is `CONNECT_TIMEOUT`, unaffected.
+    timeout: Duration,
 }
 
 impl Client {
@@ -178,7 +181,16 @@ impl Client {
             authorization: base64(format!("{user}:{password}").as_bytes()),
             socks: socks.map(str::to_owned),
             tls,
+            timeout: TIMEOUT,
         })
+    }
+
+    /// Overrides the per-call read/write timeout (default `TIMEOUT`). The remote funding signer wants
+    /// a tighter bound than a node's long onion budget, so a stalled signer fails fast and never
+    /// hangs the engine thread (design 0012). The connect timeout is unchanged.
+    pub fn with_timeout(mut self, timeout: Duration) -> Client {
+        self.timeout = timeout;
+        self
     }
 
     pub fn host_port(&self) -> String {
@@ -215,8 +227,10 @@ impl Client {
             None => connect_direct(&self.endpoint.host, self.endpoint.port),
         }
         .map_err(RpcError::Io)?;
-        tcp.set_read_timeout(Some(TIMEOUT)).map_err(RpcError::Io)?;
-        tcp.set_write_timeout(Some(TIMEOUT)).map_err(RpcError::Io)?;
+        tcp.set_read_timeout(Some(self.timeout))
+            .map_err(RpcError::Io)?;
+        tcp.set_write_timeout(Some(self.timeout))
+            .map_err(RpcError::Io)?;
 
         let (status, payload) = match &self.tls {
             Some(config) => {

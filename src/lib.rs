@@ -15,6 +15,7 @@ pub mod relay_server;
 pub mod replay;
 pub mod routing;
 pub mod rpc;
+pub mod signer;
 pub mod silentpayments;
 pub mod socks;
 pub mod store;
