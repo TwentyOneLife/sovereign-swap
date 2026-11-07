@@ -23,7 +23,23 @@ use crate::swap::{FeeProof, FeeState, LockView, SpendView};
 pub enum NodeError {
     Rpc(RpcError),
     Replay(ReplayError<RpcError>),
+    Signer(SignerError),
     Unexpected(String),
+}
+
+/// Why a remote (cold) funding signer did not return a usable signed PSBT (design 0012). Kept
+/// distinct from a node `Rpc` error so the daemon can tell "the signer is unreachable, do not fund"
+/// from "the signer refused this PSBT", and so neither is ever confused with a hot fallback.
+#[derive(Debug)]
+pub enum SignerError {
+    /// The signer endpoint could not be reached. There is no hot fallback: funding simply refuses.
+    Unreachable(String),
+    /// The signer did not answer within the timeout.
+    Timeout,
+    /// The signer answered with a typed refusal (a policy ceiling, an allow-list, a rate limit, ...).
+    Refused { code: i64, message: String },
+    /// The signer answered, but the reply was not a usable signed PSBT for the same transaction.
+    Malformed(String),
 }
 
 impl From<RpcError> for NodeError {
@@ -299,16 +315,69 @@ fn parse<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T, NodeError> 
     deserialize_hex(hex).map_err(|e| NodeError::Unexpected(e.to_string()))
 }
 
+/// The network this node serves, from `getblockchaininfo`. Shared by `open` and `open_cold`.
+fn chain_network(rpc: &Client) -> Result<Network, NodeError> {
+    match rpc.call("getblockchaininfo", json!([]))?["chain"].as_str() {
+        Some("main") => Ok(Network::Bitcoin),
+        Some("testnet4") => Ok(Network::Testnet4),
+        Some("signet") => Ok(Network::Signet),
+        Some("regtest") => Ok(Network::Regtest),
+        other => Err(NodeError::Unexpected(format!("chain {other:?}"))),
+    }
+}
+
+/// Imports one account descriptor into the watch-only funding wallet as an active descriptor (design
+/// 0012), idempotently. The checksum comes from `getdescriptorinfo`'s canonical `descriptor` field,
+/// so a descriptor supplied with or without a `#checksum` is normalised and never double-appended.
+/// `internal` marks the change branch. When the wallet is not freshly created, the import is skipped
+/// if the descriptor is already present, so a restart does not re-import (which Core can reject once
+/// the keypool has advanced the stored range).
+fn ensure_account_descriptor(
+    rpc: &Client,
+    wallet: &Client,
+    descriptor: &str,
+    internal: bool,
+    created: bool,
+) -> Result<(), NodeError> {
+    let info = rpc.call("getdescriptorinfo", json!([descriptor]))?;
+    let canonical = info["descriptor"]
+        .as_str()
+        .ok_or_else(|| NodeError::Unexpected("getdescriptorinfo returned no descriptor".into()))?;
+    if !created {
+        let listed = wallet.call("listdescriptors", json!([]))?;
+        let present = listed["descriptors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|d| d["desc"].as_str() == Some(canonical));
+        if present {
+            return Ok(());
+        }
+    }
+    let result = wallet.call(
+        "importdescriptors",
+        json!([[{
+            "desc": canonical,
+            "timestamp": "now",
+            "active": true,
+            "internal": internal,
+            "range": 1000,
+        }]]),
+    )?;
+    match result[0]["success"].as_bool() {
+        Some(true) => Ok(()),
+        _ => Err(NodeError::Unexpected(format!(
+            "importdescriptors ({}): {result}",
+            if internal { "change" } else { "receive" }
+        ))),
+    }
+}
+
 impl ChainNode {
-    /// Opens (or creates) `<name>` for funds and `<name>-watch` for contracts on this node.
+    /// Opens (or creates) `<name>` for funds and `<name>-watch` for contracts on this node. Hot: the
+    /// funding wallet holds its keys and signs with `WalletSigner`. The cold path is `open_cold`.
     pub fn open(rpc: Client, name: &str) -> Result<ChainNode, NodeError> {
-        let network = match rpc.call("getblockchaininfo", json!([]))?["chain"].as_str() {
-            Some("main") => Network::Bitcoin,
-            Some("testnet4") => Network::Testnet4,
-            Some("signet") => Network::Signet,
-            Some("regtest") => Network::Regtest,
-            other => return Err(NodeError::Unexpected(format!("chain {other:?}"))),
-        };
+        let network = chain_network(&rpc)?;
         let watch_name = format!("{name}-watch");
         let loaded = rpc.call("listwallets", json!([]))?;
         for (wallet, watch_only) in [(name, false), (watch_name.as_str(), true)] {
@@ -326,6 +395,71 @@ impl ChainNode {
         let signer = Box::new(WalletSigner {
             wallet: wallet.clone(),
         });
+        Ok(ChainNode {
+            wallet,
+            watch: rpc.wallet(&watch_name),
+            signer,
+            rpc,
+            network,
+        })
+    }
+
+    /// Opens the chain for cold funding (design 0012). `<name>` is created watch-only
+    /// (`private_keys_enabled=false`) and the account descriptors (receive external + change
+    /// internal) are imported, so the engine builds funded PSBTs with no private key; `<name>-watch`
+    /// tracks contracts exactly as in `open`. The external `signer` is injected here, so a hot
+    /// `WalletSigner` is never constructed on this path and there is no hot fallback.
+    ///
+    /// Loud safety refusal: if `<name>` holds private keys (a hot wallet reused under a cold config),
+    /// this returns an error rather than ever signing the user's balance on the engine host.
+    ///
+    /// Import uses `timestamp: "now"`, so only funds received after the import are tracked. An
+    /// operator migrating a pre-funded xpub needs a rescan (a later-stage concern, design 0012); for
+    /// stage 1 the funding account is expected to be funded after provisioning.
+    pub fn open_cold(
+        rpc: Client,
+        name: &str,
+        descriptor_receive: &str,
+        descriptor_change: &str,
+        signer: Box<dyn FundingSigner>,
+    ) -> Result<ChainNode, NodeError> {
+        let network = chain_network(&rpc)?;
+        let watch_name = format!("{name}-watch");
+        let loaded = rpc.call("listwallets", json!([]))?;
+        let is_loaded = |w: &str| loaded.as_array().is_some_and(|l| l.iter().any(|v| v == w));
+        // Both wallets are watch-only: the funding wallet tracks the user's balance from the account
+        // descriptors, the watch wallet tracks the swap contracts. Remember whether the funding
+        // wallet was created now, so a restart does not re-import into an existing one.
+        let mut funding_created = false;
+        for wallet in [name, watch_name.as_str()] {
+            if is_loaded(wallet) || rpc.call("loadwallet", json!([wallet])).is_ok() {
+                continue;
+            }
+            // disable_private_keys=true, blank=true, passphrase="", avoid_reuse=false,
+            // descriptors=true: a blank descriptor wallet that holds no key.
+            rpc.call("createwallet", json!([wallet, true, true, "", false, true]))?;
+            if wallet == name {
+                funding_created = true;
+            }
+        }
+        let wallet = rpc.wallet(name);
+        // Safety (design 0012): the funding wallet must hold no private key, whether just created,
+        // loaded, or already present. Keys present means a hot wallet was reused under a cold config;
+        // refuse rather than ever sign the user's balance on the engine host.
+        let info = wallet.call("getwalletinfo", json!([]))?;
+        if info["private_keys_enabled"].as_bool() != Some(false) {
+            return Err(NodeError::Unexpected(format!(
+                "cold funding wallet {name} has private keys enabled; it must be watch-only. \
+                 Refusing to fund from a key on the engine host (recreate it from the account \
+                 descriptors)."
+            )));
+        }
+        // Import the receive (external) and change (internal) account descriptors so
+        // walletcreatefundedpsbt can select coins and build a change-handling PSBT. Only on a fresh
+        // wallet, or when a descriptor is absent: re-importing an existing one on every restart can
+        // be rejected once the keypool has advanced the stored range (design 0012).
+        ensure_account_descriptor(&rpc, &wallet, descriptor_receive, false, funding_created)?;
+        ensure_account_descriptor(&rpc, &wallet, descriptor_change, true, funding_created)?;
         Ok(ChainNode {
             wallet,
             watch: rpc.wallet(&watch_name),

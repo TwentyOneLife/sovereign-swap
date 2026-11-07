@@ -31,6 +31,66 @@ pub enum Chain {
     Xbtc,
 }
 
+/// Per-chain funding mode (design 0012). `Hot`: the node wallet holds the funding keys and signs,
+/// the regtest and dust default, unchanged for existing installs. `Cold`: the funding wallet is
+/// watch-only and an external signer signs, so no key to the user's balance lives on the engine
+/// host. Per chain because BTC and xBTC can run different signers.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FundingMode {
+    #[default]
+    Hot,
+    Cold,
+}
+
+/// A chain's funding configuration (design 0012): the mode, and for cold mode the external signer
+/// endpoint (same shape and transport as a node endpoint, design 0011), its RPC auth and optional
+/// Root CA, and the account output descriptors (receive external + change internal) for the
+/// watch-only funding wallet. The auth and the descriptors are operator secrets: kept in the data
+/// dir, never served to the web layer, and redacted from `Debug` (see below) so a settings dump does
+/// not leak them. (A malformed descriptor can still surface in a node RPC error in the operator's own
+/// daemon log; that path never reaches the web layer.)
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct FundingConfig {
+    #[serde(default)]
+    pub mode: FundingMode,
+    #[serde(default)]
+    pub signer_endpoint: String,
+    #[serde(default)]
+    pub signer_user: String,
+    #[serde(default)]
+    pub signer_pass: String,
+    #[serde(default)]
+    pub signer_ca: String,
+    #[serde(default)]
+    pub descriptor_receive: String,
+    #[serde(default)]
+    pub descriptor_change: String,
+}
+
+impl std::fmt::Debug for FundingConfig {
+    /// Redacts the signer password and the account descriptors so they never reach a log line; the
+    /// mode, endpoint, user and CA are not secret (an endpoint carries the same exposure as a node).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| {
+            if s.trim().is_empty() {
+                "<empty>"
+            } else {
+                "<set>"
+            }
+        };
+        f.debug_struct("FundingConfig")
+            .field("mode", &self.mode)
+            .field("signer_endpoint", &self.signer_endpoint)
+            .field("signer_user", &self.signer_user)
+            .field("signer_pass", &redact(&self.signer_pass))
+            .field("signer_ca", &redact(&self.signer_ca))
+            .field("descriptor_receive", &redact(&self.descriptor_receive))
+            .field("descriptor_change", &redact(&self.descriptor_change))
+            .finish()
+    }
+}
+
 /// The user-facing settings, saved in the data dir and reloaded on start. Separate from the engine's
 /// internal `Config`/`Policy`: this is what a person edits, not the safety-critical invariants the
 /// engine enforces regardless.
@@ -86,6 +146,13 @@ pub struct Settings {
     /// replacing the former hardcoded default (design 0011). The StartOS Tor proxy on a node install.
     #[serde(default = "default_tor_socks")]
     pub tor_socks: String,
+    /// Per-chain funding mode and cold signer config (design 0012). Absent (the default) is hot on
+    /// both chains, so existing installs and regtest are unchanged. The legacy global `signer` field
+    /// above is not consulted by the connect wiring; these per-chain values are authoritative.
+    #[serde(default)]
+    pub btc_funding: FundingConfig,
+    #[serde(default)]
+    pub xbtc_funding: FundingConfig,
 }
 
 /// The largest fee a setting may ask for: a guard against a fat-finger, not a policy (spec 7.5 sets
@@ -125,6 +192,8 @@ impl Default for Settings {
             btc_rpc_ca: String::new(),
             xbtc_rpc_ca: String::new(),
             tor_socks: default_tor_socks(),
+            btc_funding: FundingConfig::default(),
+            xbtc_funding: FundingConfig::default(),
         }
     }
 }
@@ -147,6 +216,12 @@ impl Settings {
             if !(relay.starts_with("ws://") || relay.starts_with("wss://")) {
                 e.push(format!("relay {relay}: must be a ws:// or wss:// URL"));
             }
+        }
+        for (name, cfg) in [
+            ("btc_funding", &self.btc_funding),
+            ("xbtc_funding", &self.xbtc_funding),
+        ] {
+            e.extend(validate_funding(name, cfg, &self.tor_socks));
         }
         if self.btc_conf < 1 || self.btc_conf > 100 {
             e.push("btc_conf: 1..=100".to_owned());
@@ -334,6 +409,28 @@ fn valid_host_port(s: &str) -> bool {
     }
 }
 
+/// Validates a chain's funding config (design 0012). Hot needs nothing. Cold needs a signer endpoint
+/// (checked by the same node-endpoint rules, reusing the signer's own CA) and both account
+/// descriptors, so the watch-only funding wallet can build a change-handling PSBT. Never echoes a
+/// descriptor or a credential: the messages are logged.
+fn validate_funding(name: &str, cfg: &FundingConfig, tor_socks: &str) -> Vec<String> {
+    let mut e = Vec::new();
+    if cfg.mode != FundingMode::Cold {
+        return e;
+    }
+    if cfg.signer_endpoint.trim().is_empty() {
+        e.push(format!("{name}: cold mode needs a signer_endpoint"));
+    } else if let Err(msg) = validate_node(&cfg.signer_endpoint, &cfg.signer_ca, tor_socks) {
+        e.push(format!("{name} signer_endpoint: {msg}"));
+    }
+    if cfg.descriptor_receive.trim().is_empty() || cfg.descriptor_change.trim().is_empty() {
+        e.push(format!(
+            "{name}: cold mode needs a receive and a change account descriptor"
+        ));
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +522,69 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().iter().any(|m| m.contains("fee_maker_bps")));
+    }
+
+    #[test]
+    fn funding_defaults_hot_and_old_config_loads() {
+        // The default is hot on both chains, so nothing changes for existing installs.
+        let s = Settings::default();
+        assert_eq!(s.btc_funding.mode, FundingMode::Hot);
+        assert_eq!(s.xbtc_funding.mode, FundingMode::Hot);
+        assert!(s.validate().is_empty(), "hot defaults must validate");
+        // Config written before the funding fields existed still deserializes (serde defaults).
+        let old = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":[],
+            "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.btc_funding.mode, FundingMode::Hot);
+    }
+
+    #[test]
+    fn cold_mode_requires_an_endpoint_and_both_descriptors() {
+        // Cold with nothing set: endpoint and descriptors both missing.
+        let mut s = Settings::default();
+        s.btc_funding.mode = FundingMode::Cold;
+        let issues = s.validate();
+        assert!(issues.iter().any(|m| m.contains("signer_endpoint")));
+        assert!(issues.iter().any(|m| m.contains("descriptor")));
+
+        // A plain host:port endpoint and both descriptors: valid.
+        s.btc_funding.signer_endpoint = "127.0.0.1:8080".to_owned();
+        s.btc_funding.descriptor_receive = "wpkh(tpub.../0/*)".to_owned();
+        s.btc_funding.descriptor_change = "wpkh(tpub.../1/*)".to_owned();
+        assert!(
+            s.validate().is_empty(),
+            "a complete cold config must validate: {:?}",
+            s.validate()
+        );
+
+        // One descriptor missing is still refused.
+        s.btc_funding.descriptor_change = String::new();
+        assert!(s.validate().iter().any(|m| m.contains("descriptor")));
+
+        // An https LAN signer with no CA is refused by the shared node-endpoint rule.
+        s.btc_funding.descriptor_change = "wpkh(tpub.../1/*)".to_owned();
+        s.btc_funding.signer_endpoint = "https://192.0.2.7:8080".to_owned();
+        assert!(s
+            .validate()
+            .iter()
+            .any(|m| m.contains("signer_endpoint") && m.contains("Root CA")));
+    }
+
+    #[test]
+    fn funding_debug_redacts_the_secrets() {
+        let cfg = FundingConfig {
+            mode: FundingMode::Cold,
+            signer_endpoint: "node.example:8080".to_owned(),
+            signer_user: "operator".to_owned(),
+            signer_pass: "hunter2".to_owned(),
+            signer_ca: String::new(),
+            descriptor_receive: "wpkh(tpub.../0/*)".to_owned(),
+            descriptor_change: "wpkh(tpub.../1/*)".to_owned(),
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("hunter2"), "password must not be logged");
+        assert!(!shown.contains("tpub"), "descriptors must not be logged");
+        // The non-secret fields stay visible for diagnosis.
+        assert!(shown.contains("node.example:8080") && shown.contains("operator"));
     }
 }

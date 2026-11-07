@@ -30,6 +30,7 @@ use crate::envelope::Identity;
 use crate::node::ChainNode;
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
+use crate::signer::RemoteSigner;
 use crate::ws::WsConn;
 
 /// How often the engine thread drives a swap forward when no command arrives.
@@ -39,7 +40,12 @@ mod types;
 mod wire;
 
 pub use engine::SwapView;
-pub use types::{parse_btc_to_sats, Chain, Settings, Signer};
+pub use types::{parse_btc_to_sats, Chain, FundingConfig, FundingMode, Settings, Signer};
+
+/// Per-call budget for a remote funding signer (design 0012): shorter than a node's long onion
+/// budget, since funding signing is one round trip at the start of a swap, when there is time, and a
+/// stalled signer must never hang the engine thread.
+const SIGNER_TIMEOUT: Duration = Duration::from_secs(60);
 
 use engine::{engine_config, offer_to_json, run_engine, EngineCmd};
 use reference::Reference;
@@ -155,24 +161,61 @@ impl Daemon {
         // here, and the user never has to guess it. The settings field stays the manual fallback.
         let tor_socks =
             resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
-        let open_node = |addr: &str, user: &str, pass: &str, ca: &str| {
-            let socks = addr.contains(".onion").then_some(tor_socks.as_str());
-            let ca = (!ca.trim().is_empty()).then_some(ca);
-            let client = Client::connect(addr, user, pass, ca, socks)
-                .map_err(|e| format!("node {addr}: {e:?}"))?;
-            ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}"))
+        // Per-chain funding mode (design 0012). Hot is unchanged: the node wallet signs. Cold opens a
+        // watch-only funding wallet from the account descriptors and injects a `RemoteSigner` reached
+        // over the same transport as a node; the signer is probed for reachability first, so the
+        // daemon refuses to start rather than ever silently funding hot.
+        let open_chain = |node_addr: &str,
+                          node_user: &str,
+                          node_pass: &str,
+                          node_ca: &str,
+                          funding: &FundingConfig,
+                          chain: &'static str|
+         -> Result<ChainNode, String> {
+            let client = connect_client(node_addr, node_user, node_pass, node_ca, &tor_socks)
+                .map_err(|e| format!("node {node_addr}: {e}"))?;
+            match funding.mode {
+                FundingMode::Hot => ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}")),
+                FundingMode::Cold => {
+                    let signer_client = connect_client(
+                        &funding.signer_endpoint,
+                        &funding.signer_user,
+                        &funding.signer_pass,
+                        &funding.signer_ca,
+                        &tor_socks,
+                    )
+                    .map_err(|e| format!("{chain} signer: {e}"))?
+                    .with_timeout(SIGNER_TIMEOUT);
+                    let signer = RemoteSigner::new(signer_client, chain);
+                    signer
+                        .probe()
+                        .map_err(|e| format!("{chain} signer probe failed: {e:?}"))?;
+                    ChainNode::open_cold(
+                        client,
+                        &wallet,
+                        &funding.descriptor_receive,
+                        &funding.descriptor_change,
+                        Box::new(signer),
+                    )
+                    .map_err(|e| format!("{e:?}"))
+                }
+            }
         };
-        let btc = open_node(
+        let btc = open_chain(
             &settings.btc_node,
             &settings.btc_rpc_user,
             &settings.btc_rpc_pass,
             &settings.btc_rpc_ca,
+            &settings.btc_funding,
+            "btc",
         )?;
-        let xbtc = open_node(
+        let xbtc = open_chain(
             &settings.xbtc_node,
             &settings.xbtc_rpc_user,
             &settings.xbtc_rpc_pass,
             &settings.xbtc_rpc_ca,
+            &settings.xbtc_funding,
+            "xbtc",
         )?;
         let socks = relay.contains(".onion").then(|| tor_socks.to_owned());
         let conn = WsConn::connect(relay, socks.as_deref()).map_err(|e| format!("relay: {e:?}"))?;
@@ -587,6 +630,22 @@ impl Daemon {
 fn resolve_tor_socks(env: Option<String>, setting: &str) -> String {
     env.filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| setting.to_owned())
+}
+
+/// Builds an RPC client for a node or a cold signer endpoint, applying the design-0011 transport
+/// rules: an `.onion` is dialed through `tor_socks`, an `https` LAN address is verified against its
+/// Root CA, plain `http` is direct. A node and a signer share this one builder (design 0012), so a
+/// signer endpoint reaches the engine the same way a node does, with no new network code.
+fn connect_client(
+    addr: &str,
+    user: &str,
+    pass: &str,
+    ca: &str,
+    tor_socks: &str,
+) -> Result<Client, String> {
+    let socks = addr.contains(".onion").then_some(tor_socks);
+    let ca = (!ca.trim().is_empty()).then_some(ca);
+    Client::connect(addr, user, pass, ca, socks).map_err(|e| format!("{e:?}"))
 }
 
 /// True if `bind`'s host is a loopback address (reachable only from the same machine). `0.0.0.0` and

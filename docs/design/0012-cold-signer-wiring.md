@@ -1,8 +1,18 @@
 # 0012 Wiring the cold funding signer into the daemon and package (M2b)
 
-Status: design. The signer seam exists in the library (0008); this note designs how the daemon and
-the StartOS package select and reach an external signer, so a user's balance keys never sit on the
-engine host. No code yet.
+Status: stage 1 (daemon side) implemented; package actions (stage 2) still to do. The signer seam
+exists in the library (0008); this note designs how the daemon and the StartOS package select and
+reach an external signer, so a user's balance keys never sit on the engine host.
+
+Stage 1 landed the daemon wiring: a per-chain `funding_mode` (`hot` default, or `cold` with a signer
+endpoint and account descriptors) in `Settings`; a `RemoteSigner` that forwards the unsigned PSBT to
+the signer over the existing node transport and finalises nothing itself; watch-only funding wallet
+provisioning (`ChainNode::open_cold`) that imports the account descriptors and refuses a wallet that
+holds keys; and `funding_mode` resolution in `Daemon::connect` that probes the signer and refuses to
+start rather than ever silently funding hot. The `RemoteSigner` wire protocol is documented in
+`src/signer.rs`. Still to do: the StartOS package action fields and store wiring (stage 2), a
+hot-to-cold migration path (an existing keyed funding wallet under the same name is refused), and a
+rescan/birthday for a pre-funded account (import uses `timestamp: "now"`).
 
 ## The gap
 
