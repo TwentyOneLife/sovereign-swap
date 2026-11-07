@@ -106,7 +106,12 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
     let mut seen = false;
     while Instant::now() < deadline {
         let (_, list) = request(&taker, "GET", "/offers", &taker_tok, "");
-        if list.contains("\"amount_sat\":50000000") && list.contains("\"sell_chain\":\"xbtc\"") {
+        // The market row needs taker_chain too: the web UI renders it (o.taker_chain), so a missing
+        // field throws and the Market table renders empty with no Take button.
+        if list.contains("\"amount_sat\":50000000")
+            && list.contains("\"sell_chain\":\"xbtc\"")
+            && list.contains("\"taker_chain\":\"btc\"")
+        {
             seen = true;
             break;
         }
