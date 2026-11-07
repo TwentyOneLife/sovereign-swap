@@ -37,7 +37,10 @@ use crate::ws::WsConn;
 mod engine;
 mod reference;
 mod types;
-mod wire;
+// Visible to the reference signer's service module (`crate::signer_server`), which reuses the HTTP
+// request reader and the constant-time auth comparison rather than reinventing a web server (design
+// 0012). This is a visibility change only; the daemon's funding path is untouched.
+pub(crate) mod wire;
 
 pub use engine::SwapView;
 pub use types::{parse_btc_to_sats, Chain, FundingConfig, FundingMode, Settings, Signer};
