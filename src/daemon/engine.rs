@@ -199,6 +199,7 @@ pub(crate) fn offer_to_json(o: &SwapOffer) -> Value {
     json!({
         "id": o.id.to_hex_string(Case::Lower),
         "sell_chain": chain_str(o.maker_chain),
+        "taker_chain": chain_str(o.maker_chain.other()),
         "amount_sat": o.maker_amount.to_sat(),
         "counter_amount_sat": o.taker_amount.to_sat(),
         "min_amount_sat": o.min_maker_amount.to_sat(),
