@@ -11,7 +11,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::PubkeyHash;
 use common::{binaries, Node};
 use sovereign_swap::htlc::Contract;
-use sovereign_swap::node::{ChainNode, FundingSigner, NodeError};
+use sovereign_swap::node::{ChainBackend, ChainNode, FundingSigner, NodeError};
 use sovereign_swap::replay::UtxoLookup;
 use sovereign_swap::rpc::{Client, RpcError};
 

@@ -251,6 +251,39 @@ fn os_random() -> [u8; 32] {
     b
 }
 
+/// The chain data and broadcast surface the engine needs from a node, with no wallet in it: the
+/// network, the tip height, a transaction by txid, a watch-only registration for a contract, the
+/// live view of a lock, and transaction broadcast. `ChainNode` is the bitcoind implementation; a
+/// future Electrum backend (Fulcrum for BTC, Shulcrum for xBTC) is another, which is what removes
+/// the user's full-node requirement (design 0014). Funding and signing are deliberately absent:
+/// they stay on `ChainNode` until they move to the user's own wallet in a later stage.
+pub trait ChainBackend {
+    /// The network this backend serves.
+    fn network(&self) -> Network;
+
+    /// The current tip height.
+    fn height(&self) -> Result<u32, NodeError>;
+
+    /// A transaction this backend knows, by txid: used to read a counterparty lock's inputs and
+    /// outputs when checking its fee (design 0010).
+    fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError>;
+
+    /// Registers `contract`'s address so the backend tracks its lock, spends and confirmations.
+    fn watch_contract(&self, contract: &Contract) -> Result<(), NodeError>;
+
+    /// The lock of `amount` in `contract`, as the backend sees it now. `ours` are our own claim and
+    /// refund destinations, to tell our spend from the counterparty's.
+    fn lock_view(
+        &self,
+        contract: &Contract,
+        amount: Amount,
+        ours: &[ScriptBuf],
+    ) -> Result<Option<LockView>, NodeError>;
+
+    /// Broadcasts `tx`; a transaction the backend already has counts as success.
+    fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError>;
+}
+
 pub struct ChainNode {
     pub rpc: Client,
     wallet: Client,
@@ -309,27 +342,6 @@ impl ChainNode {
         self
     }
 
-    pub fn network(&self) -> Network {
-        self.network
-    }
-
-    pub fn height(&self) -> Result<u32, NodeError> {
-        Ok(self
-            .rpc
-            .call("getblockcount", json!([]))?
-            .as_u64()
-            .unwrap_or_default() as u32)
-    }
-
-    /// A transaction the watch wallet knows (it pays a watched contract), by txid: used to read a
-    /// counterparty lock's inputs and outputs when checking its fee (design 0010).
-    pub fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
-        let got = self
-            .watch
-            .call("gettransaction", json!([txid.to_string(), true]))?;
-        parse(&got["hex"])
-    }
-
     pub fn new_destination(&self) -> Result<ScriptBuf, NodeError> {
         let address = self.wallet.call("getnewaddress", json!([]))?;
         let info = self.wallet.call("getaddressinfo", json!([address]))?;
@@ -339,99 +351,6 @@ impl ChainNode {
 
     fn address(&self, contract: &Contract) -> Address {
         Address::from_script(&contract.script_pubkey(), self.network).expect("P2WSH has an address")
-    }
-
-    pub fn watch_contract(&self, contract: &Contract) -> Result<(), NodeError> {
-        let desc = format!("addr({})", self.address(contract));
-        let info = self.rpc.call("getdescriptorinfo", json!([desc]))?;
-        let desc = format!("{desc}#{}", info["checksum"].as_str().unwrap_or_default());
-        let result = self.watch.call(
-            "importdescriptors",
-            json!([[{"desc": desc, "timestamp": "now"}]]),
-        )?;
-        match result[0]["success"].as_bool() {
-            Some(true) => Ok(()),
-            _ => Err(NodeError::Unexpected(format!(
-                "importdescriptors: {result}"
-            ))),
-        }
-    }
-
-    /// The lock of `amount` in `contract`, as the node sees it now. `ours` are our own claim and
-    /// refund destinations, to tell our spend from the counterparty's.
-    pub fn lock_view(
-        &self,
-        contract: &Contract,
-        amount: Amount,
-        ours: &[ScriptBuf],
-    ) -> Result<Option<LockView>, NodeError> {
-        let address = self.address(contract).to_string();
-        let history = self
-            .watch
-            .call("listtransactions", json!(["*", 1000, 0, true]))?;
-        let entries = history.as_array().cloned().unwrap_or_default();
-        let live = |e: &Value| e["confirmations"].as_i64().unwrap_or(-1) >= 0;
-        let receives: Vec<&Value> = entries
-            .iter()
-            .filter(|e| e["category"] == "receive" && e["address"] == address.as_str() && live(e))
-            .collect();
-        let exact = receives.iter().find(|e| {
-            Amount::from_btc(e["amount"].as_f64().unwrap_or_default()).ok() == Some(amount)
-        });
-        let Some(entry) = exact.or(receives.first()) else {
-            return Ok(None);
-        };
-        let outpoint = OutPoint {
-            txid: entry["txid"]
-                .as_str()
-                .unwrap_or_default()
-                .parse()
-                .map_err(|_| NodeError::Unexpected("txid".into()))?,
-            vout: entry["vout"].as_u64().unwrap_or_default() as u32,
-        };
-        let height = self.height()?;
-        let confirmations = entry["confirmations"].as_u64().unwrap_or_default() as u32;
-        let confirmed_height = (confirmations > 0).then(|| height + 1 - confirmations);
-
-        let mut spend = None;
-        let mut seen = HashSet::new();
-        for e in entries
-            .iter()
-            .filter(|e| e["category"] == "send" && live(e))
-        {
-            let txid: Txid = match e["txid"].as_str().and_then(|t| t.parse().ok()) {
-                Some(t) => t,
-                None => continue,
-            };
-            if !seen.insert(txid) {
-                continue;
-            }
-            let tx: Transaction = parse(
-                &self
-                    .watch
-                    .call("gettransaction", json!([txid.to_string(), true]))?["hex"],
-            )?;
-            if tx.input.iter().any(|i| i.previous_output == outpoint) {
-                spend = Some(SpendView {
-                    preimage: extract_preimage(&tx, contract),
-                    depth: e["confirmations"].as_u64().unwrap_or_default() as u32,
-                    ours: tx.output.iter().any(|o| ours.contains(&o.script_pubkey)),
-                });
-                break;
-            }
-        }
-        let value = Amount::from_btc(entry["amount"].as_f64().unwrap_or_default())
-            .map_err(|e| NodeError::Unexpected(e.to_string()))?;
-        Ok(Some(LockView {
-            outpoint,
-            value,
-            amount_ok: exact.is_some(),
-            confirmed_height,
-            spend,
-            // The node does not know a swap's fee terms; the engine sets the counterparty lock's
-            // fee state after verifying it (design 0010). Our own lock stays NotRequired.
-            fee: FeeState::NotRequired,
-        }))
     }
 
     /// Funds and signs a lock of `amount` in `contract` from the funding wallet, from inputs with at
@@ -530,9 +449,123 @@ impl ChainNode {
         }
         Ok(out)
     }
+}
 
-    /// Broadcasts `tx`; a transaction the node already has counts as success.
-    pub fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError> {
+/// bitcoind is the first `ChainBackend`: chain data from the node's RPC, locks tracked by the
+/// watch-only wallet (`watch_contract`, `lock_view`), and broadcast over `sendrawtransaction`.
+impl ChainBackend for ChainNode {
+    fn network(&self) -> Network {
+        self.network
+    }
+
+    fn height(&self) -> Result<u32, NodeError> {
+        Ok(self
+            .rpc
+            .call("getblockcount", json!([]))?
+            .as_u64()
+            .unwrap_or_default() as u32)
+    }
+
+    /// The watch wallet knows this transaction because it pays a watched contract.
+    fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
+        let got = self
+            .watch
+            .call("gettransaction", json!([txid.to_string(), true]))?;
+        parse(&got["hex"])
+    }
+
+    fn watch_contract(&self, contract: &Contract) -> Result<(), NodeError> {
+        let desc = format!("addr({})", self.address(contract));
+        let info = self.rpc.call("getdescriptorinfo", json!([desc]))?;
+        let desc = format!("{desc}#{}", info["checksum"].as_str().unwrap_or_default());
+        let result = self.watch.call(
+            "importdescriptors",
+            json!([[{"desc": desc, "timestamp": "now"}]]),
+        )?;
+        match result[0]["success"].as_bool() {
+            Some(true) => Ok(()),
+            _ => Err(NodeError::Unexpected(format!(
+                "importdescriptors: {result}"
+            ))),
+        }
+    }
+
+    fn lock_view(
+        &self,
+        contract: &Contract,
+        amount: Amount,
+        ours: &[ScriptBuf],
+    ) -> Result<Option<LockView>, NodeError> {
+        let address = self.address(contract).to_string();
+        let history = self
+            .watch
+            .call("listtransactions", json!(["*", 1000, 0, true]))?;
+        let entries = history.as_array().cloned().unwrap_or_default();
+        let live = |e: &Value| e["confirmations"].as_i64().unwrap_or(-1) >= 0;
+        let receives: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["category"] == "receive" && e["address"] == address.as_str() && live(e))
+            .collect();
+        let exact = receives.iter().find(|e| {
+            Amount::from_btc(e["amount"].as_f64().unwrap_or_default()).ok() == Some(amount)
+        });
+        let Some(entry) = exact.or(receives.first()) else {
+            return Ok(None);
+        };
+        let outpoint = OutPoint {
+            txid: entry["txid"]
+                .as_str()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| NodeError::Unexpected("txid".into()))?,
+            vout: entry["vout"].as_u64().unwrap_or_default() as u32,
+        };
+        let height = self.height()?;
+        let confirmations = entry["confirmations"].as_u64().unwrap_or_default() as u32;
+        let confirmed_height = (confirmations > 0).then(|| height + 1 - confirmations);
+
+        let mut spend = None;
+        let mut seen = HashSet::new();
+        for e in entries
+            .iter()
+            .filter(|e| e["category"] == "send" && live(e))
+        {
+            let txid: Txid = match e["txid"].as_str().and_then(|t| t.parse().ok()) {
+                Some(t) => t,
+                None => continue,
+            };
+            if !seen.insert(txid) {
+                continue;
+            }
+            let tx: Transaction = parse(
+                &self
+                    .watch
+                    .call("gettransaction", json!([txid.to_string(), true]))?["hex"],
+            )?;
+            if tx.input.iter().any(|i| i.previous_output == outpoint) {
+                spend = Some(SpendView {
+                    preimage: extract_preimage(&tx, contract),
+                    depth: e["confirmations"].as_u64().unwrap_or_default() as u32,
+                    ours: tx.output.iter().any(|o| ours.contains(&o.script_pubkey)),
+                });
+                break;
+            }
+        }
+        let value = Amount::from_btc(entry["amount"].as_f64().unwrap_or_default())
+            .map_err(|e| NodeError::Unexpected(e.to_string()))?;
+        Ok(Some(LockView {
+            outpoint,
+            value,
+            amount_ok: exact.is_some(),
+            confirmed_height,
+            spend,
+            // The node does not know a swap's fee terms; the engine sets the counterparty lock's
+            // fee state after verifying it (design 0010). Our own lock stays NotRequired.
+            fee: FeeState::NotRequired,
+        }))
+    }
+
+    fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError> {
         match self
             .rpc
             .call("sendrawtransaction", json!([serialize_hex(tx)]))
