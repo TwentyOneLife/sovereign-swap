@@ -56,14 +56,34 @@ impl Chain {
 /// Below this a swap output is not worth making; also keeps both sides clear of dust.
 pub const MIN_SWAP_AMOUNT: Amount = Amount::from_sat(10_000);
 
-/// The voluntary fee terms an offer carries (design 0010). Both sides pay and verify against these,
-/// so the terms are never taken from one side's local settings; `None` on an offer means no fee.
+/// The voluntary fee terms an offer carries (design 0010, 0013). Both sides pay and verify against
+/// these, so the terms are never taken from one side's local settings; `None` on an offer means no
+/// fee. The address is per chain: each side pays to the address for the chain it locks. The two
+/// chains share Bitcoin's address format, so the fields are kept separate by construction to stop a
+/// BTC and an xBTC address being confused (design 0013). `deny_unknown_fields` makes an offer of the
+/// old single-address shape fail to parse rather than silently drop the fee.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeeTerms {
     pub maker_bps: u16,
     pub taker_bps: u16,
-    /// The operator's silent payment (BIP352) address the fee output pays.
-    pub sp_address: String,
+    /// Fee address for the side locking BTC; `None` means no fee on that chain. A silent payment
+    /// (`sp1...`) or a normal address.
+    #[serde(default)]
+    pub btc_address: Option<String>,
+    /// Fee address for the side locking xBTC; `None` means no fee on that chain.
+    #[serde(default)]
+    pub xbtc_address: Option<String>,
+}
+
+impl FeeTerms {
+    /// The fee address the side locking `chain` pays to, if the offer sets one for that chain.
+    pub fn address(&self, chain: Chain) -> Option<&str> {
+        match chain {
+            Chain::Btc => self.btc_address.as_deref(),
+            Chain::Xbtc => self.xbtc_address.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

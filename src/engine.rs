@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::fee::{self, FeeRates};
 use crate::htlc::{Contract, Spend};
 use crate::keys::{Keys, Use};
-use crate::node::{ChainNode, NodeError};
+use crate::node::{ChainNode, FeeDest, NodeError};
 use crate::policy::{Policy, PolicyError};
-use crate::silentpayments::{self, SilentPaymentAddress};
+use crate::silentpayments;
 use crate::store::write_atomic;
 use crate::swap::{
     Action, BidError, Chain, ChainView, FeeProof, FeeState, Message, Offer, Phase, Role, Swap,
@@ -398,16 +398,28 @@ impl<T: Transport> Engine<T> {
         })
     }
 
-    /// The fee state of the counterparty's lock `lock_txid` on `cp_chain` (design 0010): no fee set
-    /// in the offer is `NotRequired`; no proof yet or the lock not readable is `Pending`; a present,
-    /// proven fee output of at least the required amount is `Verified`; anything else is `Failed`.
+    /// The fee state of the counterparty's lock `lock_txid` on `cp_chain` (design 0010, 0013): no fee
+    /// set for the counterparty's chain is `NotRequired`; the lock not readable (or, for a silent
+    /// payment fee, no proof yet) is `Pending`; a fee output of at least the required amount, paying
+    /// the agreed address (directly for a normal address, or by the DLEQ proof for a silent payment),
+    /// is `Verified`; anything else is `Failed`.
     fn fee_state(&self, record: &Record, lock_txid: Txid, cp_chain: &ChainNode) -> FeeState {
         let swap = &record.swap;
         let Some(terms) = &swap.offer.fee else {
             return FeeState::NotRequired;
         };
-        let Some(proof) = &record.received_fee else {
-            return FeeState::Pending;
+        // The counterparty pays its fee on the chain it locks (design 0013). If the offer sets no fee
+        // address for that chain, the counterparty owes no fee output and there is nothing to check.
+        let cp_chain_id = match swap.role {
+            Role::Maker => swap.offer.maker_chain.other(),
+            Role::Taker => swap.offer.maker_chain,
+        };
+        let Some(fee_address) = terms.address(cp_chain_id) else {
+            return FeeState::NotRequired;
+        };
+        let dest = match FeeDest::parse(fee_address, cp_chain.network()) {
+            Ok(dest) => dest,
+            Err(_) => return FeeState::Failed, // a malformed or wrong-network fee address
         };
         let cp_role = swap.role.other();
         let cp_locked = match cp_role {
@@ -421,55 +433,73 @@ impl<T: Transport> Engine<T> {
         let Ok(required) = fee::fee_amount(rates, cp_role, cp_locked) else {
             return FeeState::Failed;
         };
-        let Ok(recipient) = SilentPaymentAddress::parse(&terms.sp_address) else {
-            return FeeState::Failed;
-        };
-        if recipient.network != cp_chain.network() {
-            return FeeState::Failed; // a fee address for the wrong network
-        }
-        let Ok(proof_bytes) = <[u8; 64]>::try_from(proof.proof.as_slice()) else {
-            return FeeState::Failed;
-        };
         let Ok(lock_tx) = cp_chain.get_tx(lock_txid) else {
             return FeeState::Pending; // not on chain yet, or not readable: wait
         };
-        // Authenticate each input's public key from the proof's prevout transactions.
-        let mut pubkeys = Vec::new();
-        let mut outpoints = Vec::new();
-        for input in &lock_tx.input {
-            outpoints.push(input.previous_output);
-            let Some(prevout) = proof
-                .prevouts
-                .iter()
-                .find(|t| t.compute_txid() == input.previous_output.txid)
-            else {
-                return FeeState::Failed;
-            };
-            let Some(txout) = prevout.output.get(input.previous_output.vout as usize) else {
-                return FeeState::Failed;
-            };
-            if let Some(pk) = silentpayments::input_pubkey(
-                &txout.script_pubkey,
-                &input.script_sig,
-                &input.witness,
-            ) {
-                pubkeys.push(pk);
+        match dest {
+            // A normal address is verified directly: the lock must carry an output paying it at least
+            // the required amount. No proof is involved (design 0013).
+            FeeDest::Normal(addr) => {
+                let spk = addr.script_pubkey();
+                if lock_tx
+                    .output
+                    .iter()
+                    .any(|o| o.script_pubkey == spk && o.value >= required)
+                {
+                    FeeState::Verified
+                } else {
+                    FeeState::Failed
+                }
             }
-        }
-        let share = proof.share.serialize();
-        if silentpayments::verify_fee(
-            self.keys.secp(),
-            &pubkeys,
-            &outpoints,
-            &recipient,
-            &share,
-            &proof_bytes,
-            &lock_tx.output,
-            required,
-        ) {
-            FeeState::Verified
-        } else {
-            FeeState::Failed
+            // A silent payment output is unlinkable, so the payer reveals a DLEQ share and proof the
+            // counterparty authenticates against the lock's inputs (design 0010).
+            FeeDest::SilentPayment(recipient) => {
+                let Some(proof) = &record.received_fee else {
+                    return FeeState::Pending;
+                };
+                let Ok(proof_bytes) = <[u8; 64]>::try_from(proof.proof.as_slice()) else {
+                    return FeeState::Failed;
+                };
+                // Authenticate each input's public key from the proof's prevout transactions.
+                let mut pubkeys = Vec::new();
+                let mut outpoints = Vec::new();
+                for input in &lock_tx.input {
+                    outpoints.push(input.previous_output);
+                    let Some(prevout) = proof
+                        .prevouts
+                        .iter()
+                        .find(|t| t.compute_txid() == input.previous_output.txid)
+                    else {
+                        return FeeState::Failed;
+                    };
+                    let Some(txout) = prevout.output.get(input.previous_output.vout as usize)
+                    else {
+                        return FeeState::Failed;
+                    };
+                    if let Some(pk) = silentpayments::input_pubkey(
+                        &txout.script_pubkey,
+                        &input.script_sig,
+                        &input.witness,
+                    ) {
+                        pubkeys.push(pk);
+                    }
+                }
+                let share = proof.share.serialize();
+                if silentpayments::verify_fee(
+                    self.keys.secp(),
+                    &pubkeys,
+                    &outpoints,
+                    &recipient,
+                    &share,
+                    &proof_bytes,
+                    &lock_tx.output,
+                    required,
+                ) {
+                    FeeState::Verified
+                } else {
+                    FeeState::Failed
+                }
+            }
         }
     }
 
@@ -551,30 +581,28 @@ impl<T: Transport> Engine<T> {
                 None => {
                     let other = &self.nodes[&own_chain.other()].rpc;
                     let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
-                    // The voluntary fee (design 0010): terms come from the offer, the amount from
-                    // our role and what we lock. If the offer sets terms we cannot honour (a bad
-                    // address, or a trade below the minimum), funding fails loudly: we never lock
-                    // without the fee the counterparty will look for.
-                    let fee = match &swap.offer.fee {
+                    // The voluntary fee (design 0010, 0013): terms come from the offer, the address
+                    // for the chain we lock, the amount from our role and what we lock. If the offer
+                    // sets no fee address for our chain, we lock without a fee output. If it sets one
+                    // we cannot honour (a bad address, or a trade below the minimum), funding fails
+                    // loudly: we never lock without the fee the counterparty will look for.
+                    let fee = match swap
+                        .offer
+                        .fee
+                        .as_ref()
+                        .and_then(|terms| terms.address(own_chain).map(|a| (terms, a)))
+                    {
                         None => None,
-                        Some(terms) => {
-                            let addr =
-                                SilentPaymentAddress::parse(&terms.sp_address).map_err(|e| {
-                                    NodeError::Unexpected(format!("fee address: {e:?}"))
-                                })?;
-                            if addr.network != self.nodes[&own_chain].network() {
-                                return Err(NodeError::Unexpected(
-                                    "fee address is for the wrong network".into(),
-                                )
-                                .into());
-                            }
+                        Some((terms, fee_address)) => {
+                            let dest =
+                                FeeDest::parse(fee_address, self.nodes[&own_chain].network())?;
                             let rates = FeeRates {
                                 maker_bps: terms.maker_bps,
                                 taker_bps: terms.taker_bps,
                             };
                             let amount = fee::fee_amount(rates, swap.role, lock_amount)
                                 .map_err(|e| NodeError::Unexpected(format!("fee amount: {e:?}")))?;
-                            Some((amount, addr))
+                            Some((amount, dest))
                         }
                     };
                     let (tx, fee_proof) = self.nodes[&own_chain].fund(
@@ -583,7 +611,7 @@ impl<T: Transport> Engine<T> {
                         self.config.fee_rate_sat_vb,
                         self.config.policy.funding_minconf(own_chain),
                         other,
-                        fee.as_ref().map(|(a, addr)| (*a, addr)),
+                        fee.as_ref().map(|(a, dest)| (*a, dest)),
                     )?;
                     self.records[i].funding = Some(tx.clone());
                     self.records[i].fee = fee_proof;

@@ -255,7 +255,8 @@ fn swap_with_fees_completes_end_to_end() {
     let fee = FeeTerms {
         maker_bps: 20,
         taker_bps: 30,
-        sp_address: recipient.encode(),
+        btc_address: Some(recipient.encode()),
+        xbtc_address: Some(recipient.encode()),
     };
     let fee_offer = Offer {
         fee: Some(fee),
