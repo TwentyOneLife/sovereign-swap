@@ -1,7 +1,9 @@
 # 0013 Fee collection: silent payment or normal address, with daemon-side chain scanning
 
-Status: design. Extends 0010 (which made the fee a silent-payment-only output). The per-chain fee
-address decision is tracked in issue #45. No code yet.
+Status: partly implemented. Extends 0010 (which made the fee a silent-payment-only output). The
+per-chain fee address choice (silent payment or normal: `FeeTerms.btc_address`/`xbtc_address`,
+`FeeDest`, `fee_state`) is implemented and released; the daemon-side chain scanner for silent-payment
+collection is open in a separate PR. The per-chain fee address decision was tracked in issue #45.
 
 This note adds two things the operator asked for: a choice, per chain, between a silent payment
 address and a normal address for the fee, and a daemon-side way to detect and collect silent-payment
