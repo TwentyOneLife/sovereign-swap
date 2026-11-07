@@ -84,6 +84,17 @@ pub struct Engine<T: Transport> {
     nodes: HashMap<Chain, ChainNode>,
     transport: T,
     config: Config,
+    /// Smallest swap leg either side will bid or accept, in sats. Defaults to
+    /// [`crate::swap::MIN_SWAP_AMOUNT`] and is lowered only by a deployment that wants to offer a
+    /// small real-rate leg. Threaded into the bid validation ([`Offer::taker_part_min`]); a safety
+    /// floor on the setting (see `daemon::types::MIN_SWAP_FLOOR_SAT`) keeps the leg spendable after
+    /// the spend fee.
+    min_swap_sat: u64,
+    /// Smallest trade the voluntary-fee path acts on, in sats. Defaults to [`crate::fee::MIN_TRADE_SAT`]
+    /// and is lowered only by a deployment that wants the fee to apply to a small (real-rate dust)
+    /// leg. Threaded into both fee paths (funding and verify) so a funder and its counterparty agree.
+    /// The fee floor ([`crate::fee::FLOOR_SAT`]) is deliberately not configurable: it guards dust.
+    min_trade_sat: u64,
     state: State,
     records: Vec<Record>,
     /// Tests only: drop this many broadcasts instead of sending them.
@@ -123,11 +134,27 @@ impl<T: Transport> Engine<T> {
             nodes: HashMap::from([(Chain::Btc, btc), (Chain::Xbtc, xbtc)]),
             transport,
             config,
+            min_swap_sat: crate::swap::MIN_SWAP_AMOUNT.to_sat(),
+            min_trade_sat: crate::fee::MIN_TRADE_SAT,
             state,
             records,
             drop_broadcasts: 0,
             lock_amount_override: None,
         })
+    }
+
+    /// Overrides the minimum swap leg bids are checked against, replacing the
+    /// [`crate::swap::MIN_SWAP_AMOUNT`] default. Call it right after [`Engine::open`], before the
+    /// first tick; the daemon sets it from the operator's configured `min_swap_sat`.
+    pub fn set_min_swap_sat(&mut self, min_swap_sat: u64) {
+        self.min_swap_sat = min_swap_sat;
+    }
+
+    /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
+    /// default. Call it right after [`Engine::open`], before the first tick; the daemon sets it from
+    /// the operator's configured `min_trade_sat`.
+    pub fn set_min_trade_sat(&mut self, min_trade_sat: u64) {
+        self.min_trade_sat = min_trade_sat;
     }
 
     pub fn swaps(&self) -> impl Iterator<Item = &Swap> {
@@ -189,7 +216,9 @@ impl<T: Transport> Engine<T> {
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
         }
-        let taker_part = offer.taker_part(maker_part).map_err(EngineError::Bid)?;
+        let taker_part = offer
+            .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
+            .map_err(EngineError::Bid)?;
         self.config
             .policy
             .depths(offer, maker_part, taker_part)
@@ -236,7 +265,9 @@ impl<T: Transport> Engine<T> {
                 if self.records.iter().any(|r| r.swap.id == swap_id) {
                     return Ok(());
                 }
-                let Ok(taker_part) = offer.taker_part(maker_part) else {
+                let Ok(taker_part) =
+                    offer.taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
+                else {
                     return Ok(());
                 };
                 let Ok(depths) = self.config.policy.depths(&offer, maker_part, taker_part) else {
@@ -288,7 +319,9 @@ impl<T: Transport> Engine<T> {
                     return Ok(());
                 };
                 let (_, offer, maker_part, index) = self.state.bids[pos].clone();
-                let taker_part = offer.taker_part(maker_part).map_err(EngineError::Bid)?;
+                let taker_part = offer
+                    .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
+                    .map_err(EngineError::Bid)?;
                 let depths = self
                     .config
                     .policy
@@ -439,7 +472,8 @@ impl<T: Transport> Engine<T> {
             maker_bps: terms.maker_bps,
             taker_bps: terms.taker_bps,
         };
-        let Ok(required) = fee::fee_amount(rates, cp_role, cp_locked) else {
+        let Ok(required) = fee::fee_amount_min(rates, cp_role, cp_locked, self.min_trade_sat)
+        else {
             return FeeState::Failed;
         };
         let Ok(lock_tx) = cp_chain.get_tx(lock_txid) else {
@@ -609,8 +643,13 @@ impl<T: Transport> Engine<T> {
                                 maker_bps: terms.maker_bps,
                                 taker_bps: terms.taker_bps,
                             };
-                            let amount = fee::fee_amount(rates, swap.role, lock_amount)
-                                .map_err(|e| NodeError::Unexpected(format!("fee amount: {e:?}")))?;
+                            let amount = fee::fee_amount_min(
+                                rates,
+                                swap.role,
+                                lock_amount,
+                                self.min_trade_sat,
+                            )
+                            .map_err(|e| NodeError::Unexpected(format!("fee amount: {e:?}")))?;
                             Some((amount, dest))
                         }
                     };

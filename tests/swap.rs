@@ -267,6 +267,42 @@ fn swap_with_fees_completes_end_to_end() {
     w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
 }
 
+/// The configurable minimum trade (settings `min_trade_sat`, design 0010): lowered on both engines,
+/// the voluntary fee applies to legs below the 100_000 sat default, and the swap completes. Reaching
+/// Done proves the override reached BOTH fee paths on both parties: each funds its lock with a fee
+/// output (the funding path) and verifies the counterparty's (the verify path). With the default
+/// minimum these sub-100k legs would make the fee BelowMinimum, so funding would error and the
+/// counterparty's fee would verify as Failed.
+#[test]
+fn a_lowered_min_trade_lets_the_fee_apply_to_a_small_swap() {
+    let Some(w) = World::start() else { return };
+    let secp = Secp256k1::new();
+    let recipient = SilentPaymentAddress {
+        scan: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x55; 32]).unwrap()),
+        spend: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x66; 32]).unwrap()),
+        network: Network::Regtest,
+    };
+    let fee = FeeTerms {
+        maker_bps: 20,
+        taker_bps: 30,
+        btc_address: Some(recipient.encode()),
+        xbtc_address: Some(recipient.encode()),
+    };
+    // Both legs sit below the 100_000 sat default minimum trade but above the swap floor.
+    let small = Offer {
+        maker_amount: Amount::from_sat(90_000),
+        taker_amount: Amount::from_sat(60_000),
+        min_maker_amount: Amount::from_sat(90_000),
+        fee: Some(fee),
+        ..offer(Chain::Xbtc)
+    };
+    let (mut maker, mut taker) = w.parties_offer(small.clone(), Chain::Xbtc, small.maker_amount);
+    // Lower the minimum on both engines, as a test deployment would through its settings.
+    maker.engine().set_min_trade_sat(1_000);
+    taker.engine().set_min_trade_sat(1_000);
+    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+}
+
 #[test]
 fn swap_maker_sells_btc() {
     let Some(w) = World::start() else { return };
@@ -337,6 +373,34 @@ fn an_engine_does_not_bid_on_its_own_offer() {
         maker.engine().bid(&offer, offer.maker_amount, [9; 16]),
         Err(EngineError::Bid(BidError::OwnOffer))
     ));
+}
+
+/// The configurable minimum swap leg (settings `min_swap_sat`): the engine refuses a bid for a leg
+/// below the 10_000 sat default, and accepts the same bid once the minimum is lowered. This is the
+/// bid side of the gate; the offer side is covered by `NewOffer::validate` in the daemon tests.
+#[test]
+fn a_lowered_min_swap_lets_a_small_leg_be_bid() {
+    let Some(w) = World::start() else { return };
+    let (a, _b) = memory_pair();
+    let mut taker = Party::new("taker", a, &w.btc, &w.xbtc);
+    // A 1:1 offer whose full leg (4_000 sat) is below the default minimum.
+    let small = Offer {
+        maker_amount: Amount::from_sat(4_000),
+        taker_amount: Amount::from_sat(4_000),
+        min_maker_amount: Amount::ZERO,
+        ..offer(Chain::Xbtc)
+    };
+    // At the default minimum the bid is refused.
+    assert!(matches!(
+        taker.engine().bid(&small, Amount::from_sat(4_000), [1; 16]),
+        Err(EngineError::Bid(BidError::BelowMinimum))
+    ));
+    // Lowered, the same bid is accepted.
+    taker.engine().set_min_swap_sat(3_000);
+    assert!(taker
+        .engine()
+        .bid(&small, Amount::from_sat(4_000), [2; 16])
+        .is_ok());
 }
 
 /// Replay, engine level: a maker whose only xBTC coins also exist on BTC must not lock them.

@@ -7,8 +7,15 @@ use crate::swap::{Chain as SwapChain, FeeTerms, Offer as SwapOffer};
 use super::engine::{engine_config, MAKER_LOCK_BLOCKS, TAKER_LOCK_BLOCKS};
 use super::wire::random16;
 
-/// Below this an amount is dust; an offer under it is refused.
+/// The default smallest swap leg; an offer under it is refused. The runtime value is the configurable
+/// `min_swap_sat` setting, which defaults to this.
 pub(crate) const DUST_SAT: u64 = 10_000;
+
+/// The hard safety floor a configured `min_swap_sat` may be lowered to. The claim and refund each
+/// subtract the flat spend fee (`Amount::from_sat(2_000)`, see the engine config) from the leg, and
+/// the remainder must stay above Bitcoin's dust limit (~330 sat). At the floor, 3_000 - 2_000 = 1_000
+/// sat, safely above dust. A setting below this is rejected at config load.
+pub(crate) const MIN_SWAP_FLOOR_SAT: u64 = 3_000;
 
 /// A sane band for a swap price, so a fat-fingered or hostile rate is caught before it is published.
 pub(crate) const MIN_PRICE: f64 = 0.5;
@@ -103,6 +110,23 @@ pub struct Settings {
     pub btc_conf: u32,
     pub xbtc_conf: u32,
     pub margin_blocks: u16,
+    /// Smallest swap leg this deployment will offer, bid or accept, in sats. Defaults to `DUST_SAT`
+    /// (10_000), so existing configs are unchanged. Lower it only on a deployment that wants to offer
+    /// a small real-rate leg (xBTC is far cheaper than BTC, so a realistic swap's BTC side is tiny).
+    /// Validated `>= MIN_SWAP_FLOOR_SAT` so the leg stays spendable after the claim/refund spend fee.
+    /// Enforced in two places from this one value: the offer form (`NewOffer::validate`) and the
+    /// engine's bid validation.
+    #[serde(default = "default_min_swap_sat")]
+    pub min_swap_sat: u64,
+    /// Smallest trade the voluntary-fee path acts on, in sats. Defaults to the production
+    /// `MIN_TRADE_SAT` (100_000), so existing configs are unchanged. Lower it only on a test
+    /// deployment that wants the fee to apply to a small (real-rate dust) leg, where xBTC being far
+    /// cheaper than BTC makes a realistic swap's BTC side tiny. Both counterparties must set the same
+    /// value: `FeeTerms` does not carry it, so a mismatch fails safely (the verifier marks the fee
+    /// `Failed`, or funding errors loudly, before anything commits) and never loses funds. The fee
+    /// floor is not configurable; it guards Bitcoin's dust limit.
+    #[serde(default = "default_min_trade_sat")]
+    pub min_trade_sat: u64,
     /// Node RPC credentials. Local to the daemon (data dir, mode 600); not a key to funds (the
     /// funding wallet is watch-only, 0008). Absent in older config, hence `serde(default)`.
     #[serde(default)]
@@ -159,6 +183,12 @@ pub struct Settings {
 /// the real defaults far below this). One percent is already well above any sane swap fee.
 pub(crate) const MAX_FEE_BPS: u16 = 100;
 
+fn default_min_swap_sat() -> u64 {
+    DUST_SAT
+}
+fn default_min_trade_sat() -> u64 {
+    crate::fee::MIN_TRADE_SAT
+}
 fn default_fee_maker_bps() -> u16 {
     20
 }
@@ -179,6 +209,8 @@ impl Default for Settings {
             btc_conf: 1,
             xbtc_conf: 2,
             margin_blocks: 2,
+            min_swap_sat: default_min_swap_sat(),
+            min_trade_sat: default_min_trade_sat(),
             btc_rpc_user: String::new(),
             btc_rpc_pass: String::new(),
             xbtc_rpc_user: String::new(),
@@ -231,6 +263,14 @@ impl Settings {
         }
         if self.margin_blocks < 1 || self.margin_blocks > 1000 {
             e.push("margin_blocks: 1..=1000".to_owned());
+        }
+        if self.min_swap_sat < MIN_SWAP_FLOOR_SAT {
+            e.push(format!(
+                "min_swap_sat: at least {MIN_SWAP_FLOOR_SAT} (claim/refund subtract the 2000 sat spend fee; the remainder must clear dust)"
+            ));
+        }
+        if self.min_trade_sat < 1 {
+            e.push("min_trade_sat: at least 1".to_owned());
         }
         if self.fee_maker_bps > MAX_FEE_BPS {
             e.push(format!("fee_maker_bps: 0..={MAX_FEE_BPS}"));
@@ -288,24 +328,63 @@ fn looks_like_sp_address(a: &str) -> bool {
 pub(crate) struct NewOffer {
     pub(crate) sell_chain: Chain,
     pub(crate) amount_sat: u64,
-    pub(crate) price: f64,
+    /// The relative price (counter amount = `amount_sat * price`). Mutually exclusive with
+    /// `counter_amount_sat`: set exactly one. The price path is band-checked (`MIN_PRICE..=MAX_PRICE`)
+    /// and rounds through an f64, so it fits parity-ish offers but cannot express a lopsided rate
+    /// precisely.
+    #[serde(default)]
+    pub(crate) price: Option<f64>,
+    /// The exact counter amount in sats, given directly rather than as a price. Mutually exclusive
+    /// with `price`. Use this for a lopsided real-rate offer (xBTC is far cheaper than BTC, so the
+    /// price would fall outside the band and the f64 round-trip would lose precision); the integer
+    /// amount removes both problems, so the band check is skipped and the amount is taken verbatim.
+    #[serde(default)]
+    pub(crate) counter_amount_sat: Option<u64>,
     pub(crate) min_amount_sat: u64,
 }
 
 impl NewOffer {
-    pub(crate) fn validate(&self) -> Vec<String> {
+    /// Validates the form against the operator's configured smallest leg `min_swap_sat` (which
+    /// defaults to [`DUST_SAT`]). Every "smallest leg" bound, both legs and the per-bid minimum, is
+    /// this one value, so lowering the setting lets a small real-rate offer through; the engine's bid
+    /// validation enforces the same value on the other side.
+    pub(crate) fn validate(&self, min_swap_sat: u64) -> Vec<String> {
         let mut e = Vec::new();
-        if self.amount_sat < DUST_SAT {
-            e.push(format!("amount_sat: below dust ({DUST_SAT})"));
+        if self.amount_sat < min_swap_sat {
+            e.push(format!(
+                "amount_sat: below the minimum leg ({min_swap_sat})"
+            ));
         }
         if self.amount_sat > 21_000_000 * 100_000_000 {
             e.push("amount_sat: above the supply cap".to_owned());
         }
-        if !(self.price.is_finite() && (MIN_PRICE..=MAX_PRICE).contains(&self.price)) {
-            e.push(format!("price: expected {MIN_PRICE}..={MAX_PRICE}"));
+        // Exactly one of `price` or `counter_amount_sat`. The band check guards only the float price
+        // path; an exact counter amount is a plain minimum-leg-and-cap check, with no band.
+        match (self.price, self.counter_amount_sat) {
+            (Some(_), Some(_)) => {
+                e.push("price and counter_amount_sat: set exactly one, not both".to_owned());
+            }
+            (None, None) => {
+                e.push("price or counter_amount_sat: one is required".to_owned());
+            }
+            (Some(price), None) => {
+                if !(price.is_finite() && (MIN_PRICE..=MAX_PRICE).contains(&price)) {
+                    e.push(format!("price: expected {MIN_PRICE}..={MAX_PRICE}"));
+                }
+            }
+            (None, Some(counter)) => {
+                if counter < min_swap_sat {
+                    e.push(format!(
+                        "counter_amount_sat: below the minimum leg ({min_swap_sat})"
+                    ));
+                }
+                if counter > 21_000_000 * 100_000_000 {
+                    e.push("counter_amount_sat: above the supply cap".to_owned());
+                }
+            }
         }
-        if self.min_amount_sat < DUST_SAT || self.min_amount_sat > self.amount_sat {
-            e.push("min_amount_sat: between dust and amount_sat".to_owned());
+        if self.min_amount_sat < min_swap_sat || self.min_amount_sat > self.amount_sat {
+            e.push("min_amount_sat: between the minimum leg and amount_sat".to_owned());
         }
         e
     }
@@ -317,7 +396,16 @@ impl NewOffer {
             Chain::Btc => SwapChain::Btc,
             Chain::Xbtc => SwapChain::Xbtc,
         };
-        let taker_amount = Amount::from_sat((self.amount_sat as f64 * self.price).round() as u64);
+        // Validation guarantees exactly one of the two is set. An exact counter amount is taken
+        // verbatim; otherwise the relative price rounds through an f64. The `(None, None)` arm is
+        // unreachable after `validate`; fall back to a 1:1 amount rather than panic.
+        let taker_amount = match (self.counter_amount_sat, self.price) {
+            (Some(counter), _) => Amount::from_sat(counter),
+            (None, Some(price)) => {
+                Amount::from_sat((self.amount_sat as f64 * price).round() as u64)
+            }
+            (None, None) => Amount::from_sat(self.amount_sat),
+        };
         let maker_amount = Amount::from_sat(self.amount_sat);
         let margin = s.margin_blocks as u32;
         // Size the timelocks to the amount from policy, so a larger offer (needing deeper
@@ -444,7 +532,8 @@ mod tests {
         NewOffer {
             sell_chain: Chain::Xbtc,
             amount_sat: 50_000_000,
-            price: 1.0,
+            price: Some(1.0),
+            counter_amount_sat: None,
             min_amount_sat: 50_000_000,
         }
     }
@@ -522,6 +611,137 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().iter().any(|m| m.contains("fee_maker_bps")));
+    }
+
+    #[test]
+    fn min_trade_sat_defaults_to_the_production_value_and_validates() {
+        // No config: the production default, and nothing changes for existing installs.
+        let s = Settings::default();
+        assert_eq!(s.min_trade_sat, 100_000);
+        assert!(s.validate().is_empty(), "the default must validate");
+        // Config written before the field existed still deserializes with the default.
+        let old = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":[],
+            "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.min_trade_sat, 100_000);
+        // A lowered value validates; zero is refused.
+        let low = Settings {
+            min_trade_sat: 50,
+            ..Default::default()
+        };
+        assert!(low.validate().is_empty(), "a lowered minimum is accepted");
+        let zero = Settings {
+            min_trade_sat: 0,
+            ..Default::default()
+        };
+        assert!(zero.validate().iter().any(|m| m.contains("min_trade_sat")));
+    }
+
+    #[test]
+    fn an_exact_counter_amount_skips_the_price_band() {
+        // A real-rate offer: xBTC far cheaper than BTC, so the implied price (287) is far outside the
+        // [0.5, 2.0] band. Given as an exact counter amount it validates, and the taker amount is
+        // taken verbatim with no float round-trip.
+        let o = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 1_000_000,
+            price: None,
+            counter_amount_sat: Some(287_000_000),
+            min_amount_sat: 1_000_000,
+        };
+        assert!(
+            o.validate(DUST_SAT).is_empty(),
+            "an exact counter amount is not band-checked: {:?}",
+            o.validate(DUST_SAT)
+        );
+        let swap = o.into_swap_offer(&Settings::default());
+        assert_eq!(swap.taker_amount, Amount::from_sat(287_000_000));
+    }
+
+    #[test]
+    fn price_and_counter_amount_are_mutually_exclusive() {
+        // Both set: refused.
+        let both = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 1_000_000,
+            price: Some(1.0),
+            counter_amount_sat: Some(1_000_000),
+            min_amount_sat: 1_000_000,
+        };
+        assert!(both
+            .validate(DUST_SAT)
+            .iter()
+            .any(|m| m.contains("exactly one")));
+        // Neither set: refused.
+        let neither = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 1_000_000,
+            price: None,
+            counter_amount_sat: None,
+            min_amount_sat: 1_000_000,
+        };
+        assert!(neither
+            .validate(DUST_SAT)
+            .iter()
+            .any(|m| m.contains("one is required")));
+    }
+
+    #[test]
+    fn min_swap_sat_defaults_and_has_a_safety_floor() {
+        // No config: the default smallest leg, and nothing changes for existing installs.
+        let s = Settings::default();
+        assert_eq!(s.min_swap_sat, DUST_SAT);
+        assert!(s.validate().is_empty(), "the default must validate");
+        // Config written before the field existed still deserializes with the default.
+        let old = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":[],
+            "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.min_swap_sat, DUST_SAT);
+        // At the floor it validates; one sat below the floor is rejected.
+        let at_floor = Settings {
+            min_swap_sat: MIN_SWAP_FLOOR_SAT,
+            ..Default::default()
+        };
+        assert!(at_floor.validate().is_empty(), "the floor is accepted");
+        let below = Settings {
+            min_swap_sat: MIN_SWAP_FLOOR_SAT - 1,
+            ..Default::default()
+        };
+        assert!(below.validate().iter().any(|m| m.contains("min_swap_sat")));
+    }
+
+    #[test]
+    fn a_lowered_min_swap_lets_a_small_leg_be_offered() {
+        // A 4_000-sat leg: refused at the default minimum, accepted once the setting is lowered. Both
+        // the price form and the exact-counter form honour the configured minimum.
+        let priced = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 4_000,
+            price: Some(1.0),
+            counter_amount_sat: None,
+            min_amount_sat: 4_000,
+        };
+        assert!(
+            !priced.validate(DUST_SAT).is_empty(),
+            "4_000 is below the 10_000 default"
+        );
+        assert!(
+            priced.validate(3_000).is_empty(),
+            "4_000 is accepted when the minimum is lowered: {:?}",
+            priced.validate(3_000)
+        );
+        let exact = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 4_000,
+            price: None,
+            counter_amount_sat: Some(4_000),
+            min_amount_sat: 4_000,
+        };
+        assert!(
+            exact.validate(3_000).is_empty(),
+            "an exact 4_000-sat counter leg is accepted when the minimum is lowered: {:?}",
+            exact.validate(3_000)
+        );
     }
 
     #[test]

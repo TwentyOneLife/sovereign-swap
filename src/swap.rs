@@ -53,7 +53,12 @@ impl Chain {
     }
 }
 
-/// Below this a swap output is not worth making; also keeps both sides clear of dust.
+/// The default smallest swap leg: below this a swap output is not worth making, and it keeps both
+/// sides clear of dust. The runtime value is configurable (daemon setting `min_swap_sat`, threaded
+/// into the engine) and defaults to this; the pure state machine takes it as an input, never a global.
+/// A deployment may lower it (down to a safety floor; see `daemon::types::MIN_SWAP_FLOOR_SAT`) to
+/// offer a small real-rate leg. The claim and refund each subtract the spend fee from the leg, so the
+/// floor keeps the remainder clear of Bitcoin's dust limit.
 pub const MIN_SWAP_AMOUNT: Amount = Amount::from_sat(10_000);
 
 /// The voluntary fee terms an offer carries (design 0010, 0013). Both sides pay and verify against
@@ -118,17 +123,25 @@ pub enum BidError {
 
 impl Offer {
     /// What the taker pays for `maker_part`, rounded down: both engines compute the same number.
+    /// Uses the default [`MIN_SWAP_AMOUNT`]; see [`Offer::taker_part_min`] for the configurable form.
     pub fn taker_part(&self, maker_part: Amount) -> Result<Amount, BidError> {
+        self.taker_part_min(maker_part, MIN_SWAP_AMOUNT)
+    }
+
+    /// As [`Offer::taker_part`], but with the smallest swap leg `min_swap` passed in rather than read
+    /// from the [`MIN_SWAP_AMOUNT`] default, so a deployment can lower the bound through config. The
+    /// state machine stays pure: the limit is an input, never a global read.
+    pub fn taker_part_min(&self, maker_part: Amount, min_swap: Amount) -> Result<Amount, BidError> {
         if maker_part > self.maker_amount {
             return Err(BidError::AboveOffer);
         }
-        if maker_part < self.min_maker_amount || maker_part < MIN_SWAP_AMOUNT {
+        if maker_part < self.min_maker_amount || maker_part < min_swap {
             return Err(BidError::BelowMinimum);
         }
         let part = u128::from(self.taker_amount.to_sat()) * u128::from(maker_part.to_sat())
             / u128::from(self.maker_amount.to_sat());
         let part = Amount::from_sat(part as u64);
-        if part < MIN_SWAP_AMOUNT {
+        if part < min_swap {
             return Err(BidError::BelowMinimum);
         }
         Ok(part)
@@ -578,6 +591,28 @@ mod tests {
         assert_eq!(
             tiny.taker_part(Amount::from_sat(400_000)),
             Err(BidError::BelowMinimum)
+        );
+    }
+
+    #[test]
+    fn a_lowered_min_swap_accepts_a_small_leg() {
+        // A 1:1 offer whose legs sit below the 10_000 sat default minimum.
+        let small = Offer {
+            maker_amount: Amount::from_sat(4_000),
+            taker_amount: Amount::from_sat(4_000),
+            min_maker_amount: Amount::ZERO,
+            ..offer()
+        };
+        // At the default minimum a 4_000-sat bid is refused.
+        assert_eq!(
+            small.taker_part(Amount::from_sat(4_000)),
+            Err(BidError::BelowMinimum)
+        );
+        // Lower the configured minimum and the same 4_000-sat bid is accepted on both the bid and
+        // the computed counter leg.
+        assert_eq!(
+            small.taker_part_min(Amount::from_sat(4_000), Amount::from_sat(3_000)),
+            Ok(Amount::from_sat(4_000))
         );
     }
 

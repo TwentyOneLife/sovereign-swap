@@ -188,9 +188,15 @@ Defence in depth, because the GUI is untrusted and replaceable:
    satoshis before it calls the API (which is integer-sats only, so no locale reaches the protocol);
    a string with both separators or more than eight decimals is refused, not guessed. The canonical
    normalizer is `daemon::parse_btc_to_sats`, which the GUI mirrors.
-2. **Daemon / API** - authoritative: amount above dust and above the offer's min fill, funds actually
-   available in the funding wallet, node reachable, rate within a sanity band, timelocks taken from
-   policy not the form. A bad request is rejected `422` with per-field reasons; the GUI shows them.
+2. **Daemon / API** - authoritative: amount above the configured minimum leg and above the offer's
+   min fill, funds actually available in the funding wallet, node reachable, rate within a sanity
+   band, timelocks taken from policy not the form. A bad request is rejected `422` with per-field
+   reasons; the GUI shows them. The minimum leg is the `min_swap_sat` setting (default 10,000 sat,
+   validated `>= 3,000` so the leg stays spendable after the claim/refund spend fee); lowering it lets
+   a small real-rate leg through. A `POST /offers` body gives the counter side either as `price`
+   (band-checked, rounded through an f64) or, mutually exclusive with it, as an exact
+   `counter_amount_sat` (no band, taken verbatim) for a lopsided real-rate offer whose price would
+   fall outside the sanity band.
 3. **Engine** - safety-critical invariants it already enforces and cannot be talked out of:
    confirmations and timelocks never below policy whatever an offer or form says (0002), the replay
    guard (0001), envelope verification (0005). The GUI and even the daemon API cannot lower these.
