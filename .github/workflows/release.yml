@@ -13,16 +13,17 @@ jobs:
       image: rust@sha256:ed2c95ca377d6571b124b05e75e01207973ded639dce7d5542eb7bcd797e32aa
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build the relay and the daemon (reproducible, pinned toolchain)
+      - name: Build the relay, the daemon and the reference signer (reproducible, pinned toolchain)
         run: |
           apt-get -qq update && apt-get -qq install -y --no-install-recommends gnupg >/dev/null
-          cargo build --locked --release --bin sovereign-swap-relay --bin sovereign-swap-daemon
+          cargo build --locked --release --bin sovereign-swap-relay --bin sovereign-swap-daemon --bin sovereign-swap-signer
           mkdir -p dist
           cp target/release/sovereign-swap-relay dist/sovereign-swap-relay-x86_64-linux
           cp target/release/sovereign-swap-daemon dist/sovereign-swap-daemon-x86_64-linux
+          cp target/release/sovereign-swap-signer dist/sovereign-swap-signer-x86_64-linux
       - name: Checksums
         working-directory: dist
-        run: sha256sum sovereign-swap-relay-x86_64-linux sovereign-swap-daemon-x86_64-linux > SHA256SUMS
+        run: sha256sum sovereign-swap-relay-x86_64-linux sovereign-swap-daemon-x86_64-linux sovereign-swap-signer-x86_64-linux > SHA256SUMS
       - name: Sign the checksums with the release key
         working-directory: dist
         env:
@@ -49,5 +50,6 @@ jobs:
           files: |
             dist/sovereign-swap-relay-x86_64-linux
             dist/sovereign-swap-daemon-x86_64-linux
+            dist/sovereign-swap-signer-x86_64-linux
             dist/SHA256SUMS
             dist/SHA256SUMS.asc
