@@ -60,10 +60,15 @@ pub struct Settings {
     /// fee output and no BIP352 code. Stays off until a legal opinion.
     #[serde(default)]
     pub fee_enabled: bool,
-    /// The operator's published silent payment address (BIP352). Each swap pays a fresh, unlinkable
-    /// output derived from it. Required when `fee_enabled`; ignored otherwise.
+    /// The operator's published fee address for the side locking BTC (design 0013). A silent payment
+    /// (`sp1...`) address today; each swap pays a fresh, unlinkable output derived from it. Used only
+    /// when `fee_enabled`; at least one of the two chain addresses is then required.
     #[serde(default)]
-    pub fee_sp_address: String,
+    pub fee_btc_address: String,
+    /// The operator's published fee address for the side locking xBTC. Kept separate from the BTC
+    /// address because the two chains share Bitcoin's address format (design 0013).
+    #[serde(default)]
+    pub fee_xbtc_address: String,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -113,7 +118,8 @@ impl Default for Settings {
             xbtc_rpc_pass: String::new(),
             price_reference: false,
             fee_enabled: false,
-            fee_sp_address: String::new(),
+            fee_btc_address: String::new(),
+            fee_xbtc_address: String::new(),
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -160,11 +166,21 @@ impl Settings {
         // Only when the fee is switched on does the address matter. The signer's BIP352 capability is
         // checked where the live signer is known (the engine wiring), not in this pure validation; a
         // non-BIP352 signer refuses to enable fees there with a clear message (design 0010).
-        if self.fee_enabled && !looks_like_sp_address(&self.fee_sp_address) {
-            e.push(
-                "fee_sp_address: a silent payment address is required when the fee is enabled"
-                    .to_owned(),
-            );
+        if self.fee_enabled {
+            let addresses = [
+                ("fee_btc_address", &self.fee_btc_address),
+                ("fee_xbtc_address", &self.fee_xbtc_address),
+            ];
+            if addresses.iter().all(|(_, a)| a.trim().is_empty()) {
+                e.push(
+                    "fee: a BTC or xBTC fee address is required when the fee is enabled".to_owned(),
+                );
+            }
+            for (name, a) in addresses {
+                if !a.trim().is_empty() && !looks_like_sp_address(a) {
+                    e.push(format!("{name}: must be a silent payment address"));
+                }
+            }
         }
         e
     }
@@ -228,10 +244,12 @@ impl NewOffer {
         // The fee terms travel in the offer (design 0010), filled from the operator's settings when
         // the fee is on; a fee-less offer carries None. The address was shape-checked by
         // Settings::validate; the taker's engine parses it for its network before paying.
+        let non_empty = |a: &str| (!a.trim().is_empty()).then(|| a.trim().to_owned());
         let fee = s.fee_enabled.then(|| FeeTerms {
             maker_bps: s.fee_maker_bps,
             taker_bps: s.fee_taker_bps,
-            sp_address: s.fee_sp_address.clone(),
+            btc_address: non_empty(&s.fee_btc_address),
+            xbtc_address: non_empty(&s.fee_xbtc_address),
         });
         SwapOffer {
             id: random16(),
@@ -330,17 +348,19 @@ mod tests {
             .into_swap_offer(&Settings::default())
             .fee
             .is_none());
-        // Fee on: the offer carries the operator's rates and address, from settings.
+        // Fee on: the offer carries the operator's rates and the per-chain addresses, from settings.
         let on = Settings {
             fee_enabled: true,
-            fee_sp_address: sp_addr(),
+            fee_btc_address: sp_addr(),
+            fee_xbtc_address: sp_addr(),
             fee_maker_bps: 20,
             fee_taker_bps: 30,
             ..Default::default()
         };
         let terms = a_new_offer().into_swap_offer(&on).fee.expect("fee terms");
         assert_eq!((terms.maker_bps, terms.taker_bps), (20, 30));
-        assert_eq!(terms.sp_address, sp_addr());
+        assert_eq!(terms.btc_address.as_deref(), Some(sp_addr().as_str()));
+        assert_eq!(terms.xbtc_address.as_deref(), Some(sp_addr().as_str()));
     }
 
     #[test]
@@ -363,17 +383,27 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            s.validate().iter().any(|m| m.contains("fee_sp_address")),
+            s.validate()
+                .iter()
+                .any(|m| m.contains("fee address is required")),
             "enabled fee with no address must be refused"
         );
-        s.fee_sp_address = sp_addr();
+        // A fee address on one chain only is enough; the other side simply pays no fee.
+        s.fee_btc_address = sp_addr();
         assert!(
             s.validate().is_empty(),
-            "a well-formed sp address is accepted"
+            "a well-formed sp address on one chain is accepted"
         );
-        // Disabled again, the address is irrelevant and a blank one is fine.
+        // A malformed address on the other chain is refused even though the first is valid.
+        s.fee_xbtc_address = "not-an-sp-address".to_owned();
+        assert!(
+            s.validate().iter().any(|m| m.contains("fee_xbtc_address")),
+            "a malformed per-chain address must be refused"
+        );
+        // Disabled again, the addresses are irrelevant and blank ones are fine.
         s.fee_enabled = false;
-        s.fee_sp_address = String::new();
+        s.fee_btc_address = String::new();
+        s.fee_xbtc_address = String::new();
         assert!(s.validate().is_empty());
     }
 

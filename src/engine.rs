@@ -406,6 +406,15 @@ impl<T: Transport> Engine<T> {
         let Some(terms) = &swap.offer.fee else {
             return FeeState::NotRequired;
         };
+        // The counterparty pays its fee on the chain it locks (design 0013). If the offer sets no fee
+        // address for that chain, the counterparty owes no fee output and there is nothing to check.
+        let cp_chain_id = match swap.role {
+            Role::Maker => swap.offer.maker_chain.other(),
+            Role::Taker => swap.offer.maker_chain,
+        };
+        let Some(fee_address) = terms.address(cp_chain_id) else {
+            return FeeState::NotRequired;
+        };
         let Some(proof) = &record.received_fee else {
             return FeeState::Pending;
         };
@@ -421,7 +430,7 @@ impl<T: Transport> Engine<T> {
         let Ok(required) = fee::fee_amount(rates, cp_role, cp_locked) else {
             return FeeState::Failed;
         };
-        let Ok(recipient) = SilentPaymentAddress::parse(&terms.sp_address) else {
+        let Ok(recipient) = SilentPaymentAddress::parse(fee_address) else {
             return FeeState::Failed;
         };
         if recipient.network != cp_chain.network() {
@@ -551,17 +560,22 @@ impl<T: Transport> Engine<T> {
                 None => {
                     let other = &self.nodes[&own_chain.other()].rpc;
                     let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
-                    // The voluntary fee (design 0010): terms come from the offer, the amount from
-                    // our role and what we lock. If the offer sets terms we cannot honour (a bad
-                    // address, or a trade below the minimum), funding fails loudly: we never lock
-                    // without the fee the counterparty will look for.
-                    let fee = match &swap.offer.fee {
+                    // The voluntary fee (design 0010, 0013): terms come from the offer, the address
+                    // for the chain we lock, the amount from our role and what we lock. If the offer
+                    // sets no fee address for our chain, we lock without a fee output. If it sets one
+                    // we cannot honour (a bad address, or a trade below the minimum), funding fails
+                    // loudly: we never lock without the fee the counterparty will look for.
+                    let fee = match swap
+                        .offer
+                        .fee
+                        .as_ref()
+                        .and_then(|terms| terms.address(own_chain).map(|a| (terms, a)))
+                    {
                         None => None,
-                        Some(terms) => {
-                            let addr =
-                                SilentPaymentAddress::parse(&terms.sp_address).map_err(|e| {
-                                    NodeError::Unexpected(format!("fee address: {e:?}"))
-                                })?;
+                        Some((terms, fee_address)) => {
+                            let addr = SilentPaymentAddress::parse(fee_address).map_err(|e| {
+                                NodeError::Unexpected(format!("fee address: {e:?}"))
+                            })?;
                             if addr.network != self.nodes[&own_chain].network() {
                                 return Err(NodeError::Unexpected(
                                     "fee address is for the wrong network".into(),
