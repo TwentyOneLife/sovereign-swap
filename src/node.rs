@@ -32,6 +32,36 @@ impl From<RpcError> for NodeError {
     }
 }
 
+/// Where a voluntary fee output pays (design 0013). A silent payment address gives a fresh, unlinkable
+/// output that the counterparty authenticates with a DLEQ proof; a normal address is paid directly and
+/// verified against the agreed address on chain, with no proof and no BIP352-aware signer required.
+pub enum FeeDest {
+    SilentPayment(SilentPaymentAddress),
+    Normal(Address),
+}
+
+impl FeeDest {
+    /// Parse a configured fee address, requiring it to be for `network`. An `sp`/`tsp`/`sprt` address
+    /// is a silent payment; anything else that is a valid address for the network is normal. Both
+    /// chains share Bitcoin's network parameters, so the wrong-chain guard is the per-chain field, not
+    /// this network check (design 0013).
+    pub fn parse(s: &str, network: Network) -> Result<FeeDest, NodeError> {
+        if let Ok(sp) = SilentPaymentAddress::parse(s) {
+            if sp.network != network {
+                return Err(NodeError::Unexpected(
+                    "fee address is for the wrong network".into(),
+                ));
+            }
+            return Ok(FeeDest::SilentPayment(sp));
+        }
+        let addr = Address::from_str(s)
+            .map_err(|e| NodeError::Unexpected(format!("fee address: {e}")))?
+            .require_network(network)
+            .map_err(|_| NodeError::Unexpected("fee address is for the wrong network".into()))?;
+        Ok(FeeDest::Normal(addr))
+    }
+}
+
 /// Signs a funding transaction. The engine builds the unsigned PSBT and runs the replay guard; the
 /// signer turns it into a signed PSBT. This is the seam that keeps funding keys off the engine
 /// server: in production the signer is an external cold device, so the engine holds no spending key
@@ -414,13 +444,14 @@ impl ChainNode {
         fee_rate_sat_vb: u64,
         minconf: u32,
         other_chain: &impl UtxoLookup<Error = RpcError>,
-        fee: Option<(Amount, &SilentPaymentAddress)>,
+        fee: Option<(Amount, &FeeDest)>,
     ) -> Result<(Transaction, Option<FeeProof>), NodeError> {
         let mut outputs = vec![json!({ self.address(contract).to_string(): amount.to_btc() })];
-        // When a fee is due, add a placeholder P2TR output the signer rewrites into the fresh silent
-        // payment output. P2TR so its size, and so the miner fee, matches the final transaction.
+        // A silent-payment fee needs a placeholder P2TR output the signer rewrites into the fresh
+        // output (P2TR so its size, and the miner fee, match the final transaction). A normal-address
+        // fee is paid directly as its own output, with nothing to rewrite (design 0013).
         let placeholder_spk = match fee {
-            Some((fee_amount, _)) => {
+            Some((fee_amount, FeeDest::SilentPayment(_))) => {
                 let addr = self.wallet.call("getnewaddress", json!(["", "bech32m"]))?;
                 let addr = addr
                     .as_str()
@@ -428,6 +459,10 @@ impl ChainNode {
                 outputs.push(json!({ addr: fee_amount.to_btc() }));
                 let info = self.wallet.call("getaddressinfo", json!([addr]))?;
                 Some(info["scriptPubKey"].as_str().unwrap_or_default().to_owned())
+            }
+            Some((fee_amount, FeeDest::Normal(addr))) => {
+                outputs.push(json!({ addr.to_string(): fee_amount.to_btc() }));
+                None
             }
             None => None,
         };
@@ -443,9 +478,11 @@ impl ChainNode {
         let decoded = self.rpc.call("decodepsbt", json!([psbt]))?;
         check_inputs(&inputs_of(&decoded["tx"])?, other_chain).map_err(NodeError::Replay)?;
 
-        // Delegate signing: the engine never holds the funding keys (cold in production).
+        // Delegate signing: the engine never holds the funding keys (cold in production). A silent
+        // payment fee is signed through the BIP352 path and yields a proof; a normal-address fee (or
+        // no fee) is a plain signature with no proof.
         let (signed_psbt, fee_proof) = match (fee, placeholder_spk) {
-            (Some((_, recipient)), Some(spk)) => {
+            (Some((_, FeeDest::SilentPayment(recipient))), Some(spk)) => {
                 // Funding may insert a change output, so find the placeholder by its script.
                 let fee_vout = find_vout(&decoded["tx"], &spk).ok_or_else(|| {
                     NodeError::Unexpected("placeholder fee output not in the funded psbt".into())
@@ -546,4 +583,45 @@ fn inputs_of(tx: &Value) -> Result<Transaction, NodeError> {
         input,
         output: vec![],
     })
+}
+
+#[cfg(test)]
+mod fee_dest_tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::SecretKey;
+    use bitcoin::WPubkeyHash;
+
+    fn sp(network: Network) -> SilentPaymentAddress {
+        let secp = Secp256k1::new();
+        SilentPaymentAddress {
+            scan: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap()),
+            spend: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap()),
+            network,
+        }
+    }
+
+    #[test]
+    fn classifies_silent_payment_and_normal() {
+        let sp_addr = sp(Network::Regtest).encode();
+        assert!(matches!(
+            FeeDest::parse(&sp_addr, Network::Regtest),
+            Ok(FeeDest::SilentPayment(_))
+        ));
+        let spk = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20]));
+        let normal = Address::from_script(&spk, Network::Regtest)
+            .unwrap()
+            .to_string();
+        assert!(matches!(
+            FeeDest::parse(&normal, Network::Regtest),
+            Ok(FeeDest::Normal(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_network_and_garbage() {
+        let mainnet_sp = sp(Network::Bitcoin).encode();
+        assert!(FeeDest::parse(&mainnet_sp, Network::Regtest).is_err());
+        assert!(FeeDest::parse("not-an-address", Network::Regtest).is_err());
+    }
 }

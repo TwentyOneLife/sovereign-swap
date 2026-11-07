@@ -177,8 +177,10 @@ impl Settings {
                 );
             }
             for (name, a) in addresses {
-                if !a.trim().is_empty() && !looks_like_sp_address(a) {
-                    e.push(format!("{name}: must be a silent payment address"));
+                if !a.trim().is_empty() && !looks_like_fee_address(a) {
+                    e.push(format!(
+                        "{name}: must be a silent payment or a normal address"
+                    ));
                 }
             }
         }
@@ -186,10 +188,19 @@ impl Settings {
     }
 }
 
+/// A lightweight shape check for a fee address (design 0013): a silent payment (BIP352) address, or a
+/// normal address that parses. This is a settings guard only; the authoritative parse and the
+/// per-chain network check happen where the output is built (`FeeDest::parse`), which rejects anything
+/// malformed or on the wrong network before a single sat is committed.
+fn looks_like_fee_address(a: &str) -> bool {
+    let a = a.trim();
+    looks_like_sp_address(a)
+        || a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .is_ok()
+}
+
 /// A lightweight shape check for a silent payment address (BIP352): the bech32m `sp1`/`tsp1` prefix
-/// and a plausible length. This is a settings guard only; the authoritative parse happens in the
-/// BIP352 layer that derives the output (design 0010 step 3), which rejects anything malformed or on
-/// the wrong network before a single sat is committed.
+/// and a plausible length.
 fn looks_like_sp_address(a: &str) -> bool {
     let a = a.trim();
     (a.starts_with("sp1") || a.starts_with("tsp1") || a.starts_with("sprt1"))

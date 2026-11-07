@@ -11,7 +11,7 @@ use serde_json::json;
 
 use bitcoin::hashes::Hash;
 use sovereign_swap::htlc::Contract;
-use sovereign_swap::node::ChainNode;
+use sovereign_swap::node::{ChainNode, FeeDest};
 use sovereign_swap::replay::UtxoLookup;
 use sovereign_swap::rpc::RpcError;
 use sovereign_swap::silentpayments::{
@@ -62,15 +62,9 @@ fn wallet_signer_pays_a_silent_payment_fee_that_verifies_and_scans() {
 
     // Fund the lock with the fee. The hot signer derives its input keys, builds the fee output and
     // the share+proof, and signs.
+    let dest = FeeDest::SilentPayment(recipient);
     let (tx, proof) = chain
-        .fund(
-            &contract,
-            amount,
-            2,
-            1,
-            &NoOtherChain,
-            Some((fee, &recipient)),
-        )
+        .fund(&contract, amount, 2, 1, &NoOtherChain, Some((fee, &dest)))
         .expect("the wallet signer funds the lock with a fee");
     chain.broadcast(&tx).expect("the funded lock broadcasts");
     contract
