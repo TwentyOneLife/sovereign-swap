@@ -72,6 +72,15 @@ verify.
   address only with `SWAP_API_TRUST_NETWORK=1`, and that flag is a bind permission, not an auth bypass
   (`sovereign-swap-daemon.rs`). Every request is gated by the same password and token regardless of
   origin, which is what makes the LAN front door in section 8 safe to expose.
+- **Finding (fail-open default), from the black-box pass in section 7:** the page carries the API
+  token, and it is behind Basic auth only when a web password is set. A daemon bound off-loopback with
+  no password would serve the token to anyone on the network. The StartOS package always sets a
+  password, so the deployed service was never exposed, but the daemon's own default failed open, which
+  is the wrong default for a service that can move coins.
+- **Fix (fail closed):** `Daemon::serve` now refuses to start when the bind is off-loopback and no web
+  password is set (`serve_guard`), rather than serving an open, token-bearing API. Loopback binds are
+  unaffected (reachable only locally). Unit tests cover the loopback classification and both the
+  refused and allowed combinations.
 
 ## 5. Malicious-counterparty harness
 
@@ -114,6 +123,18 @@ also over a StartOS-terminated HTTPS LAN address, see section 8):
 | Node RPC TLS, and the web-UI TLS LAN address | testssl.sh / sslyze | low risk (StartOS rustls proxy); the LAN address is now a direct target, no Tor host needed |
 | The web UI auth over the LAN (off Tor) | `hydra` / `medusa`, an `nmap` service scan | reachable since 0.2.0:5; blocked by the 20-char random password, rate-limiting is the open item (section 9) |
 | The swap protocol itself | the malicious-counterparty harness | primitive done, extend live |
+
+**Black-box red-team pass.** An operator ran a black-box engagement from Kali against an isolated
+replica (the client daemon and the relay on a sandboxed lab segment, never the production node), driven
+by a tester with no access to the source. It confirmed the hardening above holds from the outside: no
+path traversal, no version banner, terse JSON errors, `nosniff` set, no permissive CORS, only static
+assets unauthenticated, and the relay rejecting forged, unsigned, and wrong-kind events. It found the
+fail-open default now fixed in section 4 (the API token was readable from the unauthenticated page when
+no web password was set). It also noted the relay's connection and rate limits were not observed to
+trip under a short burst (80 connections, 60 messages) from one peer; the caps exist in code, so the
+open item is confirming they are configured to sane values on a deployed relay, and considering a
+per-peer connection ceiling and a NIP-42 AUTH challenge. Done responsibly against a replica, not the
+live service.
 
 ## 8. LAN HTTPS front door (added in client package 0.2.0:5)
 

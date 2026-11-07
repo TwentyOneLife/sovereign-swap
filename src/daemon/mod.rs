@@ -214,8 +214,15 @@ impl Daemon {
         &self.token
     }
 
-    /// Binds and serves forever on `bind` (must be a loopback address). A thread per connection.
+    /// Binds and serves forever on `bind`. A thread per connection. Refuses an off-loopback bind with
+    /// no web password set (see `serve_guard`): the page carries the API token.
     pub fn serve(self, bind: &str) -> std::io::Result<()> {
+        // Fail closed. GET / serves the page with the API token substituted in, and that page is only
+        // behind HTTP Basic auth when a web password is set. Off loopback with no password, the token
+        // would be readable by anyone who can reach the port, which is full fund-touching API access.
+        // Refuse to start in that case rather than serve an open API. On loopback the open page is
+        // only reachable locally, so it is allowed (the plain non-StartOS daemon).
+        serve_guard(bind, self.basic_auth.is_some())?;
         let listener = TcpListener::bind(bind)?;
         self.accept_loop(listener);
         Ok(())
@@ -567,5 +574,57 @@ impl Daemon {
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }
+    }
+}
+
+/// True if `bind`'s host is a loopback address (reachable only from the same machine). `0.0.0.0` and
+/// `::` bind all interfaces and are reachable off-host, so they are not loopback.
+fn bind_is_loopback(bind: &str) -> bool {
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// Fail closed: an off-loopback bind with no web password would serve the API token (in GET /) to the
+/// network. Returns an error so `serve` refuses to start rather than exposing a fund-touching API.
+fn serve_guard(bind: &str, has_basic_auth: bool) -> std::io::Result<()> {
+    if !bind_is_loopback(bind) && !has_basic_auth {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to serve off-loopback with no web password set \
+             (SWAP_USERNAME/SWAP_PASSWORD): GET / carries the API token and would be reachable by \
+             anyone on the network",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_is_loopback, serve_guard};
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        for b in ["127.0.0.1:8787", "localhost:8787", "::1:8787", "[::1]:8787"] {
+            assert!(bind_is_loopback(b), "{b} should be loopback");
+        }
+        for b in ["0.0.0.0:8787", "203.0.113.1:8787", "::0:8787"] {
+            assert!(!bind_is_loopback(b), "{b} should not be loopback");
+        }
+    }
+
+    #[test]
+    fn serve_guard_refuses_off_loopback_without_password() {
+        // The dangerous combination: reachable off-host, no web password. Must refuse.
+        assert!(serve_guard("0.0.0.0:8787", false).is_err());
+        assert!(serve_guard("203.0.113.1:8787", false).is_err());
+    }
+
+    #[test]
+    fn serve_guard_allows_the_safe_combinations() {
+        // Off-loopback is fine with a password (the StartOS case).
+        assert!(serve_guard("0.0.0.0:8787", true).is_ok());
+        // Loopback is fine either way (reachable only locally).
+        assert!(serve_guard("127.0.0.1:8787", false).is_ok());
+        assert!(serve_guard("127.0.0.1:8787", true).is_ok());
     }
 }
