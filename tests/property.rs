@@ -71,6 +71,7 @@ fn swap(role: Role) -> Swap {
             Role::Maker => Phase::Locking,
             Role::Taker => Phase::Waiting,
         },
+        started_at: None,
     }
 }
 
