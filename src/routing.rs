@@ -184,8 +184,21 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
                 Message::Accept { .. } => {}
                 // The counterparty is already known for the swap; no routing bookkeeping needed.
                 Message::FeeProof { .. } => {}
-                // A broadcast with no reply; the engine updates its seen offers.
-                Message::Withdraw { .. } => {}
+                // Only the author of an offer may withdraw it (#71): the sender must match the pubkey
+                // that published that offer. Fail closed if the offer is unknown - its author cannot
+                // be verified (also the case after a relay restart clears this in-memory map, where a
+                // withdraw then simply does not propagate, which is acceptable).
+                Message::Withdraw { offer_id } => {
+                    let authentic = self
+                        .offers
+                        .lock()
+                        .unwrap()
+                        .get(offer_id)
+                        .is_some_and(|(pk, _)| *pk == event.pubkey);
+                    if !authentic {
+                        continue;
+                    }
+                }
             }
             out.push(message);
         }
