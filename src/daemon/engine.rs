@@ -64,6 +64,7 @@ pub struct SwapView {
     maker_part: Amount,
     taker_part: Amount,
     secret_revealed: bool,
+    started_at: Option<u64>,
 }
 
 impl SwapView {
@@ -76,6 +77,7 @@ impl SwapView {
             maker_part: s.maker_part,
             taker_part: s.taker_part,
             secret_revealed: s.learned_secret.is_some(),
+            started_at: s.started_at,
         }
     }
 
@@ -93,6 +95,7 @@ impl SwapView {
             "maker_amount_sat": self.maker_part.to_sat(),
             "taker_amount_sat": self.taker_part.to_sat(),
             "secret_revealed": self.secret_revealed,
+            "started_at": self.started_at,
         })
     }
 }

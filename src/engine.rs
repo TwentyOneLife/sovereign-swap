@@ -30,6 +30,15 @@ const SPEND_CONF_TARGET: u16 = 3;
 /// = 14.1 sat/vB), rounded up, so a chain with no estimator keeps a safe, near-unchanged fee.
 const FALLBACK_SPEND_RATE_SAT_VB: u64 = 15;
 
+/// Unix seconds now, for a swap's local creation timestamp (web UI time column). A clock before the
+/// epoch falls back to 0 rather than panicking.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Lower bound (floor) on a claim/refund transaction fee, in sats. The actual fee is the greater
@@ -306,6 +315,7 @@ impl<T: Transport> Engine<T> {
                 "rate": s.taker_part.to_sat() as f64 / s.maker_part.to_sat().max(1) as f64,
                 "our_lock_txid": r.funding.as_ref().map(|t| t.compute_txid().to_string()),
                 "voluntary_fee_paid_sat": fee_paid,
+                "started_at": s.started_at,
                 "secret_revealed": s.learned_secret.is_some(),
                 "active": !matches!(s.phase, Phase::Done | Phase::Refunded | Phase::Abandoned),
             }));
@@ -525,6 +535,7 @@ impl<T: Transport> Engine<T> {
                         + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
                     phase: Phase::Locking,
+                    started_at: Some(now_unix()),
                     offer,
                 };
                 self.start(swap)?;
@@ -583,6 +594,7 @@ impl<T: Transport> Engine<T> {
                         + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
                     phase: Phase::Waiting,
+                    started_at: Some(now_unix()),
                     offer,
                 };
                 self.state.bids.remove(pos);

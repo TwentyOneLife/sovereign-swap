@@ -261,6 +261,10 @@ pub struct Swap {
     /// Taker only: the secret, kept once seen, since a reorg can take its transaction away again.
     pub learned_secret: Option<[u8; PREIMAGE_LEN]>,
     pub phase: Phase,
+    /// Unix seconds when this swap was created locally, for the web UI's time column (newest-first,
+    /// sortable). `serde(default)` so a record written before the field existed still loads (as None).
+    #[serde(default)]
+    pub started_at: Option<u64>,
 }
 
 /// What one lock looks like on its chain right now.
@@ -559,6 +563,15 @@ mod tests {
     }
 
     #[test]
+    fn a_swap_from_before_started_at_still_deserializes() {
+        // A record written before the timestamp field existed must still load, with started_at None.
+        let mut v = serde_json::to_value(swap(Role::Taker)).unwrap();
+        v.as_object_mut().unwrap().remove("started_at");
+        let back: Swap = serde_json::from_value(v).unwrap();
+        assert_eq!(back.started_at, None);
+    }
+
+    #[test]
     fn an_offer_from_before_the_fee_still_deserializes() {
         // A pre-fee offer has no `fee` field; serde(default) fills it with None.
         let mut v = serde_json::to_value(offer()).unwrap();
@@ -598,6 +611,7 @@ mod tests {
                 Role::Maker => Phase::Locking,
                 Role::Taker => Phase::Waiting,
             },
+            started_at: None,
         }
     }
 
