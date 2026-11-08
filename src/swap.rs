@@ -146,6 +146,8 @@ pub enum BidError {
     BelowMinimum,
     AboveOffer,
     OwnOffer,
+    /// The taker's own voluntary fee would exceed the per-trade sanity band (F3). Local refusal.
+    FeeTooHigh,
 }
 
 impl Offer {

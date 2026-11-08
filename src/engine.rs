@@ -509,6 +509,25 @@ impl<T: Transport> Engine<T> {
         let taker_part = offer
             .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
             .map_err(EngineError::Bid)?;
+        // F3 local band: refuse to take if our own voluntary fee would be a disproportionate fraction
+        // of our leg. Local only (never the counterparty's fee verification), so an old and a new peer
+        // never disagree over the offer.
+        if let Some(terms) = &offer.fee {
+            let taker_chain = offer.maker_chain.other();
+            if terms.address(taker_chain).is_some() {
+                let rates = FeeRates {
+                    maker_bps: terms.maker_bps,
+                    taker_bps: terms.taker_bps,
+                };
+                if let Ok(fee) =
+                    fee::fee_amount_min(rates, Role::Taker, taker_part, self.min_trade_sat)
+                {
+                    if fee::fee_exceeds_band(fee, taker_part) {
+                        return Err(EngineError::Bid(BidError::FeeTooHigh));
+                    }
+                }
+            }
+        }
         self.config
             .policy
             .depths(offer, maker_part, taker_part)
