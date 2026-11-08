@@ -72,6 +72,10 @@ pub enum EngineError {
     NoSuchSwap,
     /// Abort was asked for a swap that has already funded its lock; it can only time out to a refund.
     AlreadyFunded,
+    /// Withdraw was asked for an offer id that is not among our own offers: either never ours or
+    /// already withdrawn/filled. `own_offers` holds only our own offers, so a peer's offer can never
+    /// be withdrawn here. Report it instead of returning a misleading success (#78).
+    NotYourOffer,
 }
 
 impl From<NodeError> for EngineError {
@@ -214,7 +218,9 @@ impl<T: Transport> Engine<T> {
         let before = self.state.own_offers.len();
         self.state.own_offers.retain(|o| o.id != offer_id);
         if self.state.own_offers.len() == before {
-            return Ok(());
+            // Nothing was removed: the id is not one of our own offers (never ours, or already
+            // withdrawn/filled). Report it rather than reporting a no-op as success (#78).
+            return Err(EngineError::NotYourOffer);
         }
         self.save_state()?;
         self.transport.send(&Message::Withdraw { offer_id });

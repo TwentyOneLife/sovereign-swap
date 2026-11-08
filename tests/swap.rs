@@ -641,6 +641,30 @@ fn a_withdrawn_offer_disappears_and_does_not_reappear_on_replay() {
     );
 }
 
+/// Withdrawing an id that is not one of our own offers is an error, not a silent success: a never-ours
+/// id and an already-withdrawn id both report, so the HTTP layer can return 422 instead of a
+/// misleading `{"withdrawn":...}` 200 (#78).
+#[test]
+fn withdrawing_a_non_owned_offer_is_rejected() {
+    let Some(w) = World::start() else { return };
+    let (a, _b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let offer = offer(Chain::Xbtc);
+    maker.engine().publish(offer.clone()).unwrap();
+    // The real owned offer withdraws cleanly.
+    maker.engine().withdraw(offer.id).unwrap();
+    // A second withdraw of the same id now finds nothing and must error.
+    assert!(
+        maker.engine().withdraw(offer.id).is_err(),
+        "withdrawing an already-withdrawn offer must be an error (#78)"
+    );
+    // An id that was never ours (e.g. a peer's offer) must likewise error, never report success.
+    assert!(
+        maker.engine().withdraw([0u8; 16]).is_err(),
+        "withdrawing a non-owned offer must be an error (#78)"
+    );
+}
+
 /// Operator abort is only for a swap that has committed no coin: once our lock is funded it must be
 /// refused, so a funded swap can only ever reach a timelock refund, never a forced abandon that would
 /// strand the coin (#65).
