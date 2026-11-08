@@ -137,11 +137,39 @@ struct Subscription {
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Aggregate relay counters for operator visibility (design 0006 / #45), served in the NIP-11
+/// document. Aggregate only, by deliberate design: never a pubkey, IP, or anything that identifies a
+/// client or a swap. All monotonic since start except the live connection gauge (held separately).
+#[derive(Default)]
+struct Stats {
+    started_at: u64,
+    connections_total: AtomicU64,
+    connections_rejected_at_cap: AtomicU64,
+    events_accepted: AtomicU64,
+    events_duplicate: AtomicU64,
+    rejected_unparseable: AtomicU64,
+    rejected_rate_limited: AtomicU64,
+    rejected_too_large: AtomicU64,
+    rejected_kind: AtomicU64,
+    rejected_bad_sig: AtomicU64,
+    rejected_stale: AtomicU64,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats {
+            started_at: Store::now(),
+            ..Default::default()
+        }
+    }
+}
+
 pub struct RelayServer {
     cfg: RelayConfig,
     store: Arc<Mutex<Store>>,
     subs: Arc<Mutex<Vec<Subscription>>>,
     connections: Arc<AtomicUsize>,
+    stats: Arc<Stats>,
 }
 
 impl RelayServer {
@@ -156,7 +184,47 @@ impl RelayServer {
             store: Arc::new(Mutex::new(store)),
             subs: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::new(Stats::new()),
         }
+    }
+
+    /// The NIP-11 relay information document (design 0006 / #45), which doubles as the operator status
+    /// read: static relay metadata plus the aggregate counters. Everything here is aggregate; nothing
+    /// identifies a client or a swap.
+    fn relay_info(&self) -> String {
+        let s = &self.stats;
+        let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        serde_json::json!({
+            "name": "sovereign-swap relay",
+            "description": "A hardened Nostr relay that carries only sovereign-swap messages (kind 4859). Holds no funds.",
+            "software": "https://github.com/TwentyOneLife/sovereign-swap",
+            "version": env!("CARGO_PKG_VERSION"),
+            "supported_nips": [1, 11],
+            "limitation": {
+                "max_message_length": self.cfg.max_event_bytes,
+                "restricted_writes": true,
+            },
+            "swap_relay": {
+                "allowed_kinds": self.cfg.allowed_kinds,
+                "retention_secs": self.cfg.retention_secs,
+                "max_connections": self.cfg.max_connections,
+                "uptime_secs": Store::now().saturating_sub(s.started_at),
+                "connections_now": self.connections.load(Ordering::Relaxed),
+                "connections_total": n(&s.connections_total),
+                "connections_rejected_at_cap": n(&s.connections_rejected_at_cap),
+                "events_accepted": n(&s.events_accepted),
+                "events_duplicate": n(&s.events_duplicate),
+                "events_rejected": {
+                    "unparseable": n(&s.rejected_unparseable),
+                    "rate_limited": n(&s.rejected_rate_limited),
+                    "too_large": n(&s.rejected_too_large),
+                    "kind_not_allowed": n(&s.rejected_kind),
+                    "bad_signature": n(&s.rejected_bad_sig),
+                    "outside_retention": n(&s.rejected_stale),
+                },
+            },
+        })
+        .to_string()
     }
 
     /// Binds and serves forever, a thread per connection. Returns the bound address.
@@ -178,10 +246,18 @@ impl RelayServer {
         let server = Arc::new(self);
         for stream in listener.incoming().flatten() {
             if server.connections.load(Ordering::Relaxed) >= server.cfg.max_connections {
+                server
+                    .stats
+                    .connections_rejected_at_cap
+                    .fetch_add(1, Ordering::Relaxed);
                 continue; // drop the connection: we are at the cap
             }
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
+                server
+                    .stats
+                    .connections_total
+                    .fetch_add(1, Ordering::Relaxed);
                 server.connections.fetch_add(1, Ordering::Relaxed);
                 server.serve_connection(stream);
                 server.connections.fetch_sub(1, Ordering::Relaxed);
@@ -206,7 +282,11 @@ impl RelayServer {
         // WebSocket handshake proceed untouched (peek leaves the request in the socket).
         match classify_request(&stream) {
             Some(RequestKind::WebSocket) => {}
-            Some(RequestKind::Http) => {
+            Some(RequestKind::Http { nip11: true }) => {
+                serve_info(&stream, &self.relay_info());
+                return;
+            }
+            Some(RequestKind::Http { nip11: false }) => {
                 serve_landing(&stream);
                 return;
             }
@@ -319,28 +399,40 @@ impl RelayServer {
         let json = raw.to_string();
         let ok =
             |id: &str, accepted: bool, msg: &str| format!(r#"["OK","{id}",{accepted},"{msg}"]"#);
+        let bump = |a: &AtomicU64| {
+            a.fetch_add(1, Ordering::Relaxed);
+        };
+        let s = &self.stats;
         let Ok(event) = Event::from_json(json.as_bytes()) else {
+            bump(&s.rejected_unparseable);
             return ok("", false, "invalid: unparseable event");
         };
         let id = event.id.to_hex_string(Case::Lower);
         if !limiter.allow() {
+            bump(&s.rejected_rate_limited);
             return ok(&id, false, "rate-limited: too many events");
         }
         if json.len() > self.cfg.max_event_bytes {
+            bump(&s.rejected_too_large);
             return ok(&id, false, "invalid: event too large");
         }
         if !self.cfg.allowed_kinds.contains(&event.kind) {
+            bump(&s.rejected_kind);
             return ok(&id, false, "blocked: kind not allowed");
         }
         if event.verify(secp).is_err() {
+            bump(&s.rejected_bad_sig);
             return ok(&id, false, "invalid: bad id or signature");
         }
         if !self.store.lock().unwrap().fresh(&event) {
+            bump(&s.rejected_stale);
             return ok(&id, false, "invalid: outside retention window");
         }
         if !self.store.lock().unwrap().insert(event.clone()) {
+            bump(&s.events_duplicate);
             return ok(&id, true, "duplicate");
         }
+        bump(&s.events_accepted);
         self.fan_out(&event);
         ok(&id, true, "")
     }
@@ -364,7 +456,11 @@ impl RelayServer {
 /// What the first bytes of a connection look like: a WebSocket upgrade, or a plain HTTP request.
 enum RequestKind {
     WebSocket,
-    Http,
+    /// A plain HTTP GET. `nip11` is set when it asked for `application/nostr+json`, the NIP-11 relay
+    /// information document (which also carries the aggregate stats).
+    Http {
+        nip11: bool,
+    },
 }
 
 /// Peeks at the request head (without consuming it, so the WebSocket handshake can still read it)
@@ -383,9 +479,11 @@ fn classify_request(stream: &TcpStream) -> Option<RequestKind> {
                 {
                     return Some(RequestKind::WebSocket);
                 }
-                // A complete header block with no upgrade line is a plain HTTP request.
+                // A complete header block with no upgrade line is a plain HTTP request. A client
+                // asking for `application/nostr+json` wants the NIP-11 document, not the landing page.
                 if contains(head, b"\r\n\r\n") {
-                    return Some(RequestKind::Http);
+                    let nip11 = contains(&lower, b"application/nostr+json");
+                    return Some(RequestKind::Http { nip11 });
                 }
                 // Headers still arriving (or the buffer is full without an upgrade): keep waiting
                 // for the rest, up to the deadline.
@@ -410,21 +508,38 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Writes the informational landing page and closes. This is all a browser ever gets; the relay
 /// itself speaks only WebSocket.
-fn serve_landing(mut stream: &TcpStream) {
-    let body = LANDING_HTML.as_bytes();
+fn serve_landing(stream: &TcpStream) {
+    serve_http(
+        stream,
+        "Content-Type: text/html; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\n",
+        LANDING_HTML.as_bytes(),
+    );
+}
+
+/// Serves the NIP-11 relay information document (design 0006 / #45) to a plain GET that asked for
+/// `application/nostr+json`. The permissive CORS header is standard for NIP-11 so a browser client can
+/// read the relay's capabilities; the body is public, aggregate-only metadata.
+fn serve_info(stream: &TcpStream, body: &str) {
+    serve_http(
+        stream,
+        "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n",
+        body.as_bytes(),
+    );
+}
+
+/// Writes one HTTP/1.1 response and closes cleanly. The request was only peeked, so its bytes are
+/// still unread; closing a socket with unread data makes the kernel send RST, which discards any
+/// unacknowledged response bytes and truncates the body over a high-latency path (whole on a LAN but
+/// cut off over Tor). Half-close the write side to mark the end of the response, then drain the
+/// request so the socket closes with a clean FIN.
+fn serve_http(mut stream: &TcpStream, extra_headers: &str, body: &[u8]) {
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-         Connection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
-    // The request was only peeked, so its bytes are still unread. Closing a socket with unread data
-    // makes the kernel send RST, which discards any unacknowledged response bytes and truncates the
-    // page over a high-latency path (it arrived whole on a LAN but cut off over Tor). Half-close the
-    // write side to mark the end of the response, then drain the request so the socket closes with a
-    // clean FIN.
     let _ = stream.shutdown(Shutdown::Write);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut sink = [0u8; 1024];
@@ -528,6 +643,37 @@ impl RateLimiter {
             true
         } else {
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_count_rejections_and_surface_in_the_nip11_document() {
+        let server = RelayServer::new(RelayConfig::default());
+        let secp = Secp256k1::verification_only();
+        let mut limiter = RateLimiter::new(1000);
+
+        // An unparseable event is rejected and counted (no signing needed for this path).
+        let reply = server.accept_event(&serde_json::json!({"nope": true}), &secp, &mut limiter);
+        assert!(reply.contains(r#""OK""#) && reply.contains("false"));
+
+        let info: Value = serde_json::from_str(&server.relay_info()).expect("valid NIP-11 JSON");
+        assert_eq!(info["supported_nips"], serde_json::json!([1, 11]));
+        assert_eq!(info["swap_relay"]["events_rejected"]["unparseable"], 1);
+        assert_eq!(info["swap_relay"]["events_accepted"], 0);
+        assert_eq!(
+            info["swap_relay"]["allowed_kinds"],
+            serde_json::json!([KIND_SWAP])
+        );
+
+        // Aggregate-only guarantee: the document must never carry a client identifier.
+        let lower = server.relay_info().to_lowercase();
+        for forbidden in ["pubkey", "\"ip\"", "client", "peer"] {
+            assert!(!lower.contains(forbidden), "NIP-11 leaked {forbidden}");
         }
     }
 }
