@@ -206,7 +206,10 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
     policy.funding_minconf_xbtc = s.xbtc_conf;
     let payout = |a: &str| (!a.trim().is_empty()).then(|| a.trim().to_owned());
     EngineConfig {
-        spend_fee: Amount::from_sat(2_000),
+        // Floor on the claim/refund fee (F6); the real fee is the live estimate x vsize, never below
+        // this. Min-relay-safe (~2.8 sat/vB for a ~142 vB claim) so a spend still confirms when the
+        // mempool is empty, while a quiet mempool no longer forces the old flat 2000-sat overpay.
+        min_spend_fee: Amount::from_sat(400),
         fee_rate_sat_vb: 2,
         policy,
         btc_payout: payout(&s.btc_payout_address),

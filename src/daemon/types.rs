@@ -12,9 +12,11 @@ use super::wire::random16;
 pub(crate) const DUST_SAT: u64 = 10_000;
 
 /// The hard safety floor a configured `min_swap_sat` may be lowered to. The claim and refund each
-/// subtract the flat spend fee (`Amount::from_sat(2_000)`, see the engine config) from the leg, and
-/// the remainder must stay above Bitcoin's dust limit (~330 sat). At the floor, 3_000 - 2_000 = 1_000
-/// sat, safely above dust. A setting below this is rejected at config load.
+/// subtract a spend fee from the leg (now fee-rate-based with a small floor, see the engine config,
+/// F6), and the remainder must stay above Bitcoin's dust limit (~330 sat). 3_000 clears any spend fee
+/// at a sane rate (at ~14 sat/vB a ~142 vB claim is ~2_000, leaving ~1_000, safely above dust); in an
+/// extreme fee spike a leg this small may not be claimable until the rate falls, which is inherent to
+/// dust-sized swaps. A setting below this is rejected at config load.
 pub(crate) const MIN_SWAP_FLOOR_SAT: u64 = 3_000;
 
 /// A sane band for a swap price, so a fat-fingered or hostile rate is caught before it is published.
@@ -279,7 +281,7 @@ impl Settings {
         }
         if self.min_swap_sat < MIN_SWAP_FLOOR_SAT {
             e.push(format!(
-                "min_swap_sat: at least {MIN_SWAP_FLOOR_SAT} (claim/refund subtract the 2000 sat spend fee; the remainder must clear dust)"
+                "min_swap_sat: at least {MIN_SWAP_FLOOR_SAT} (claim/refund subtract a spend fee; the remainder must clear dust)"
             ));
         }
         if self.min_trade_sat < 1 {

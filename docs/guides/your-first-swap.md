@@ -56,6 +56,34 @@ is unconfirmed, locked, or spent, plus a reminder that funds are safe. A swap ca
 confirmations depend on the chains, and the xBTC (BLAKE2b) chain can be slow, so a swap may take
 hours. That is normal; the timelocks are sized with margin.
 
+## Fees: what you pay, and who pays it
+
+Three things cost money in a swap. You are never charged for the other side's transactions, and the
+relay that carries offers and swap messages is free, it never touches coins.
+
+1. **Miner fees, on both chains.** Every on-chain transaction you broadcast pays that chain's miners,
+   in that chain's coin:
+   - your **lock** (funding) transaction, on the chain you lock;
+   - your **claim** transaction, on the *other* chain, when you take the counterparty's coin;
+   - your **refund** transaction, on your own chain, only if the swap fails and your lock times out.
+
+   So a completed swap pays a miner fee on *both* chains: a lock fee on your chain and a claim fee on
+   the other. These fees are sized by transaction weight at the chain's going rate, so they rise and
+   fall with the mempool (with a small floor so a claim or refund still confirms when a chain is quiet).
+   The lock fee comes from your wallet; the claim/refund fee comes out of the coin being moved, so you
+   receive the locked amount minus the claim fee.
+2. **The voluntary project fee (only if enabled).** When it is on, the side locking a coin adds one
+   extra output on its lock transaction, a small percentage of the trade, to the project's address for
+   that chain. It is paid *on the lock*, before the swap succeeds, and the counterparty checks it is
+   there before locking. If the swap later fails and you refund, this fee is **not** returned, it was
+   already spent on the lock.
+3. **Nothing for messaging.** The relay charges no fee.
+
+In short: a completed swap costs one lock miner fee + one claim miner fee (on the two different chains)
++ your share of the voluntary fee if it is on. A swap you abandon *before* locking costs nothing. A
+swap that fails *after* you locked costs the lock miner fee + the refund miner fee + the voluntary fee
+already paid on the lock.
+
 ## If something stalls
 
 The engine recovers on its own, you do not have to babysit it:
@@ -82,6 +110,9 @@ are the on-chain claim or the timelock refund.
 - **The status dots.** Green means a dependency is up. The price-reference dot is green only when a
   rate was actually fetched, orange when it is enabled but the source cannot be reached, and red when
   it is off.
+- **A failed swap still costs the voluntary fee.** That fee rides your lock transaction, so if a swap
+  fails after you locked, your refund returns the coin minus fees, but the voluntary fee is already
+  spent on the lock and is not refunded.
 - **Settings apply on restart.** Changing a minimum or a fee setting takes effect when the engine
   restarts, which the config action does for you.
 - **Slow confirmations are not a stuck swap.** If a lock sits unconfirmed, the chain is just mining
