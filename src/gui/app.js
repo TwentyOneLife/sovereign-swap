@@ -235,7 +235,8 @@ function offerForm(o) {
   const hintLine = hint
     ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${hint.min.toFixed(4)} - ${hint.max.toFixed(4)}. You set your own price.</p>`
     : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
-  return `<h2>${o ? "Take offer" : "Create offer"}</h2>
+  return `<div class="row between"><h2>${o ? "Take offer" : "Create offer"}</h2>
+      <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
     <label>I am selling
       <select id="f-chain" ${o ? "disabled" : ""}>
         <option value="xbtc" ${sell === "xbtc" ? "selected" : ""}>xBTC</option>
@@ -243,11 +244,12 @@ function offerForm(o) {
       </select></label>
     <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
     <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
+    ${o ? "" : '<label title="For a lopsided real rate (e.g. BTC vs the much cheaper xBTC): the exact total amount of the other coin you want for the whole amount. Overrides Price when set.">Exact counter amount (optional) <input id="f-counter" placeholder="leave blank to use Price"></label>'}
     ${hintLine}
     ${o ? "" : '<p id="f-ref" class="muted"></p><p id="f-dev" class="muted" style="color:var(--orange)"></p>'}
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
-      <button class="ghost" id="f-cancel">Cancel</button>
+      <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
       <button class="primary" id="f-go">${o ? "Take" : "Publish offer"}</button>
     </div>
     <p id="f-msg" class="muted"></p>`;
@@ -256,7 +258,10 @@ function offerForm(o) {
 function openSheet(html) {
   $("#modal .sheet").innerHTML = html;
   $("#modal").classList.remove("hidden");
-  $("#f-cancel").onclick = () => $("#modal").classList.add("hidden");
+  const close = () => $("#modal").classList.add("hidden");
+  $("#f-cancel").onclick = close;
+  const x = $("#f-x");
+  if (x) x.onclick = close;
 }
 
 function createSheet() {
@@ -295,15 +300,21 @@ function createSheet() {
   showReference();
   $("#f-go").onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
-    const price = parseFloat($("#f-price").value.replace(",", "."));
-    if (amount === null || !isFinite(price)) return ($("#f-msg").textContent = "Enter a valid amount and price.");
+    if (amount === null) return ($("#f-msg").textContent = "Enter a valid amount.");
+    const counterRaw = $("#f-counter") ? $("#f-counter").value.trim() : "";
+    const body = { sell_chain: $("#f-chain").value, amount_sat: amount, min_amount_sat: amount };
+    if (counterRaw) {
+      // F1/F2: an exact counter amount expresses a lopsided real rate the band/price-field cannot.
+      const counter = parseBtc(counterRaw);
+      if (counter === null) return ($("#f-msg").textContent = "Enter a valid counter amount.");
+      body.counter_amount_sat = counter;
+    } else {
+      const price = parseFloat($("#f-price").value.replace(",", "."));
+      if (!isFinite(price)) return ($("#f-msg").textContent = "Enter a price or an exact counter amount.");
+      body.price = price;
+    }
     try {
-      await api("POST", "/offers", {
-        sell_chain: $("#f-chain").value,
-        amount_sat: amount,
-        price,
-        min_amount_sat: amount,
-      });
+      await api("POST", "/offers", body);
       $("#modal").classList.add("hidden");
       loadMarket();
     } catch (e) {
@@ -328,74 +339,73 @@ function takeSheet(o) {
 $("#new-offer").onclick = createSheet;
 
 // --- swaps ---
+let lastSwaps = [];
 async function loadSwaps() {
-  const swaps = await api("GET", "/swaps").catch(() => []);
-  const body = $("#swaps-table tbody");
-  body.innerHTML = "";
-  $("#swaps-empty").style.display = swaps.length ? "none" : "block";
-  for (const s of swaps) {
-    const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active";
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td>#${s.id.slice(0, 6)}</td><td>${s.role}</td>` +
-      `<td>${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}</td>` +
-      `<td><span class="pill ${cls}">${s.phase}</span></td>` +
-      `<td class="num"><button class="link">Detail</button></td>`;
-    tr.querySelector("button").onclick = () => showSwap(s.id);
-    body.appendChild(tr);
-  }
+  lastSwaps = await api("GET", "/swaps").catch(() => []);
+  $("#swaps-empty").style.display = lastSwaps.length ? "none" : "block";
+  mountTable($("#swaps-table"), {
+    rows: lastSwaps,
+    rowId: (s) => s.id,
+    defaultSort: 0, // Started, newest first
+    defaultDir: "desc",
+    columns: [
+      { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const t = fmtTime(s.started_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
+      { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
+      { label: "Role", get: (s) => s.role, cell: (s) => s.role },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
+      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+    ],
+    detailInto: (s, box) => fillSwapDetail(s.id, box),
+  });
 }
 
-// The open swap detail, auto-refreshed: confirmations and the refund countdown change every block
-// without a phase change, so SSE alone would not catch them. Poll on a timer with a visible countdown.
-const DETAIL_REFRESH = 30; // seconds
-let detailId = null;
-let detailNext = 0;
-
-function showSwap(id) {
-  detailId = id;
-  detailNext = Date.now();
+// A txid rendered as a link to the operator's configured explorer (#67), or plain text when none set.
+function explorerTx(chain, lock) {
+  if (!lock || !lock.txid) return "not locked yet";
+  const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
+  const short = String(lock.txid).slice(0, 16) + "…";
+  const link = base
+    ? `<a href="${escapeHtml(base.replace(/\/$/, ""))}/tx/${escapeHtml(lock.txid)}" target="_blank" rel="noopener">${short}</a>`
+    : short;
+  const state = `${lock.confirmations == null ? "unconfirmed" : lock.confirmations + " conf"} · ${lock.spent ? "spent" : "locked"}`;
+  return `${link}<br>${state}`;
 }
 
-async function renderSwap(id) {
+async function fillSwapDetail(id, box) {
+  box.innerHTML = "Loading…";
   const s = await api("GET", "/swaps/" + id).catch(() => null);
-  if (!s || detailId !== id) return;
+  const st = $("#swaps-table")._v;
+  if (!st || st.open !== id) return; // row closed or changed during the fetch
+  const live = $("#swaps-table").querySelector(".detail-box");
+  if (!live) return;
+  if (!s) { live.innerHTML = `<span class="muted">detail unavailable</span>`; return; }
   const c = s.chain || {};
-  const leg = (name, lock) =>
-    `<div class="leg card"><strong>${name}</strong><br>` +
-    (lock
-      ? `tx ${String(lock.txid).slice(0, 12)}…<br>` +
-        `${lock.confirmations == null ? "unconfirmed" : lock.confirmations + " conf"} · ${lock.spent ? "spent" : "locked"}`
-      : "not locked yet") +
-    `</div>`;
-  const done = ["done", "refunded", "abandoned"].includes(s.phase);
-  // Label the legs by our role: our own lock is on our side of the swap, which is the taker lock when
-  // we are the taker, not always the maker lock (#73).
+  // Our own lock is on our side of the swap, which is the taker lock when we are the taker (#73).
+  const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
+  const cpChain = s.role === "maker" ? s.taker_chain : s.maker_chain;
   const ownLock = s.role === "maker" ? c.maker_lock : c.taker_lock;
   const cpLock = s.role === "maker" ? c.taker_lock : c.maker_lock;
-  $("#swap-detail").innerHTML =
-    `<div class="card"><div class="row between"><h2>Swap #${s.id.slice(0, 6)}</h2>` +
-    `<span class="pill ${done ? "phase-" + s.phase : "phase-active"}">${s.phase}</span></div>` +
+  live.innerHTML =
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
-    `<div class="legs">${leg("Your leg", ownLock)}${leg("Counterparty", cpLock)}</div>` +
-    (c.refund_in_blocks != null
-      ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>`
-      : "") +
-    `<p class="muted">Funds are safe: this ends claimed or refunded, always.` +
-    (done ? "" : ` <span id="detail-age"></span>`) + `</p></div>`;
+    `<div class="legs">` +
+    `<div class="leg card"><strong>Your leg (${ownChain.toUpperCase()})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
+    `<div class="leg card"><strong>Counterparty (${cpChain.toUpperCase()})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
+    `</div>` +
+    (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
+    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>`;
 }
 
-// One ticker drives the detail refresh + its countdown.
+// Refresh the open swap's detail each tick: confirmations and the refund countdown change per block
+// without a phase change, so the event stream alone would not catch them.
 setInterval(() => {
-  if (detailId === null || $("#swaps").classList.contains("active") === false) return;
-  if (Date.now() >= detailNext) {
-    renderSwap(detailId);
-    detailNext = Date.now() + DETAIL_REFRESH * 1000;
+  if (!$("#swaps").classList.contains("active")) return;
+  const st = $("#swaps-table")._v;
+  if (st && st.open) {
+    const box = $("#swaps-table").querySelector(".detail-box");
+    if (box) fillSwapDetail(st.open, box);
   }
-  const el = $("#detail-age");
-  if (el) el.textContent = `· refreshing in ${Math.max(0, Math.round((detailNext - Date.now()) / 1000))}s`;
-}, 1000);
+}, 30000);
 
 // --- live updates (fetch stream keeps auth in the header) ---
 async function subscribe() {
@@ -422,9 +432,8 @@ async function subscribe() {
 }
 function onEvent() {
   const active = $(".view.active").id;
-  refresh(active);
+  refresh(active); // re-renders the active table, which re-fills any open inline detail
   loadStatus();
-  if (detailId !== null) detailNext = Date.now(); // a phase change refreshes the open detail at once
 }
 
 function refresh(tab) {
