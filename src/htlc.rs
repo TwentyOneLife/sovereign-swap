@@ -237,23 +237,44 @@ impl Contract {
 }
 
 /// Fee a claim or refund by its real vbytes (F6). `build` signs the spend for a given fee; we build
-/// once at `at_least` to learn the exact vsize, then rebuild at `max(at_least, rate_sat_vb * (vsize +
-/// 1))`. The +1 vB covers a signature that signs one byte longer on the rebuild (the sighash commits
-/// to the output value, so the second signature's `r`/`s` length can differ), so a spend aimed at the
-/// min-relay rate never lands a hair under it. `at_least` is the caller's lower bound: a min-relay
-/// floor, raised to any fee already broadcast for this spend so a rebuild only ever replaces upward
-/// (RBF-safe). Returns the signed spend and the fee it pays. Propagates `OutputBelowDust` when the leg
-/// is too small to pay the fee, exactly as a plain spend would.
+/// once at the current lower bound to learn the exact vsize, then settle the fee. The vsize is taken
+/// +1 vB because the rebuild's signature may sign one byte longer (the sighash commits to the output
+/// value, so `r`/`s` length can differ), so a spend aimed at a rate never lands a hair under it.
+///
+/// `prior` is the fee of a transaction already in the mempool for this spend (`None` on the first
+/// spend). The returned fee is:
+/// - first spend (`prior` is `None`): `max(floor, rate * vsize)`;
+/// - a rebuild (`prior` is `Some(p)`): the new rate `rate * vsize` **only when it clears the BIP125
+///   increment** `p + incremental_relay_feerate * vsize` (1 sat/vB), otherwise exactly `p`. So a
+///   rebuild is either an identical, already-accepted transaction (a no-op rebroadcast) or a valid
+///   fee-bump replacement - never a replacement the node rejects for an insufficient fee.
+///
+/// Returns the signed spend and the fee it pays. Propagates `OutputBelowDust` when the leg is too
+/// small to pay the fee, exactly as a plain spend would.
 pub fn spend_at_rate(
     build: impl Fn(Amount) -> Result<Transaction, SpendError>,
     rate_sat_vb: u64,
-    at_least: Amount,
+    floor: Amount,
+    prior: Option<Amount>,
 ) -> Result<(Transaction, Amount), SpendError> {
-    let probe = build(at_least)?;
+    let lower = prior.unwrap_or(floor).max(floor);
+    let probe = build(lower)?;
     let vsize = probe.vsize() as u64 + 1;
-    let fee = Amount::from_sat((vsize * rate_sat_vb).max(at_least.to_sat()));
-    if fee == at_least {
-        Ok((probe, at_least))
+    let raw = vsize.saturating_mul(rate_sat_vb);
+    let fee = match prior {
+        None => Amount::from_sat(raw.max(floor.to_sat())),
+        Some(p) => {
+            let p = p.to_sat();
+            // Bump to the new rate only if it clears p + 1 sat/vB * vsize (BIP125), else reuse p.
+            if raw >= p + vsize {
+                Amount::from_sat(raw)
+            } else {
+                Amount::from_sat(p)
+            }
+        }
+    };
+    if fee == lower {
+        Ok((probe, fee))
     } else {
         Ok((build(fee)?, fee))
     }
@@ -515,12 +536,11 @@ mod tests {
             let s = Spend { fee, ..spend() };
             c.claim(&secp, &s, &key, &preimage)
         };
-        // Rate wins: at 50 sat/vB a ~142 vB claim pays well above the 500-sat floor, and the fee
-        // covers at least the rate times the actual vsize.
-        let (tx, fee) = spend_at_rate(base, 50, Amount::from_sat(500)).unwrap();
+        // First spend, rate wins: at 50 sat/vB a ~142 vB claim pays well above the 500-sat floor.
+        let (tx, fee) = spend_at_rate(base, 50, Amount::from_sat(500), None).unwrap();
         assert!(
             fee > Amount::from_sat(500),
-            "the rate, not the floor, should win here"
+            "the rate, not the floor, should win"
         );
         assert!(
             fee.to_sat() >= 50 * tx.vsize() as u64,
@@ -532,11 +552,20 @@ mod tests {
             spend().value - fee,
             "output = value - fee"
         );
-        // Floor wins: at 1 sat/vB (~143 sat) the 2000-sat lower bound dominates, and the spend is
-        // built at exactly that.
-        let (tx2, fee2) = spend_at_rate(base, 1, Amount::from_sat(2_000)).unwrap();
+        // First spend, floor wins: at 1 sat/vB (~143 sat) the 2000-sat floor dominates.
+        let (_t, fee2) = spend_at_rate(base, 1, Amount::from_sat(2_000), None).unwrap();
         assert_eq!(fee2, Amount::from_sat(2_000));
-        assert_eq!(tx2.output[0].value, spend().value - Amount::from_sat(2_000));
+
+        // Rebuild (prior in the mempool): a higher rate that clears the BIP125 increment bumps.
+        let prior = Amount::from_sat(2_000);
+        let (_t, bumped) = spend_at_rate(base, 50, Amount::from_sat(500), Some(prior)).unwrap();
+        assert!(
+            bumped > prior,
+            "a big rate rise bumps the fee: {bumped} > {prior}"
+        );
+        // A rate that does NOT clear the increment reuses the exact prior fee (no rejected replace).
+        let (_t, same) = spend_at_rate(base, 1, Amount::from_sat(500), Some(prior)).unwrap();
+        assert_eq!(same, prior, "a sub-increment rate keeps the prior fee");
     }
 
     #[test]

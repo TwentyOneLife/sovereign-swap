@@ -984,8 +984,12 @@ impl<T: Transport> Engine<T> {
             .backend(chain)
             .estimate_fee_sat_vb(SPEND_CONF_TARGET)
             .unwrap_or(FALLBACK_SPEND_RATE_SAT_VB);
-        let at_least = Amount::from_sat(self.config.min_spend_fee.to_sat().max(prior.unwrap_or(0)));
-        crate::htlc::spend_at_rate(build, rate, at_least)
+        crate::htlc::spend_at_rate(
+            build,
+            rate,
+            self.config.min_spend_fee,
+            prior.map(Amount::from_sat),
+        )
     }
 
     fn act(&mut self, i: usize, action: Action) -> Result<(), EngineError> {
@@ -1007,9 +1011,9 @@ impl<T: Transport> Engine<T> {
                 swap.maker_part,
             ),
         };
-        let (chain, tx) = match action {
+        let (chain, tx, spend_fee) = match action {
             Action::Fund => match record.funding {
-                Some(tx) => (own_chain, tx),
+                Some(tx) => (own_chain, tx, None),
                 None => {
                     let other = &self.nodes[&own_chain.other()].rpc;
                     let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
@@ -1053,7 +1057,7 @@ impl<T: Transport> Engine<T> {
                     self.records[i].funding = Some(tx.clone());
                     self.records[i].fee = fee_proof;
                     self.save(&self.records[i])?;
-                    (own_chain, tx)
+                    (own_chain, tx, None)
                 }
             },
             Action::Claim { lock, preimage } => {
@@ -1072,9 +1076,7 @@ impl<T: Transport> Engine<T> {
                 let (tx, fee) = self
                     .rate_spend(spend_chain, record.spend_fee_sat, build)
                     .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
-                self.records[i].spend_fee_sat = Some(fee.to_sat());
-                self.save(&self.records[i])?;
-                (spend_chain, tx)
+                (spend_chain, tx, Some(fee.to_sat()))
             }
             Action::Refund { lock, value } => {
                 let key = self.keys.key(swap.key_index, Use::Refund);
@@ -1091,16 +1093,24 @@ impl<T: Transport> Engine<T> {
                 let (tx, fee) = self
                     .rate_spend(own_chain, record.spend_fee_sat, build)
                     .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
-                self.records[i].spend_fee_sat = Some(fee.to_sat());
-                self.save(&self.records[i])?;
-                (own_chain, tx)
+                (own_chain, tx, Some(fee.to_sat()))
             }
         };
         if self.drop_broadcasts > 0 {
             self.drop_broadcasts -= 1;
             return Ok(());
         }
-        Ok(self.backend(chain).broadcast(&tx)?)
+        self.backend(chain).broadcast(&tx)?;
+        // Persist the chosen claim/refund fee only AFTER the broadcast is accepted (F6), so the stored
+        // fee never diverges from the transaction actually in the mempool: a rejected bump leaves the
+        // prior fee in place, and the next tick rebuilds the identical, already-accepted transaction.
+        if let Some(fee) = spend_fee {
+            if self.records[i].spend_fee_sat != Some(fee) {
+                self.records[i].spend_fee_sat = Some(fee);
+                self.save(&self.records[i])?;
+            }
+        }
+        Ok(())
     }
 }
 
