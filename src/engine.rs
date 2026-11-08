@@ -56,6 +56,11 @@ struct State {
     seen_offers: Vec<Offer>,
     /// Bids we sent and wait to see accepted: swap id to (offer, maker part, key index).
     bids: Vec<([u8; 16], Offer, Amount, u32)>,
+    /// Ids of offers a maker has withdrawn. Kept so a relay that replays the original offer event
+    /// after the withdrawal does not re-add it to `seen_offers`. Absent in older state files, hence
+    /// `serde(default)`.
+    #[serde(default)]
+    withdrawn: Vec<[u8; 16]>,
 }
 
 #[derive(Debug)]
@@ -187,6 +192,20 @@ impl<T: Transport> Engine<T> {
         &self.state.own_offers
     }
 
+    /// Takes one of our offers off the market: drops it locally so `/offers` stops serving it and it
+    /// cannot be taken, and broadcasts a `Withdraw` so peers drop it from their seen offers. A no-op
+    /// if we do not hold the offer.
+    pub fn withdraw(&mut self, offer_id: [u8; 16]) -> Result<(), EngineError> {
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| o.id != offer_id);
+        if self.state.own_offers.len() == before {
+            return Ok(());
+        }
+        self.save_state()?;
+        self.transport.send(&Message::Withdraw { offer_id });
+        Ok(())
+    }
+
     pub fn node(&self, chain: Chain) -> &ChainNode {
         &self.nodes[&chain]
     }
@@ -263,8 +282,23 @@ impl<T: Transport> Engine<T> {
     fn handle(&mut self, message: Message) -> Result<(), EngineError> {
         match message {
             Message::Offer(offer) => {
+                // A replay of an offer the maker has since withdrawn must not reappear.
+                if self.state.withdrawn.contains(&offer.id) {
+                    return Ok(());
+                }
                 if !self.state.seen_offers.contains(&offer) {
                     self.state.seen_offers.push(offer);
+                    self.save_state()?;
+                }
+            }
+            Message::Withdraw { offer_id } => {
+                let before = self.state.seen_offers.len();
+                self.state.seen_offers.retain(|o| o.id != offer_id);
+                let newly = !self.state.withdrawn.contains(&offer_id);
+                if newly {
+                    self.state.withdrawn.push(offer_id);
+                }
+                if newly || self.state.seen_offers.len() != before {
                     self.save_state()?;
                 }
             }
@@ -328,9 +362,11 @@ impl<T: Transport> Engine<T> {
                     offer,
                 };
                 self.start(swap)?;
-                // The offer is atomic, so this bid consumes it: drop it so it cannot be taken again.
+                // The offer is atomic, so this bid consumes it: drop it so it cannot be taken again,
+                // and tell peers to drop it from discovery too.
                 self.state.own_offers.retain(|o| o.id != offer_id);
                 self.save_state()?;
+                self.transport.send(&Message::Withdraw { offer_id });
                 let swap = &self.records.last().expect("just started").swap;
                 self.transport.send(&Message::Accept {
                     swap_id,

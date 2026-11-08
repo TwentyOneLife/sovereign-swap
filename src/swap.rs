@@ -170,6 +170,12 @@ pub enum Message {
         swap_id: [u8; 16],
         proof: FeeProof,
     },
+    /// Broadcast when a maker takes an offer off the market (filled or cancelled): receivers drop it
+    /// from their seen offers so it is no longer discoverable. Additive, so a peer that predates this
+    /// variant simply ignores the event and keeps the offer until the maker stops honoring it.
+    Withdraw {
+        offer_id: [u8; 16],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
