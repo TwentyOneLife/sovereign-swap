@@ -30,7 +30,7 @@ pub(crate) const TAKER_LOCK_BLOCKS: u16 = 20;
 /// so none of the engine's internals need to be shared or `Send` across a lock.
 pub(crate) enum EngineCmd {
     Publish(SwapOffer, Sender<Result<(), String>>),
-    Offers(Sender<Vec<SwapOffer>>),
+    Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
@@ -148,7 +148,7 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
             let _ = reply.send(engine.publish(offer).map_err(|e| format!("{e:?}")));
         }
         EngineCmd::Offers(reply) => {
-            let _ = reply.send(engine.seen_offers().to_vec());
+            let _ = reply.send(engine.seen_offers_with_time());
         }
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
@@ -225,7 +225,7 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
     }
 }
 
-pub(crate) fn offer_to_json(o: &SwapOffer) -> Value {
+pub(crate) fn offer_to_json(o: &SwapOffer, seen_at: Option<u64>) -> Value {
     json!({
         "id": o.id.to_hex_string(Case::Lower),
         "sell_chain": chain_str(o.maker_chain),
@@ -235,6 +235,8 @@ pub(crate) fn offer_to_json(o: &SwapOffer) -> Value {
         "min_amount_sat": o.min_maker_amount.to_sat(),
         "maker_lock_blocks": o.maker_lock_blocks,
         "taker_lock_blocks": o.taker_lock_blocks,
+        // When this node last saw the offer on its market (#88), for the time column.
+        "seen_at": seen_at,
     })
 }
 

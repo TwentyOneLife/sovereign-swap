@@ -44,6 +44,38 @@ fn short_id(id: &[u8; 16]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// How long a discovered offer stays in the local market without being re-seen before it ages out
+/// (#88/#70/#65). Matches the relay's event retention (7 days), so an offer the relay would still
+/// serve is never dropped first, but a dead or withdrawn offer whose maker is gone - including a
+/// pre-M1 legacy offer with no `Withdraw` - cannot linger in discovery forever.
+const SEEN_OFFER_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// Drop discovered offers not re-seen within `SEEN_OFFER_TTL_SECS` (and their timestamps). Any offer
+/// with no timestamp yet - a legacy entry loaded from state written before `seen_at` existed - is
+/// stamped with `now` so it ages from load rather than lingering forever. Pure, so it is unit-tested
+/// directly. Returns whether anything changed (so the caller can persist).
+fn prune_seen(
+    seen_offers: &mut Vec<crate::swap::Offer>,
+    seen_at: &mut Vec<([u8; 16], u64)>,
+    now: u64,
+) -> bool {
+    let before = (seen_offers.len(), seen_at.len());
+    let known: std::collections::HashSet<[u8; 16]> = seen_at.iter().map(|(id, _)| *id).collect();
+    for o in seen_offers.iter() {
+        if !known.contains(&o.id) {
+            seen_at.push((o.id, now));
+        }
+    }
+    let fresh: std::collections::HashSet<[u8; 16]> = seen_at
+        .iter()
+        .filter(|(_, t)| now.saturating_sub(*t) < SEEN_OFFER_TTL_SECS)
+        .map(|(id, _)| *id)
+        .collect();
+    seen_offers.retain(|o| fresh.contains(&o.id));
+    seen_at.retain(|(id, _)| fresh.contains(id));
+    (seen_offers.len(), seen_at.len()) != before
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Lower bound (floor) on a claim/refund transaction fee, in sats. The actual fee is the greater
@@ -94,6 +126,12 @@ struct State {
     next_index: u32,
     own_offers: Vec<Offer>,
     seen_offers: Vec<Offer>,
+    /// When each discovered offer was last seen (unix secs), by offer id, so a stale or withdrawn
+    /// offer ages out of discovery (#88/#70/#65). Absent in older state files, hence `serde(default)`;
+    /// a legacy `seen_offers` entry without a timestamp is stamped at load. Carries the market-table
+    /// time column too.
+    #[serde(default)]
+    seen_at: Vec<([u8; 16], u64)>,
     /// Bids we sent and wait to see accepted: swap id to (offer, maker part, key index).
     bids: Vec<([u8; 16], Offer, Amount, u32)>,
     /// Ids of offers a maker has withdrawn. Kept so a relay that replays the original offer event
@@ -194,6 +232,7 @@ impl<T: Transport> Engine<T> {
             lock_amount_override: None,
         };
         engine.reconcile_offers()?;
+        engine.prune_stale_offers()?;
         Ok(engine)
     }
 
@@ -343,6 +382,35 @@ impl<T: Transport> Engine<T> {
         &self.state.seen_offers
     }
 
+    /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
+    pub fn seen_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
+        self.state
+            .seen_offers
+            .iter()
+            .map(|o| {
+                let t = self
+                    .state
+                    .seen_at
+                    .iter()
+                    .find(|(id, _)| *id == o.id)
+                    .map(|(_, t)| *t);
+                (o.clone(), t)
+            })
+            .collect()
+    }
+
+    /// Age stale or withdrawn offers out of discovery (#88/#70/#65); persists if anything changed.
+    fn prune_stale_offers(&mut self) -> Result<(), EngineError> {
+        if prune_seen(
+            &mut self.state.seen_offers,
+            &mut self.state.seen_at,
+            now_unix(),
+        ) {
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
     /// Our own live offers (those not yet taken). A filled offer is pruned, so this never advertises
     /// a spent offer.
     pub fn own_offers(&self) -> &[Offer] {
@@ -467,14 +535,27 @@ impl<T: Transport> Engine<T> {
                 if self.state.withdrawn.contains(&offer.id) {
                     return Ok(());
                 }
+                // Refresh the seen-at on every sighting, so a live, re-announced offer stays fresh
+                // and a dead one ages out at its TTL (#88/#70).
+                let now = now_unix();
+                match self
+                    .state
+                    .seen_at
+                    .iter_mut()
+                    .find(|(id, _)| *id == offer.id)
+                {
+                    Some(e) => e.1 = now,
+                    None => self.state.seen_at.push((offer.id, now)),
+                }
                 if !self.state.seen_offers.contains(&offer) {
                     self.state.seen_offers.push(offer);
-                    self.save_state()?;
                 }
+                self.save_state()?;
             }
             Message::Withdraw { offer_id } => {
                 let before = self.state.seen_offers.len();
                 self.state.seen_offers.retain(|o| o.id != offer_id);
+                self.state.seen_at.retain(|(id, _)| *id != offer_id);
                 let newly = !self.state.withdrawn.contains(&offer_id);
                 if newly {
                     self.state.withdrawn.push(offer_id);
@@ -843,6 +924,9 @@ impl<T: Transport> Engine<T> {
                 errors.push(([0; 16], e));
             }
         }
+        if let Err(e) = self.prune_stale_offers() {
+            errors.push(([0; 16], e));
+        }
         for i in 0..self.records.len() {
             if matches!(
                 self.records[i].swap.phase,
@@ -1032,5 +1116,51 @@ mod tests {
         let state: State = serde_json::from_str(old).unwrap();
         assert_eq!(state.next_index, 3);
         assert!(state.withdrawn.is_empty());
+        assert!(
+            state.seen_at.is_empty(),
+            "seen_at defaults empty on an old state"
+        );
+    }
+
+    #[test]
+    fn prune_seen_ages_out_stale_and_stamps_legacy() {
+        use super::{prune_seen, SEEN_OFFER_TTL_SECS};
+        use crate::swap::{Chain, Offer};
+        use bitcoin::Amount;
+        let offer = |n: u8| Offer {
+            id: [n; 16],
+            maker_chain: Chain::Xbtc,
+            maker_amount: Amount::from_sat(1000),
+            taker_amount: Amount::from_sat(1000),
+            min_maker_amount: Amount::ZERO,
+            maker_lock_blocks: 40,
+            taker_lock_blocks: 20,
+            maker_lock_depth: 2,
+            taker_lock_depth: 2,
+            margin_blocks: 3,
+            fee: None,
+        };
+        let now = 1_000_000u64;
+        let mut seen_offers = vec![offer(1), offer(2), offer(3)];
+        let mut seen_at = vec![
+            ([1u8; 16], now), // fresh
+            ([2u8; 16], now - SEEN_OFFER_TTL_SECS - 1), // stale, must drop
+                              // offer(3): no entry = legacy, stamped at now
+        ];
+        assert!(
+            prune_seen(&mut seen_offers, &mut seen_at, now),
+            "stale dropped = a change"
+        );
+        let ids: Vec<[u8; 16]> = seen_offers.iter().map(|o| o.id).collect();
+        assert!(ids.contains(&[1u8; 16]) && !ids.contains(&[2u8; 16]) && ids.contains(&[3u8; 16]));
+        // The legacy offer now carries a timestamp: a second prune at the same time is a no-op.
+        assert!(!prune_seen(&mut seen_offers, &mut seen_at, now));
+        // Everything ages out once past the TTL.
+        assert!(prune_seen(
+            &mut seen_offers,
+            &mut seen_at,
+            now + SEEN_OFFER_TTL_SECS + 1
+        ));
+        assert!(seen_offers.is_empty() && seen_at.is_empty());
     }
 }

@@ -576,7 +576,10 @@ impl Daemon {
         match self.engine_call(EngineCmd::Offers) {
             Ok(offers) => (
                 200,
-                json!(offers.iter().map(offer_to_json).collect::<Vec<_>>()),
+                json!(offers
+                    .iter()
+                    .map(|(o, seen_at)| offer_to_json(o, *seen_at))
+                    .collect::<Vec<_>>()),
             ),
             Err(e) => (503, json!({ "error": e })),
         }
