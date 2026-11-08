@@ -606,4 +606,9 @@ fn duplicate_messages_do_not_create_duplicate_swaps() {
         1,
         "taker made a duplicate swap"
     );
+    // The filled offer was pruned, so a replayed bid finds nothing to take.
+    assert!(
+        maker.engine().own_offers().is_empty(),
+        "a filled offer must be pruned"
+    );
 }

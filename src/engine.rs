@@ -113,7 +113,7 @@ impl<T: Transport> Engine<T> {
         config: Config,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(dir.join("swaps"))?;
-        let state = match std::fs::read(dir.join("engine.json")) {
+        let state: State = match std::fs::read(dir.join("engine.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e.into()),
@@ -128,7 +128,7 @@ impl<T: Transport> Engine<T> {
                 );
             }
         }
-        Ok(Engine {
+        let mut engine = Engine {
             dir: dir.to_owned(),
             keys: Keys::open(dir)?,
             nodes: HashMap::from([(Chain::Btc, btc), (Chain::Xbtc, xbtc)]),
@@ -140,7 +140,23 @@ impl<T: Transport> Engine<T> {
             records,
             drop_broadcasts: 0,
             lock_amount_override: None,
-        })
+        };
+        engine.reconcile_offers()?;
+        Ok(engine)
+    }
+
+    /// On load, drop any own offer a record already covers. A started swap means the offer was taken,
+    /// and an atomic offer is then fully consumed, so keeping it would let it be taken again or
+    /// re-announced on reconnect from a wallet that might still hold funds.
+    fn reconcile_offers(&mut self) -> Result<(), EngineError> {
+        let taken: std::collections::HashSet<[u8; 16]> =
+            self.records.iter().map(|r| r.swap.offer.id).collect();
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| !taken.contains(&o.id));
+        if self.state.own_offers.len() != before {
+            self.save_state()?;
+        }
+        Ok(())
     }
 
     /// Overrides the minimum swap leg bids are checked against, replacing the
@@ -163,6 +179,12 @@ impl<T: Transport> Engine<T> {
 
     pub fn seen_offers(&self) -> &[Offer] {
         &self.state.seen_offers
+    }
+
+    /// Our own live offers (those not yet taken). A filled offer is pruned, so this never advertises
+    /// a spent offer.
+    pub fn own_offers(&self) -> &[Offer] {
+        &self.state.own_offers
     }
 
     pub fn node(&self, chain: Chain) -> &ChainNode {
@@ -306,6 +328,9 @@ impl<T: Transport> Engine<T> {
                     offer,
                 };
                 self.start(swap)?;
+                // The offer is atomic, so this bid consumes it: drop it so it cannot be taken again.
+                self.state.own_offers.retain(|o| o.id != offer_id);
+                self.save_state()?;
                 let swap = &self.records.last().expect("just started").swap;
                 self.transport.send(&Message::Accept {
                     swap_id,
