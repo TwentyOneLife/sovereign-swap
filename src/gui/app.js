@@ -28,6 +28,103 @@ function parseBtc(s) {
 }
 const fmtSats = (sat) => (sat / 1e8).toFixed(8).replace(/\.?0+$/, "");
 
+// Relative time ("3m ago") with the absolute local time on hover (#88 time columns).
+function fmtTime(sec) {
+  if (!sec) return { text: "—", title: "" };
+  const d = new Date(sec * 1000);
+  const diff = Date.now() / 1000 - sec;
+  const text =
+    diff < 60 ? "just now"
+    : diff < 3600 ? Math.floor(diff / 60) + "m ago"
+    : diff < 86400 ? Math.floor(diff / 3600) + "h ago"
+    : Math.floor(diff / 86400) + "d ago";
+  return { text, title: d.toLocaleString() };
+}
+const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// A sortable, paged (5/row) table with an inline expanding detail row, shared by Swaps and Market
+// (#87). State lives on the <table> element. cfg: { columns:[{label,num?,get(row),cell(row)}], rows,
+// rowId(row), actions(row)?=>html, wireActions(tr,row)?, detailInto(row, boxEl), defaultSort, defaultDir }.
+const PAGE_SIZE = 5;
+function mountTable(table, cfg) {
+  const st = (table._v = table._v || {
+    sort: cfg.defaultSort ?? 0,
+    dir: cfg.defaultDir ?? "desc",
+    page: 0,
+    open: null,
+  });
+  st.cfg = cfg;
+  renderTable(table);
+}
+function renderTable(table) {
+  const st = table._v, cfg = st.cfg;
+  const rows = [...cfg.rows].sort((a, b) => {
+    const col = cfg.columns[st.sort], va = col.get(a), vb = col.get(b);
+    const c = va < vb ? -1 : va > vb ? 1 : 0;
+    return st.dir === "asc" ? c : -c;
+  });
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  if (st.page >= pages) st.page = pages - 1;
+  if (st.page < 0) st.page = 0;
+  const pageRows = rows.slice(st.page * PAGE_SIZE, (st.page + 1) * PAGE_SIZE);
+  const head = cfg.columns
+    .map((c, i) => {
+      const arrow = i === st.sort ? (st.dir === "asc" ? " ▲" : " ▼") : "";
+      return `<th class="${c.num ? "num " : ""}sortable" data-i="${i}">${c.label}${arrow}</th>`;
+    })
+    .join("") + "<th></th>";
+  let body = "";
+  for (const row of pageRows) {
+    const id = cfg.rowId(row);
+    const tds = cfg.columns.map((c) => `<td class="${c.num ? "num" : ""}">${c.cell(row)}</td>`).join("");
+    const act = cfg.actions ? cfg.actions(row) : "";
+    body +=
+      `<tr data-id="${id}">${tds}<td class="num">${act}` +
+      `<button class="link detail-btn">${st.open === id ? "Hide ▲" : "Detail"}</button></td></tr>`;
+    if (st.open === id) {
+      body += `<tr class="detail-row"><td colspan="${cfg.columns.length + 1}"><div class="detail-box card">Loading…</div></td></tr>`;
+    }
+  }
+  table.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
+  let pg = table.nextElementSibling;
+  if (!pg || !pg.classList.contains("pager")) {
+    pg = document.createElement("div");
+    pg.className = "pager";
+    table.after(pg);
+  }
+  pg.innerHTML =
+    pages > 1
+      ? `<button class="link" data-pg="-1" ${st.page === 0 ? "disabled" : ""}>‹ Prev</button>` +
+        `<span class="muted">Page ${st.page + 1} of ${pages}</span>` +
+        `<button class="link" data-pg="1" ${st.page >= pages - 1 ? "disabled" : ""}>Next ›</button>`
+      : "";
+  table.querySelectorAll("th.sortable").forEach((th) =>
+    th.addEventListener("click", () => {
+      const i = +th.dataset.i;
+      if (st.sort === i) st.dir = st.dir === "asc" ? "desc" : "asc";
+      else { st.sort = i; st.dir = "desc"; }
+      renderTable(table);
+    })
+  );
+  pg.querySelectorAll("[data-pg]").forEach((b) =>
+    b.addEventListener("click", () => { st.page += +b.dataset.pg; renderTable(table); })
+  );
+  table.querySelectorAll("tr[data-id]").forEach((tr) => {
+    const row = pageRows.find((r) => cfg.rowId(r) === tr.dataset.id);
+    tr.querySelector(".detail-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      st.open = st.open === tr.dataset.id ? null : tr.dataset.id;
+      renderTable(table);
+    });
+    if (cfg.wireActions) cfg.wireActions(tr, row);
+  });
+  if (st.open) {
+    const row = pageRows.find((r) => cfg.rowId(r) === st.open);
+    const box = table.querySelector(".detail-box");
+    if (row && box) cfg.detailInto(row, box);
+  }
+}
+
 // --- tabs ---
 $$(".tab").forEach((t) =>
   t.addEventListener("click", () => {
@@ -102,21 +199,33 @@ function rateHint(sellChain) {
 async function loadMarket() {
   const offers = await api("GET", "/offers").catch(() => []);
   lastOffers = offers;
-  const body = $("#offers tbody");
-  body.innerHTML = "";
   $("#offers-empty").style.display = offers.length ? "none" : "block";
-  for (const o of offers) {
-    const rate = (o.counter_amount_sat / o.amount_sat).toFixed(4);
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td>${o.sell_chain.toUpperCase()}</td>` +
-      `<td class="num">${fmtSats(o.amount_sat)}</td>` +
-      `<td class="num">${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}</td>` +
-      `<td class="num">${rate}</td>` +
-      `<td class="num"><button class="link">Take</button></td>`;
-    tr.querySelector("button").onclick = () => takeSheet(o);
-    body.appendChild(tr);
-  }
+  mountTable($("#offers"), {
+    rows: offers,
+    rowId: (o) => o.id,
+    defaultSort: 0, // Seen, newest first
+    defaultDir: "desc",
+    columns: [
+      { label: "Seen", get: (o) => o.seen_at || 0, cell: (o) => { const t = fmtTime(o.seen_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
+      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => o.sell_chain.toUpperCase() },
+      { label: "Amount", num: true, get: (o) => o.amount_sat, cell: (o) => fmtSats(o.amount_sat) },
+      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}` },
+      { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => (o.counter_amount_sat / o.amount_sat).toFixed(6) },
+    ],
+    actions: () => `<button class="link take-btn">Take</button> `,
+    wireActions: (tr, o) => { const b = tr.querySelector(".take-btn"); if (b) b.addEventListener("click", (e) => { e.stopPropagation(); takeSheet(o); }); },
+    detailInto: (o, box) => {
+      const t = fmtTime(o.seen_at);
+      box.innerHTML =
+        `<div class="row between"><strong>Offer #${escapeHtml(o.id.slice(0, 8))}</strong>` +
+        `<button class="primary take-btn2">Take this offer</button></div>` +
+        `<p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${o.sell_chain.toUpperCase()}</strong> for ` +
+        `<strong>${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}</strong> · rate ${(o.counter_amount_sat / o.amount_sat).toFixed(8)} · seen ${t.text}</p>` +
+        `<p class="muted">Lock windows: maker ${o.maker_lock_blocks} blk, taker ${o.taker_lock_blocks} blk · smallest take ${fmtSats(o.min_amount_sat)}.</p>`;
+      const b = box.querySelector(".take-btn2");
+      if (b) b.addEventListener("click", () => takeSheet(o));
+    },
+  });
 }
 
 function offerForm(o) {
