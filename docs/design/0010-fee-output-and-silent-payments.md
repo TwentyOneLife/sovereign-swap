@@ -26,6 +26,13 @@ scan key, off the swap path entirely.
 
 ## Off by default
 
+> **REVISED 2026-11-08 (owner decision): on by default for a fresh install.** `Settings::default()`
+> now ships `fee_enabled: true` with the project's per-chain fee addresses, reversing the original
+> "off until a legal opinion" stance below. The reversal is scoped so no existing install is migrated:
+> a config that never set the key still deserializes to `false` via `serde(default)`, and an explicit
+> `false` is never changed. Only a truly fresh default is on. The rest of this section documents the
+> original stance for context.
+
 `Settings.fee_enabled` defaults to `false`. When it is false the engine builds lock transactions
 exactly as today: no fee output, no BIP352 code on the path, no new failure mode. The real-proof
 milestone (v0.2.0, a real atomic swap over the deployed relay) runs with fees off, so the swap it proves

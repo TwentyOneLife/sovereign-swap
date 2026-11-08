@@ -142,8 +142,10 @@ pub struct Settings {
     /// Opt-in external price reference (nonkyc BTCB2/BTC, fetched over Tor). A hint only; off by default.
     #[serde(default)]
     pub price_reference: bool,
-    /// Voluntary fee, off by default (design 0010). Off keeps the engine on today's lock path with no
-    /// fee output and no BIP352 code. Stays off until a legal opinion.
+    /// Voluntary fee (design 0010). On by default for a fresh install, paying the project's per-chain
+    /// addresses; an operator can turn it off in the Fee config action. `serde(default)` is `false`, so
+    /// an existing config that never had the key stays off (no silent migration); only a truly fresh
+    /// `Settings::default()` is on, and it ships with the project addresses so it validates.
     #[serde(default)]
     pub fee_enabled: bool,
     /// The operator's published fee address for the side locking BTC (design 0013). A silent payment
@@ -237,9 +239,15 @@ impl Default for Settings {
             xbtc_rpc_user: String::new(),
             xbtc_rpc_pass: String::new(),
             price_reference: false,
-            fee_enabled: false,
-            fee_btc_address: String::new(),
-            fee_xbtc_address: String::new(),
+            // On by default for a fresh install (design 0010, revised): this reverses the earlier
+            // "off until a legal opinion". Shipped WITH the project fee addresses so the default still
+            // validates (an enabled fee requires an address). An existing config that lacks the key
+            // still deserializes to `false` via serde(default), so no existing install is migrated on.
+            fee_enabled: true,
+            fee_btc_address: "bc1p37x3ehmhdy6s40fuy0haw9sv9pmyjdqz5wulvm93jry4fy63ttksxja9sh"
+                .to_owned(),
+            fee_xbtc_address: "bc1pe62v4m0p6njpxn2ej9hx307tm0xlccnxe652vxk9r76g2qync7sqkfly4t"
+                .to_owned(),
             btc_payout_address: String::new(),
             xbtc_payout_address: String::new(),
             btc_explorer_url: String::new(),
@@ -607,11 +615,12 @@ mod tests {
 
     #[test]
     fn an_offer_carries_fee_terms_only_when_the_fee_is_on() {
-        // Fee off (the default): the offer is fee-less.
-        assert!(a_new_offer()
-            .into_swap_offer(&Settings::default())
-            .fee
-            .is_none());
+        // Fee off: the offer is fee-less.
+        let off = Settings {
+            fee_enabled: false,
+            ..Default::default()
+        };
+        assert!(a_new_offer().into_swap_offer(&off).fee.is_none());
         // Fee on: the offer carries the operator's rates and the per-chain addresses, from settings.
         let on = Settings {
             fee_enabled: true,
@@ -628,12 +637,22 @@ mod tests {
     }
 
     #[test]
-    fn fee_defaults_are_off_and_old_config_loads() {
+    fn fee_is_on_by_default_with_project_addresses_but_old_config_stays_off() {
+        // A fresh install: fee on, with the project addresses, and it validates.
         let s = Settings::default();
-        assert!(!s.fee_enabled);
+        assert!(s.fee_enabled, "a fresh install has the fee on");
+        assert!(
+            !s.fee_btc_address.is_empty() && !s.fee_xbtc_address.is_empty(),
+            "the on-by-default must ship with the project fee addresses"
+        );
         assert_eq!((s.fee_maker_bps, s.fee_taker_bps), (20, 30));
-        assert!(s.validate().is_empty(), "defaults must validate");
-        // Config written before the fee fields existed still deserializes (serde defaults).
+        assert!(
+            s.validate().is_empty(),
+            "the on-by-default must validate: {:?}",
+            s.validate()
+        );
+        // An existing config that never had the fee key stays OFF (serde default is false), so no
+        // install is silently migrated on.
         let old = r#"{"btc_node":"127.0.0.1:8332","xbtc_node":"127.0.0.1:8442","relays":[],
             "signer":"cold","btc_conf":1,"xbtc_conf":2,"margin_blocks":2}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
@@ -642,8 +661,11 @@ mod tests {
 
     #[test]
     fn enabling_the_fee_requires_a_silent_payment_address() {
+        // Start from an explicit empty-address state (the default now ships the project addresses).
         let mut s = Settings {
             fee_enabled: true,
+            fee_btc_address: String::new(),
+            fee_xbtc_address: String::new(),
             ..Default::default()
         };
         assert!(
