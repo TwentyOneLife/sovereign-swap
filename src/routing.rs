@@ -83,7 +83,8 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
     fn send(&self, message: &Message) {
         let payload = serde_json::to_vec(message).expect("a Message serializes");
         let (tags, envelope) = match message {
-            Message::Offer(_) => (
+            // Both are unaddressed, broadcast to everyone: an offer and its later withdrawal.
+            Message::Offer(_) | Message::Withdraw { .. } => (
                 Vec::new(),
                 sign_broadcast(&self.me, &payload, Self::os_random()),
             ),
@@ -183,6 +184,8 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
                 Message::Accept { .. } => {}
                 // The counterparty is already known for the swap; no routing bookkeeping needed.
                 Message::FeeProof { .. } => {}
+                // A broadcast with no reply; the engine updates its seen offers.
+                Message::Withdraw { .. } => {}
             }
             out.push(message);
         }

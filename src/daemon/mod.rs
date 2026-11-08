@@ -54,8 +54,8 @@ use engine::{engine_config, offer_to_json, run_engine, EngineCmd};
 use reference::Reference;
 use types::NewOffer;
 use wire::{
-    constant_time_eq, load_or_make_seed, load_or_make_token, offer_id_of, reachable, read_request,
-    reason, valid_id, Request,
+    constant_time_eq, load_or_make_seed, load_or_make_token, offer_id_of, path_id, reachable,
+    read_request, reason, valid_id, Request,
 };
 
 /// The GUI (design 0009), embedded in the binary and served on the loopback API. `index.html` carries
@@ -462,6 +462,20 @@ impl Daemon {
             {
                 self.post_take(offer_id_of(p), &req.body)
             }
+            ("POST", p)
+                if p.starts_with("/offers/")
+                    && p.ends_with("/withdraw")
+                    && valid_id(path_id(p, "/offers/", "/withdraw")) =>
+            {
+                self.post_withdraw(path_id(p, "/offers/", "/withdraw"))
+            }
+            ("POST", p)
+                if p.starts_with("/swaps/")
+                    && p.ends_with("/abort")
+                    && valid_id(path_id(p, "/swaps/", "/abort")) =>
+            {
+                self.post_abort(path_id(p, "/swaps/", "/abort"))
+            }
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -522,19 +536,22 @@ impl Daemon {
     fn status(&self) -> Value {
         let settings = self.state.lock().unwrap().settings.clone();
         let running = self.engine_running();
-        let active = if running {
-            self.engine_call(EngineCmd::Swaps)
-                .map(|v: Vec<SwapView>| v.iter().filter(|s| s.is_active()).count())
-                .unwrap_or(0)
+        let active_swaps = if running {
+            match self.engine_call::<Vec<SwapView>>(EngineCmd::Swaps) {
+                Ok(swaps) => json!(swaps.iter().filter(|s| s.is_active()).count()),
+                // The engine is up but did not answer (busy or timed out): report that it could not
+                // be read, not a misleading zero that once hid an armed, fund-retrying maker.
+                Err(_) => serde_json::Value::Null,
+            }
         } else {
-            0
+            json!(0)
         };
         json!({
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
             "relays": settings.relays.len(),
             "engine": running,
-            "active_swaps": active,
+            "active_swaps": active_swaps,
         })
     }
 
@@ -611,6 +628,40 @@ impl Daemon {
             Ok(Ok(swap_id)) => (
                 200,
                 json!({ "swap_id": swap_id.to_hex_string(Case::Lower) }),
+            ),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    fn post_withdraw(&self, offer_id_hex: &str) -> (u16, Value) {
+        let Ok(offer_id) = <[u8; 16]>::from_hex(offer_id_hex) else {
+            return (400, json!({"error": "bad offer id"}));
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::Withdraw { offer_id, reply }) {
+            Ok(Ok(())) => (
+                200,
+                json!({ "withdrawn": offer_id.to_hex_string(Case::Lower) }),
+            ),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    fn post_abort(&self, swap_id_hex: &str) -> (u16, Value) {
+        let Ok(swap_id) = <[u8; 16]>::from_hex(swap_id_hex) else {
+            return (400, json!({"error": "bad swap id"}));
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::Abort { swap_id, reply }) {
+            Ok(Ok(())) => (
+                200,
+                json!({ "aborted": swap_id.to_hex_string(Case::Lower) }),
             ),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),

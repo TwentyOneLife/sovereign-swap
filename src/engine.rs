@@ -56,6 +56,11 @@ struct State {
     seen_offers: Vec<Offer>,
     /// Bids we sent and wait to see accepted: swap id to (offer, maker part, key index).
     bids: Vec<([u8; 16], Offer, Amount, u32)>,
+    /// Ids of offers a maker has withdrawn. Kept so a relay that replays the original offer event
+    /// after the withdrawal does not re-add it to `seen_offers`. Absent in older state files, hence
+    /// `serde(default)`.
+    #[serde(default)]
+    withdrawn: Vec<[u8; 16]>,
 }
 
 #[derive(Debug)]
@@ -64,6 +69,9 @@ pub enum EngineError {
     Policy(PolicyError),
     Node(NodeError),
     Io(std::io::Error),
+    NoSuchSwap,
+    /// Abort was asked for a swap that has already funded its lock; it can only time out to a refund.
+    AlreadyFunded,
 }
 
 impl From<NodeError> for EngineError {
@@ -113,7 +121,7 @@ impl<T: Transport> Engine<T> {
         config: Config,
     ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(dir.join("swaps"))?;
-        let state = match std::fs::read(dir.join("engine.json")) {
+        let state: State = match std::fs::read(dir.join("engine.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e.into()),
@@ -128,7 +136,7 @@ impl<T: Transport> Engine<T> {
                 );
             }
         }
-        Ok(Engine {
+        let mut engine = Engine {
             dir: dir.to_owned(),
             keys: Keys::open(dir)?,
             nodes: HashMap::from([(Chain::Btc, btc), (Chain::Xbtc, xbtc)]),
@@ -140,7 +148,23 @@ impl<T: Transport> Engine<T> {
             records,
             drop_broadcasts: 0,
             lock_amount_override: None,
-        })
+        };
+        engine.reconcile_offers()?;
+        Ok(engine)
+    }
+
+    /// On load, drop any own offer a record already covers. A started swap means the offer was taken,
+    /// and an atomic offer is then fully consumed, so keeping it would let it be taken again or
+    /// re-announced on reconnect from a wallet that might still hold funds.
+    fn reconcile_offers(&mut self) -> Result<(), EngineError> {
+        let taken: std::collections::HashSet<[u8; 16]> =
+            self.records.iter().map(|r| r.swap.offer.id).collect();
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| !taken.contains(&o.id));
+        if self.state.own_offers.len() != before {
+            self.save_state()?;
+        }
+        Ok(())
     }
 
     /// Overrides the minimum swap leg bids are checked against, replacing the
@@ -163,6 +187,48 @@ impl<T: Transport> Engine<T> {
 
     pub fn seen_offers(&self) -> &[Offer] {
         &self.state.seen_offers
+    }
+
+    /// Our own live offers (those not yet taken). A filled offer is pruned, so this never advertises
+    /// a spent offer.
+    pub fn own_offers(&self) -> &[Offer] {
+        &self.state.own_offers
+    }
+
+    /// Takes one of our offers off the market: drops it locally so `/offers` stops serving it and it
+    /// cannot be taken, and broadcasts a `Withdraw` so peers drop it from their seen offers. A no-op
+    /// if we do not hold the offer.
+    pub fn withdraw(&mut self, offer_id: [u8; 16]) -> Result<(), EngineError> {
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| o.id != offer_id);
+        if self.state.own_offers.len() == before {
+            return Ok(());
+        }
+        self.save_state()?;
+        self.transport.send(&Message::Withdraw { offer_id });
+        Ok(())
+    }
+
+    /// Operator teardown of a swap that has not locked yet: mark it `Abandoned` so the engine stops
+    /// trying to fund it. Refused once our lock is funded: a locked swap can only reach a timelock
+    /// refund, never a forced abandon that would strand the coin. Idempotent on an already-terminal
+    /// swap.
+    pub fn abort(&mut self, swap_id: [u8; 16]) -> Result<(), EngineError> {
+        let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) else {
+            return Err(EngineError::NoSuchSwap);
+        };
+        if self.records[i].funding.is_some() {
+            return Err(EngineError::AlreadyFunded);
+        }
+        if matches!(
+            self.records[i].swap.phase,
+            Phase::Done | Phase::Refunded | Phase::Abandoned
+        ) {
+            return Ok(());
+        }
+        self.records[i].swap.phase = Phase::Abandoned;
+        self.save(&self.records[i])?;
+        Ok(())
     }
 
     pub fn node(&self, chain: Chain) -> &ChainNode {
@@ -241,8 +307,23 @@ impl<T: Transport> Engine<T> {
     fn handle(&mut self, message: Message) -> Result<(), EngineError> {
         match message {
             Message::Offer(offer) => {
+                // A replay of an offer the maker has since withdrawn must not reappear.
+                if self.state.withdrawn.contains(&offer.id) {
+                    return Ok(());
+                }
                 if !self.state.seen_offers.contains(&offer) {
                     self.state.seen_offers.push(offer);
+                    self.save_state()?;
+                }
+            }
+            Message::Withdraw { offer_id } => {
+                let before = self.state.seen_offers.len();
+                self.state.seen_offers.retain(|o| o.id != offer_id);
+                let newly = !self.state.withdrawn.contains(&offer_id);
+                if newly {
+                    self.state.withdrawn.push(offer_id);
+                }
+                if newly || self.state.seen_offers.len() != before {
                     self.save_state()?;
                 }
             }
@@ -295,12 +376,22 @@ impl<T: Transport> Engine<T> {
                         lock_blocks: offer.taker_lock_blocks,
                     },
                     depths,
-                    lock_deadline: 0,
+                    // The same reference the taker computes, so the maker gives up (in
+                    // `decide_maker`) strictly before the taker abandons, and never funds a lock
+                    // against a swap the taker has already walked away from.
+                    lock_deadline: self.backend(offer.maker_chain).height()?
+                        + depths.maker_lock
+                        + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
                     phase: Phase::Locking,
                     offer,
                 };
                 self.start(swap)?;
+                // The offer is atomic, so this bid consumes it: drop it so it cannot be taken again,
+                // and tell peers to drop it from discovery too.
+                self.state.own_offers.retain(|o| o.id != offer_id);
+                self.save_state()?;
+                self.transport.send(&Message::Withdraw { offer_id });
                 let swap = &self.records.last().expect("just started").swap;
                 self.transport.send(&Message::Accept {
                     swap_id,
@@ -437,6 +528,7 @@ impl<T: Transport> Engine<T> {
             taker_chain_height: b.height()?,
             maker_lock,
             taker_lock,
+            own_funded: record.funding.is_some(),
         })
     }
 
@@ -699,5 +791,20 @@ impl<T: Transport> Engine<T> {
             return Ok(());
         }
         Ok(self.backend(chain).broadcast(&tx)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn a_pre_m1_engine_state_still_loads() {
+        // An engine.json written before the withdrawn set existed must still deserialize, with the
+        // new field defaulting to empty (serde(default)).
+        let old = r#"{"next_index":3,"own_offers":[],"seen_offers":[],"bids":[]}"#;
+        let state: State = serde_json::from_str(old).unwrap();
+        assert_eq!(state.next_index, 3);
+        assert!(state.withdrawn.is_empty());
     }
 }

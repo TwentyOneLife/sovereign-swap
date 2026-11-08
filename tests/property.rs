@@ -131,6 +131,7 @@ fn decide_is_safe_on_arbitrary_chain_views() {
                     taker_chain_height: height.saturating_sub(rng.below(2) as u32),
                     maker_lock: random_lock(&mut rng, 10, height),
                     taker_lock: random_lock(&mut rng, 11, height),
+                    own_funded: rng.below(2) == 1,
                 };
                 let secret = (role == Role::Maker).then_some([9u8; 32]);
                 let before = s.phase;
@@ -240,6 +241,7 @@ fn a_monotonic_chain_drives_the_taker_to_a_terminal_phase() {
                 taker_chain_height: h,
                 maker_lock: maker.view(),
                 taker_lock: taker.view(),
+                own_funded: taker.confirmed.is_some(),
             };
             for a in s.decide(&view, None) {
                 match a {

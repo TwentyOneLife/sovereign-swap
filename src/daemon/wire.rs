@@ -18,6 +18,14 @@ pub(crate) fn offer_id_of(path: &str) -> &str {
         .unwrap_or("")
 }
 
+/// The id between `prefix` and `suffix` in a path like `/offers/<id>/withdraw`, or "" if it does not
+/// fit the shape. The caller still runs `valid_id` on the result.
+pub(crate) fn path_id<'a>(path: &'a str, prefix: &str, suffix: &str) -> &'a str {
+    path.strip_prefix(prefix)
+        .and_then(|r| r.strip_suffix(suffix))
+        .unwrap_or("")
+}
+
 pub(crate) fn random16() -> [u8; 16] {
     let mut b = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {

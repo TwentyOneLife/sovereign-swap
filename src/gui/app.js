@@ -58,7 +58,7 @@ function renderStatus() {
         : "price reference: off";
   el.innerHTML =
     `${dot(onoff(s.btc_node))}BTC ${dot(onoff(s.xbtc_node))}xBTC ${dot(onoff(s.engine))}engine ` +
-    `${dot(onoff(s.relays > 0))}relay ${dot(priceState, priceTitle)}price · ${s.active_swaps} active`;
+    `${dot(onoff(s.relays > 0))}relay ${dot(priceState, priceTitle)}price · ${s.active_swaps ?? "?"} active`;
 }
 
 async function loadStatus() {

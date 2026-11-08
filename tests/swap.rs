@@ -606,4 +606,37 @@ fn duplicate_messages_do_not_create_duplicate_swaps() {
         1,
         "taker made a duplicate swap"
     );
+    // The filled offer was pruned, so a replayed bid finds nothing to take.
+    assert!(
+        maker.engine().own_offers().is_empty(),
+        "a filled offer must be pruned"
+    );
+}
+
+/// A withdrawn offer must leave the taker's discovery and not come back when the relay replays the
+/// original offer event.
+#[test]
+fn a_withdrawn_offer_disappears_and_does_not_reappear_on_replay() {
+    let Some(w) = World::start() else { return };
+    let (a, b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let mut taker = Party::new("taker", b, &w.btc, &w.xbtc);
+    let offer = offer(Chain::Xbtc);
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));
+    // The maker withdraws it; the taker drops it on the next tick.
+    maker.engine().withdraw(offer.id).unwrap();
+    taker.tick();
+    assert!(
+        taker.engine().seen_offers().is_empty(),
+        "a withdrawn offer must disappear"
+    );
+    // A relay replay of the original offer event must not bring it back.
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    assert!(
+        taker.engine().seen_offers().is_empty(),
+        "a withdrawn offer must not reappear on replay"
+    );
 }

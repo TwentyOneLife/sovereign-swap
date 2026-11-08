@@ -383,8 +383,14 @@ impl NewOffer {
                 }
             }
         }
-        if self.min_amount_sat < min_swap_sat || self.min_amount_sat > self.amount_sat {
-            e.push("min_amount_sat: between the minimum leg and amount_sat".to_owned());
+        // Offers are atomic: the whole amount is taken at once. Partial or pro-rata fills are not
+        // supported yet (they need offer decrement, re-broadcast, and take-time concurrency), so the
+        // minimum must equal the amount. This keeps a filled offer safe to prune outright.
+        if self.min_amount_sat != self.amount_sat {
+            e.push(
+                "min_amount_sat: must equal amount_sat (partial takes are not supported yet)"
+                    .to_owned(),
+            );
         }
         e
     }
@@ -656,6 +662,28 @@ mod tests {
         );
         let swap = o.into_swap_offer(&Settings::default());
         assert_eq!(swap.taker_amount, Amount::from_sat(287_000_000));
+    }
+
+    #[test]
+    fn a_non_atomic_offer_is_refused() {
+        // Partial takes are not supported yet, so an offer whose minimum is below its amount is
+        // refused; an equal minimum and amount validates.
+        let partial = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 2_000_000,
+            price: None,
+            counter_amount_sat: Some(2_000_000),
+            min_amount_sat: 1_000_000,
+        };
+        assert!(partial
+            .validate(DUST_SAT)
+            .iter()
+            .any(|m| m.contains("min_amount_sat")));
+        let atomic = NewOffer {
+            min_amount_sat: 2_000_000,
+            ..partial
+        };
+        assert!(atomic.validate(DUST_SAT).is_empty());
     }
 
     #[test]
