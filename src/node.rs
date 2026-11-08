@@ -483,6 +483,18 @@ impl ChainNode {
             .map_err(|e| NodeError::Unexpected(e.to_string()))
     }
 
+    /// The scriptPubKey of an operator-configured payout address (finding F5), network-checked for
+    /// this node's chain so a wrong-network or malformed address is caught before a claim/refund pays
+    /// into it. A silent payment (`sp1...`) address is rejected: a claim/refund spend pays a plain
+    /// scriptPubKey, so the payout must be a normal address.
+    pub fn script_for(&self, addr: &str) -> Result<ScriptBuf, NodeError> {
+        let parsed = Address::from_str(addr)
+            .map_err(|e| NodeError::Unexpected(format!("payout address: {e}")))?
+            .require_network(self.network)
+            .map_err(|_| NodeError::Unexpected("payout address is for the wrong network".into()))?;
+        Ok(parsed.script_pubkey())
+    }
+
     fn address(&self, contract: &Contract) -> Address {
         Address::from_script(&contract.script_pubkey(), self.network).expect("P2WSH has an address")
     }

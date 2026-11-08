@@ -153,6 +153,17 @@ pub struct Settings {
     /// address because the two chains share Bitcoin's address format (design 0013).
     #[serde(default)]
     pub fee_xbtc_address: String,
+    /// Optional operator-owned address where this node's claimed proceeds and its own refunds on the
+    /// BTC chain are sent (finding F5, design 0014). Empty (the default) keeps today's behaviour: a
+    /// fresh address from the node's own funding wallet, so proceeds sit in the hot wallet. Set it to
+    /// move claimed proceeds and refunds to an operator-held (e.g. cold) address off the engine host.
+    /// Must be a normal address (not a silent payment); network-checked where the spend is built.
+    #[serde(default)]
+    pub btc_payout_address: String,
+    /// The same for the xBTC chain. Kept separate from the BTC address because the two chains share
+    /// Bitcoin's address format.
+    #[serde(default)]
+    pub xbtc_payout_address: String,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -219,6 +230,8 @@ impl Default for Settings {
             fee_enabled: false,
             fee_btc_address: String::new(),
             fee_xbtc_address: String::new(),
+            btc_payout_address: String::new(),
+            xbtc_payout_address: String::new(),
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -299,6 +312,19 @@ impl Settings {
                 }
             }
         }
+        // Operator payout addresses (finding F5): optional, but if set must be a normal address, since
+        // a claim/refund spend pays a plain scriptPubKey. The authoritative, network-checked parse is
+        // in the node (`ChainNode::script_for`); this is the settings-time shape guard.
+        for (name, a) in [
+            ("btc_payout_address", &self.btc_payout_address),
+            ("xbtc_payout_address", &self.xbtc_payout_address),
+        ] {
+            if !a.trim().is_empty() && !looks_like_normal_address(a) {
+                e.push(format!(
+                    "{name}: must be a normal address (not a silent payment address)"
+                ));
+            }
+        }
         e
     }
 }
@@ -311,6 +337,16 @@ fn looks_like_fee_address(a: &str) -> bool {
     let a = a.trim();
     looks_like_sp_address(a)
         || a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .is_ok()
+}
+
+/// A settings-time shape check for an operator payout address (finding F5): it must parse as a normal
+/// Bitcoin-format address and must NOT be a silent payment address, because a claim/refund spend pays
+/// a plain scriptPubKey. The authoritative per-chain network check is in `ChainNode::script_for`.
+fn looks_like_normal_address(a: &str) -> bool {
+    let a = a.trim();
+    !looks_like_sp_address(a)
+        && a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
             .is_ok()
 }
 
@@ -608,6 +644,61 @@ mod tests {
         s.fee_btc_address = String::new();
         s.fee_xbtc_address = String::new();
         assert!(s.validate().is_empty());
+    }
+
+    #[test]
+    fn operator_payout_addresses_are_optional_and_shape_checked() {
+        // Blank (the default) is fine: today's node-wallet behaviour.
+        let s = Settings::default();
+        assert!(
+            s.validate().is_empty(),
+            "blank payout addresses must validate"
+        );
+        // A well-formed normal address is accepted.
+        let normal = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let s = Settings {
+            btc_payout_address: normal.to_owned(),
+            ..Default::default()
+        };
+        assert!(
+            s.validate().is_empty(),
+            "a normal payout address must be accepted: {:?}",
+            s.validate()
+        );
+        // A silent payment address is refused: a claim/refund spend pays a plain scriptPubKey.
+        let s = Settings {
+            xbtc_payout_address: sp_addr(),
+            ..Default::default()
+        };
+        assert!(
+            s.validate()
+                .iter()
+                .any(|m| m.contains("xbtc_payout_address")),
+            "a silent payment payout address must be refused"
+        );
+        // A malformed address is refused.
+        let s = Settings {
+            btc_payout_address: "not-an-address".to_owned(),
+            ..Default::default()
+        };
+        assert!(s
+            .validate()
+            .iter()
+            .any(|m| m.contains("btc_payout_address")));
+    }
+
+    #[test]
+    fn engine_config_maps_payout_addresses_to_the_engine_config() {
+        use crate::daemon::engine::engine_config;
+        let normal = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let s = Settings {
+            btc_payout_address: format!("  {normal}  "), // trimmed
+            xbtc_payout_address: String::new(),
+            ..Default::default()
+        };
+        let cfg = engine_config(&s);
+        assert_eq!(cfg.btc_payout.as_deref(), Some(normal), "set + trimmed");
+        assert_eq!(cfg.xbtc_payout, None, "blank maps to None (node wallet)");
     }
 
     #[test]
