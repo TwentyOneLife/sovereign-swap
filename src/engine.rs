@@ -39,6 +39,11 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// A short hex prefix of a 16-byte id, for log lines (F4): enough to correlate, not the whole id.
+fn short_id(id: &[u8; 16]) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Lower bound (floor) on a claim/refund transaction fee, in sats. The actual fee is the greater
@@ -492,18 +497,40 @@ impl<T: Transport> Engine<T> {
                     .find(|o| o.id == offer_id)
                     .cloned()
                 else {
+                    eprintln!(
+                        "bid dropped: no own offer {} (withdrawn or never ours)",
+                        short_id(&offer_id)
+                    );
                     return Ok(());
                 };
                 if self.records.iter().any(|r| r.swap.id == swap_id) {
                     return Ok(());
                 }
-                let Ok(taker_part) =
-                    offer.taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
-                else {
-                    return Ok(());
+                // A bid the maker cannot honour was silently dropped, so an operator could not tell a
+                // below-minimum (or above-offer) bid from a lost message (F4). Log the reason.
+                let taker_part = match offer
+                    .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(
+                            "bid dropped for offer {}: amount {} sat rejected ({e:?}); min_swap_sat {}",
+                            short_id(&offer_id),
+                            maker_part.to_sat(),
+                            self.min_swap_sat
+                        );
+                        return Ok(());
+                    }
                 };
-                let Ok(depths) = self.config.policy.depths(&offer, maker_part, taker_part) else {
-                    return Ok(());
+                let depths = match self.config.policy.depths(&offer, maker_part, taker_part) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!(
+                            "bid dropped for offer {}: policy rejected ({e:?})",
+                            short_id(&offer_id)
+                        );
+                        return Ok(());
+                    }
                 };
                 let index = self.take_index();
                 let secret_hash =
