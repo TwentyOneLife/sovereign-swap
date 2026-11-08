@@ -640,3 +640,29 @@ fn a_withdrawn_offer_disappears_and_does_not_reappear_on_replay() {
         "a withdrawn offer must not reappear on replay"
     );
 }
+
+/// Operator abort is only for a swap that has committed no coin: once our lock is funded it must be
+/// refused, so a funded swap can only ever reach a timelock refund, never a forced abandon that would
+/// strand the coin (#65).
+#[test]
+fn abort_refuses_a_swap_whose_lock_is_funded() {
+    let Some(w) = World::start() else { return };
+    let (mut maker, mut taker) = w.parties(Chain::Xbtc);
+    // Drive until the taker's own lock is funded and on chain.
+    w.run(&mut maker, &mut taker, 40, always, false, |_, t| {
+        t.phase() == Some(Phase::Locked)
+    });
+    let swap_id = taker.engine().swaps().next().expect("a swap").id;
+    assert!(
+        matches!(
+            taker.engine().abort(swap_id),
+            Err(EngineError::AlreadyFunded)
+        ),
+        "abort must refuse a funded swap"
+    );
+    assert_ne!(
+        taker.phase(),
+        Some(Phase::Abandoned),
+        "a funded swap must not be force-abandoned by abort"
+    );
+}
