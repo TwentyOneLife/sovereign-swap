@@ -204,10 +204,13 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
     let mut policy = Policy::standard();
     policy.funding_minconf_btc = s.btc_conf;
     policy.funding_minconf_xbtc = s.xbtc_conf;
+    let payout = |a: &str| (!a.trim().is_empty()).then(|| a.trim().to_owned());
     EngineConfig {
         spend_fee: Amount::from_sat(2_000),
         fee_rate_sat_vb: 2,
         policy,
+        btc_payout: payout(&s.btc_payout_address),
+        xbtc_payout: payout(&s.xbtc_payout_address),
     }
 }
 

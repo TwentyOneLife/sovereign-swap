@@ -28,6 +28,14 @@ pub struct Config {
     pub spend_fee: Amount,
     pub fee_rate_sat_vb: u64,
     pub policy: Policy,
+    /// Optional operator-owned payout address per chain, where this node's claimed proceeds and its
+    /// own refunds on that chain are sent instead of a fresh address from the node's hot wallet
+    /// (finding F5, design 0014). `None` keeps today's behaviour (the node wallet). The
+    /// network-checked parse happens at `start()` via the chain's node, mirroring the fee address, so
+    /// a wrong-network or malformed address fails the swap start loudly rather than paying into the
+    /// void. Kept per chain because the two chains share Bitcoin's address format.
+    pub btc_payout: Option<String>,
+    pub xbtc_payout: Option<String>,
 }
 
 /// What a swap needs besides its state: where our coins go, and our lock once signed.
@@ -480,6 +488,21 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Watches both contracts, picks destinations, stores the swap, then keeps the bookkeeping.
+    /// Where our coin lands on `chain`: the operator's configured payout address if set (F5), else a
+    /// fresh address from the node's own wallet (today's default). A configured address is
+    /// network-checked by the node, so a misconfigured one fails the swap start rather than paying
+    /// into the void.
+    fn destination(&self, chain: Chain) -> Result<ScriptBuf, EngineError> {
+        let configured = match chain {
+            Chain::Btc => self.config.btc_payout.as_deref(),
+            Chain::Xbtc => self.config.xbtc_payout.as_deref(),
+        };
+        match configured {
+            Some(addr) => Ok(self.nodes[&chain].script_for(addr)?),
+            None => Ok(self.nodes[&chain].new_destination()?),
+        }
+    }
+
     fn start(&mut self, swap: Swap) -> Result<(), EngineError> {
         let maker_chain = swap.offer.maker_chain;
         let (claim_chain, refund_chain) = match swap.role {
@@ -491,8 +514,8 @@ impl<T: Transport> Engine<T> {
         self.backend(maker_chain.other())
             .watch_contract(&swap.taker_contract)?;
         let record = Record {
-            claim_to: self.nodes[&claim_chain].new_destination()?,
-            refund_to: self.nodes[&refund_chain].new_destination()?,
+            claim_to: self.destination(claim_chain)?,
+            refund_to: self.destination(refund_chain)?,
             funding: None,
             fee: None,
             received_fee: None,

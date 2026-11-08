@@ -35,6 +35,8 @@ fn config() -> Config {
             funding_minconf_btc: 1,
             funding_minconf_xbtc: 1,
         },
+        btc_payout: None,
+        xbtc_payout: None,
     }
 }
 
