@@ -67,6 +67,14 @@ Dust and sanity: `floor` (1,000 sat) is far above any dust limit, so a fee outpu
 spendable. The fee is checked to be a small fraction of `locked` (a sanity band, same spirit as the
 rate band in 0009 layer 2), so a mis-set rate cannot produce a fee larger than the trade.
 
+> **IMPLEMENTED 2026-11-08 (F3).** The band is `fee_exceeds_band(fee, locked)`:
+> `fee > MAX_FEE_FRACTION_BPS (50%) of locked`. It is enforced **only locally** - a maker at publish
+> (`post_offer`) and a taker before it takes (`bid`) - and never in counterparty fee verification, so
+> an old and a new peer never disagree over an offer. Under today's constants it **cannot fire**: the
+> swap minimum (`MIN_SWAP_FLOOR_SAT`, 3,000) keeps the 1,000-sat floor to at most ~33% of the smallest
+> leg. It is belt-and-braces, guarding only against a later lowering of the swap minimum or a raising
+> of the floor/bps cap. It does NOT cap dust-fee economics; that would be a different, lower threshold.
+
 ## Silent payments on the funding path
 
 A silent payment address `sp1...` carries two public keys, scan and spend. The payer, who holds the

@@ -700,6 +700,41 @@ impl Daemon {
         if !self.engine_running() {
             return Self::not_running();
         }
+        // F3 local band: refuse to publish an offer whose own voluntary fee would be a
+        // disproportionate fraction of the leg. Local only; cannot fire under today's constants.
+        {
+            let guard = self.state.lock().unwrap();
+            let s = &guard.settings;
+            let addr = match new.sell_chain {
+                Chain::Btc => &s.fee_btc_address,
+                Chain::Xbtc => &s.fee_xbtc_address,
+            };
+            if s.fee_enabled && !addr.trim().is_empty() {
+                let rates = crate::fee::FeeRates {
+                    maker_bps: s.fee_maker_bps,
+                    taker_bps: s.fee_taker_bps,
+                };
+                let leg = Amount::from_sat(new.amount_sat);
+                if let Ok(fee) = crate::fee::fee_amount_min(
+                    rates,
+                    crate::swap::Role::Maker,
+                    leg,
+                    s.min_trade_sat,
+                ) {
+                    if crate::fee::fee_exceeds_band(fee, leg) {
+                        return (
+                            422,
+                            json!({"error": format!(
+                                "voluntary fee ({} sat) would exceed {}% of the {}-sat leg",
+                                fee.to_sat(),
+                                crate::fee::MAX_FEE_FRACTION_BPS / 100,
+                                new.amount_sat
+                            )}),
+                        );
+                    }
+                }
+            }
+        }
         let offer = new.into_swap_offer(&self.state.lock().unwrap().settings);
         let id = offer.id.to_hex_string(Case::Lower);
         match self.engine_call(move |reply| EngineCmd::Publish(offer, reply)) {

@@ -17,6 +17,21 @@ pub const FLOOR_SAT: u64 = 1_000;
 /// this. The floor above is deliberately NOT configurable: it guards Bitcoin's dust limit.
 pub const MIN_TRADE_SAT: u64 = 100_000;
 
+/// The per-trade fee-vs-leg sanity band (F3, design 0010): the voluntary fee must not exceed this
+/// fraction of the leg it rides. Enforced ONLY locally - a maker at publish and a taker before it
+/// takes - never in counterparty fee verification, so an old and a new peer never disagree over an
+/// offer. Belt-and-braces: under today's constants it cannot fire, because the swap minimum
+/// (`MIN_SWAP_FLOOR_SAT`, 3000) keeps the 1000-sat fee floor to at most ~33% of the smallest leg. It
+/// guards only against a later change to the floor, the bps cap, or the swap minimum.
+pub const MAX_FEE_FRACTION_BPS: u64 = 5_000; // 50%
+
+/// True when `fee` is more than [`MAX_FEE_FRACTION_BPS`] of `locked` (the F3 band). u128 intermediates
+/// keep the comparison exact for any sat amount.
+pub fn fee_exceeds_band(fee: Amount, locked: Amount) -> bool {
+    u128::from(fee.to_sat()) * 10_000
+        > u128::from(locked.to_sat()) * u128::from(MAX_FEE_FRACTION_BPS)
+}
+
 /// The static per-side rates, in basis points (hundredths of a percent). Defaults 20 / 30 (spec 7.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeeRates {
@@ -72,6 +87,31 @@ mod tests {
         maker_bps: 20,
         taker_bps: 30,
     };
+
+    #[test]
+    fn fee_vs_leg_band() {
+        // The worst case under today's constants: the 1000-sat floor on the smallest 3000-sat leg is
+        // 33%, inside the 50% band.
+        assert!(!fee_exceeds_band(
+            Amount::from_sat(1_000),
+            Amount::from_sat(3_000)
+        ));
+        // Just under 50% passes, just over fails (leg under 2000 so the floor could exceed the band
+        // only if the swap minimum were lowered below it - which it is not).
+        assert!(!fee_exceeds_band(
+            Amount::from_sat(1_000),
+            Amount::from_sat(2_001)
+        ));
+        assert!(fee_exceeds_band(
+            Amount::from_sat(1_000),
+            Amount::from_sat(1_999)
+        ));
+        // Equal fee and leg is well over the band.
+        assert!(fee_exceeds_band(
+            Amount::from_sat(500),
+            Amount::from_sat(500)
+        ));
+    }
 
     #[test]
     fn proportional_above_the_floor() {
