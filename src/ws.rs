@@ -6,11 +6,11 @@
 //! queues and buffers the events a `REQ` subscription returns. See design 0006.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 use tungstenite::protocol::WebSocketConfig;
@@ -24,11 +24,25 @@ use crate::routing::RelayConn;
 /// memory. Our events are a few KiB; a relay's max event is 128 KiB.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_BUFFERED_EVENTS: usize = 10_000;
+/// How many stored events a (re)subscription accepts, so a reconnect does not pull the relay's whole
+/// retention window again; how often to ping so a half-open socket is noticed and reconnected rather
+/// than silently swallowing published offers; and the cap on reconnect backoff.
+const SUB_LIMIT: u32 = 500;
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct WsConn {
     outgoing: Sender<String>,
     incoming: Arc<Mutex<VecDeque<Event>>>,
+    shutdown: Arc<AtomicBool>,
     _worker: std::thread::JoinHandle<()>,
+}
+
+impl Drop for WsConn {
+    fn drop(&mut self) {
+        // Tell the worker to stop reconnecting and exit; its socket closes with it.
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -43,66 +57,142 @@ impl WsConn {
     /// Connects to `url` (ws://host:port/...). With `socks`, dials through that Tor SOCKS5 proxy so
     /// an `.onion` host resolves inside Tor; without it, a direct TCP connection.
     pub fn connect(url: &str, socks: Option<&str>) -> Result<WsConn, WsError> {
-        let (host, port, _path) = parse_ws_url(url)?;
-        let stream = match socks {
-            Some(proxy) => {
-                crate::socks::socks5_connect(proxy, &host, port, Duration::from_secs(30))
-                    .map_err(|e| WsError::Socks(e.to_string()))?
-            }
-            None => TcpStream::connect((host.as_str(), port)).map_err(WsError::Io)?,
-        };
-        // A generous timeout for the handshake: over a Tor onion the server's upgrade response can
-        // take several seconds, far longer than the 100 ms the worker loop wants. Setting the short
-        // timeout here (as before) silently failed every relay reached through Tor, because the
-        // handshake read timed out before the 101 arrived. The short timeout is set below, once the
-        // handshake is done and the worker needs non-blocking polling.
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(WsError::Io)?;
-        // Bound total message size (memory) but leave the frame size at the library default: a
-        // too-small frame cap makes tungstenite assert rather than error on an oversized frame.
-        let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
-        let (mut socket, _resp) = client_with_config(url, stream, Some(config))
-            .map_err(|e| WsError::Handshake(e.to_string()))?;
-        // The worker reads with a short timeout so it checks the outgoing queue often.
-        socket
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(WsError::Io)?;
-
-        // Subscribe to our event kind; we filter and route client-side.
-        let req = format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#);
-        socket
-            .send(WsMessage::Text(req.into()))
-            .map_err(|e| WsError::Handshake(e.to_string()))?;
-
+        // The first connect is synchronous so an unreachable relay still fails here; later drops are
+        // healed by the worker's reconnect loop.
+        let mut socket = dial(url, socks)?;
+        subscribe(&mut socket, None)?;
         let incoming: Arc<Mutex<VecDeque<Event>>> = Arc::default();
         let buffer = Arc::clone(&incoming);
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
-        let worker = std::thread::spawn(move || run(socket, rx, buffer));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let url = url.to_owned();
+        let socks = socks.map(str::to_owned);
+        let worker = std::thread::spawn(move || {
+            run(socket, &url, socks.as_deref(), rx, buffer, &worker_shutdown);
+        });
         Ok(WsConn {
             outgoing: tx,
             incoming,
+            shutdown,
             _worker: worker,
         })
     }
 }
 
-/// The owner thread: drains outgoing messages, reads incoming frames, keeps the connection alive.
-fn run<S: Read + Write>(
-    mut socket: tungstenite::WebSocket<S>,
+/// Dials `url` (direct or through the Tor SOCKS proxy), does the WebSocket handshake, and leaves the
+/// socket in short-timeout non-blocking mode for the worker loop.
+fn dial(url: &str, socks: Option<&str>) -> Result<tungstenite::WebSocket<TcpStream>, WsError> {
+    let (host, port, _path) = parse_ws_url(url)?;
+    let stream = match socks {
+        Some(proxy) => crate::socks::socks5_connect(proxy, &host, port, Duration::from_secs(30))
+            .map_err(|e| WsError::Socks(e.to_string()))?,
+        None => TcpStream::connect((host.as_str(), port)).map_err(WsError::Io)?,
+    };
+    // A generous timeout for the handshake: over a Tor onion the server's upgrade response can take
+    // several seconds, far longer than the 100 ms the worker loop wants. The short timeout is set
+    // below, once the handshake is done and the worker needs non-blocking polling.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(WsError::Io)?;
+    // Bound total message size (memory) but leave the frame size at the library default: a too-small
+    // frame cap makes tungstenite assert rather than error on an oversized frame.
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES));
+    let (socket, _resp) = client_with_config(url, stream, Some(config))
+        .map_err(|e| WsError::Handshake(e.to_string()))?;
+    socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(WsError::Io)?;
+    Ok(socket)
+}
+
+/// Subscribes to our event kind, bounded by `SUB_LIMIT`; `since` (a watermark of the newest event
+/// already seen) keeps a reconnect from replaying the whole retention window. We filter and route
+/// client-side regardless.
+fn subscribe(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    since: Option<u64>,
+) -> Result<(), WsError> {
+    let filter = match since {
+        Some(s) => format!(r#"{{"kinds":[{KIND_SWAP}],"since":{s},"limit":{SUB_LIMIT}}}"#),
+        None => format!(r#"{{"kinds":[{KIND_SWAP}],"limit":{SUB_LIMIT}}}"#),
+    };
+    socket
+        .send(WsMessage::Text(format!(r#"["REQ","s",{filter}]"#).into()))
+        .map_err(|e| WsError::Handshake(e.to_string()))
+}
+
+/// The owner thread: serve the socket until it breaks, then reconnect (unless shutting down).
+fn run(
+    mut socket: tungstenite::WebSocket<TcpStream>,
+    url: &str,
+    socks: Option<&str>,
     rx: Receiver<String>,
     buffer: Arc<Mutex<VecDeque<Event>>>,
+    shutdown: &AtomicBool,
 ) {
+    let mut since: Option<u64> = None;
     loop {
-        while let Ok(text) = rx.try_recv() {
-            if socket.send(WsMessage::Text(text.into())).is_err() {
+        serve(&mut socket, &rx, &buffer, shutdown, &mut since);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        // The socket broke. Reconnect with capped backoff, resubscribing from the watermark so new
+        // offers flow again and the relay does not replay the whole backlog.
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
                 return;
             }
+            std::thread::sleep(backoff);
+            match dial(url, socks).and_then(|mut s| subscribe(&mut s, since).map(|()| s)) {
+                Ok(s) => {
+                    socket = s;
+                    break;
+                }
+                Err(_) => backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF),
+            }
+        }
+    }
+}
+
+/// One connection's lifetime: drain the outgoing queue, ping periodically so a half-open socket is
+/// noticed, and buffer incoming events (tracking the newest `created_at` as the reconnect watermark).
+/// Returns when the socket breaks or a shutdown is requested.
+fn serve(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    rx: &Receiver<String>,
+    buffer: &Arc<Mutex<VecDeque<Event>>>,
+    shutdown: &AtomicBool,
+    since: &mut Option<u64>,
+) {
+    let mut last_ping = Instant::now();
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(text) => {
+                    if socket.send(WsMessage::Text(text.into())).is_err() {
+                        return;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        if last_ping.elapsed() >= PING_INTERVAL {
+            if socket.send(WsMessage::Ping(Vec::new().into())).is_err() {
+                return;
+            }
+            last_ping = Instant::now();
         }
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
                 if let Some(event) = parse_event_message(&text) {
+                    *since = Some(since.map_or(event.created_at, |s| s.max(event.created_at)));
                     let mut buf = buffer.lock().unwrap();
                     if buf.len() >= MAX_BUFFERED_EVENTS {
                         buf.pop_front();
