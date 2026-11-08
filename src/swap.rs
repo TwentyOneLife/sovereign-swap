@@ -262,6 +262,10 @@ pub struct ChainView {
     pub taker_chain_height: u32,
     pub maker_lock: Option<LockView>,
     pub taker_lock: Option<LockView>,
+    /// Whether our lock transaction has been funded (signed and stored) yet. Lets the maker tell a
+    /// swap it has already committed coin to from one it has not funded, so only the latter can be
+    /// abandoned at its deadline.
+    pub own_funded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,9 +322,25 @@ impl Swap {
     fn decide_maker(&mut self, view: &ChainView, secret: [u8; PREIMAGE_LEN]) -> Vec<Action> {
         let (ha, hb) = (view.maker_chain_height, view.taker_chain_height);
         let Some(own) = &view.maker_lock else {
-            // Funded but not (or no longer) on chain: the driver rebroadcasts the same transaction.
             return match self.phase {
-                Phase::Locking | Phase::Locked => vec![Action::Fund],
+                // Confirmed once, then gone (a reorg): rebroadcast the same transaction.
+                Phase::Locked => vec![Action::Fund],
+                Phase::Locking => {
+                    if view.own_funded {
+                        // Funded, awaiting its first confirmation: the driver rebroadcasts it.
+                        return vec![Action::Fund];
+                    }
+                    // Not funded yet. Give up before the taker's deadline once a fresh lock could no
+                    // longer reach funding depth in time, so we never fund a lock against a swap the
+                    // taker has already abandoned.
+                    let cutoff = self.lock_deadline.saturating_sub(self.depths.maker_lock);
+                    if ha > cutoff {
+                        self.phase = Phase::Abandoned;
+                        vec![]
+                    } else {
+                        vec![Action::Fund]
+                    }
+                }
                 _ => vec![],
             };
         };
@@ -563,6 +583,7 @@ mod tests {
             taker_chain_height: hb,
             maker_lock,
             taker_lock,
+            own_funded: false,
         }
     }
 
@@ -633,6 +654,32 @@ mod tests {
             s.decide(&view(101, 101, None, None), SECRET),
             vec![Action::Fund]
         );
+    }
+
+    #[test]
+    fn maker_abandons_if_it_cannot_fund_by_the_deadline() {
+        let mut s = swap(Role::Maker);
+        // Cutoff is lock_deadline 110 minus the maker_lock depth 2, so 108: at it, still try.
+        assert_eq!(
+            s.decide(&view(108, 108, None, None), SECRET),
+            vec![Action::Fund]
+        );
+        assert_eq!(s.phase, Phase::Locking);
+        // One block past the cutoff with nothing funded: give up, having locked nothing.
+        assert_eq!(s.decide(&view(109, 109, None, None), SECRET), vec![]);
+        assert_eq!(s.phase, Phase::Abandoned);
+    }
+
+    #[test]
+    fn maker_past_the_deadline_never_abandons_a_funded_lock() {
+        let mut s = swap(Role::Maker);
+        // Funded but not yet on chain, long past the cutoff: rebroadcast, never abandon.
+        let funded = ChainView {
+            own_funded: true,
+            ..view(200, 200, None, None)
+        };
+        assert_eq!(s.decide(&funded, SECRET), vec![Action::Fund]);
+        assert_eq!(s.phase, Phase::Locking);
     }
 
     #[test]

@@ -274,6 +274,7 @@ mod tests {
             taker_chain_height: 50,
             maker_lock: Some(lock),
             taker_lock: None,
+            own_funded: false,
         };
         // We are the maker, so our lock is on the maker chain with 40 lock blocks.
         let j = chain_view_json(&view, Side::Maker, 40, 20);

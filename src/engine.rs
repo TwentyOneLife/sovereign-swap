@@ -295,7 +295,12 @@ impl<T: Transport> Engine<T> {
                         lock_blocks: offer.taker_lock_blocks,
                     },
                     depths,
-                    lock_deadline: 0,
+                    // The same reference the taker computes, so the maker gives up (in
+                    // `decide_maker`) strictly before the taker abandons, and never funds a lock
+                    // against a swap the taker has already walked away from.
+                    lock_deadline: self.backend(offer.maker_chain).height()?
+                        + depths.maker_lock
+                        + LOCK_WAIT_BLOCKS,
                     learned_secret: None,
                     phase: Phase::Locking,
                     offer,
@@ -437,6 +442,7 @@ impl<T: Transport> Engine<T> {
             taker_chain_height: b.height()?,
             maker_lock,
             taker_lock,
+            own_funded: record.funding.is_some(),
         })
     }
 
