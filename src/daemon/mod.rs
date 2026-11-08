@@ -455,6 +455,7 @@ impl Daemon {
             ("GET", "/offers") => self.get_offers(),
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
+            ("GET", "/history") => self.get_history(),
             ("POST", p)
                 if p.starts_with("/offers/")
                     && p.ends_with("/take")
@@ -552,6 +553,9 @@ impl Daemon {
             "relays": settings.relays.len(),
             "engine": running,
             "active_swaps": active_swaps,
+            // Per-chain explorer bases for the web UI to link txids (#67); empty = render as plain text.
+            "btc_explorer_url": settings.btc_explorer_url,
+            "xbtc_explorer_url": settings.xbtc_explorer_url,
         })
     }
 
@@ -587,6 +591,19 @@ impl Daemon {
                 200,
                 json!(swaps.iter().map(SwapView::to_json).collect::<Vec<_>>()),
             ),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// The operator reporting ledger (#67): per-swap history plus totals, derived from the engine's
+    /// own records. The web UI pairs the txids here with the configured explorer URLs (from
+    /// `GET /status`) to render links.
+    fn get_history(&self) -> (u16, Value) {
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(EngineCmd::History) {
+            Ok(v) => (200, v),
             Err(e) => (503, json!({ "error": e })),
         }
     }

@@ -164,6 +164,14 @@ pub struct Settings {
     /// Bitcoin's address format.
     #[serde(default)]
     pub xbtc_payout_address: String,
+    /// Optional per-chain block-explorer base URL the web UI links txids against, as
+    /// `<base>/tx/<txid>` (#67). Empty (default) renders txids as plain text. Defaults in practice to
+    /// the operator's own local mempool; accepts a clearnet https URL or a Tor `.onion` URL, the
+    /// operator's choice and their privacy trade-off.
+    #[serde(default)]
+    pub btc_explorer_url: String,
+    #[serde(default)]
+    pub xbtc_explorer_url: String,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -232,6 +240,8 @@ impl Default for Settings {
             fee_xbtc_address: String::new(),
             btc_payout_address: String::new(),
             xbtc_payout_address: String::new(),
+            btc_explorer_url: String::new(),
+            xbtc_explorer_url: String::new(),
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -322,6 +332,19 @@ impl Settings {
             if !a.trim().is_empty() && !looks_like_normal_address(a) {
                 e.push(format!(
                     "{name}: must be a normal address (not a silent payment address)"
+                ));
+            }
+        }
+        // Explorer base URLs (#67): optional; if set, a clearnet http(s) or a Tor .onion over http(s)
+        // base. The UI appends `/tx/<txid>`; a malformed base would just make a dead link.
+        for (name, url) in [
+            ("btc_explorer_url", &self.btc_explorer_url),
+            ("xbtc_explorer_url", &self.xbtc_explorer_url),
+        ] {
+            let u = url.trim();
+            if !u.is_empty() && !(u.starts_with("http://") || u.starts_with("https://")) {
+                e.push(format!(
+                    "{name}: must be an http:// or https:// URL, or empty"
                 ));
             }
         }
@@ -699,6 +722,29 @@ mod tests {
         let cfg = engine_config(&s);
         assert_eq!(cfg.btc_payout.as_deref(), Some(normal), "set + trimmed");
         assert_eq!(cfg.xbtc_payout, None, "blank maps to None (node wallet)");
+    }
+
+    #[test]
+    fn explorer_urls_are_optional_and_scheme_checked() {
+        // Blank (default) validates.
+        assert!(Settings::default().validate().is_empty());
+        // A clearnet https base and a Tor .onion over http both validate.
+        let s = Settings {
+            btc_explorer_url: "https://mempool.lan".to_owned(),
+            xbtc_explorer_url: "http://abcd1234.onion".to_owned(),
+            ..Default::default()
+        };
+        assert!(
+            s.validate().is_empty(),
+            "https and onion-over-http bases must validate: {:?}",
+            s.validate()
+        );
+        // A base without a scheme is refused (it would make a dead link).
+        let s = Settings {
+            btc_explorer_url: "mempool.lan".to_owned(),
+            ..Default::default()
+        };
+        assert!(s.validate().iter().any(|m| m.contains("btc_explorer_url")));
     }
 
     #[test]

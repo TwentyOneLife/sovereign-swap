@@ -209,6 +209,103 @@ impl<T: Transport> Engine<T> {
         self.records.iter().map(|r| &r.swap)
     }
 
+    /// A record-derived ledger for operator reporting (#67): one entry per swap, plus totals, built
+    /// from local records only (no chain query). The voluntary fee a leg paid is recomputed from the
+    /// offer terms exactly as the engine placed it on our lock, so it matches what was spent. Txids
+    /// beyond our own lock are on the live per-swap view (`GET /swaps/{id}`). Fees *received* at the
+    /// project addresses are deliberately not here: that needs an operator-side watch-only wallet, not
+    /// the package (see #67's layer note).
+    pub fn history(&self) -> serde_json::Value {
+        let chain = |c: Chain| match c {
+            Chain::Btc => "btc",
+            Chain::Xbtc => "xbtc",
+        };
+        let mut entries = Vec::with_capacity(self.records.len());
+        let (mut done, mut refunded, mut abandoned, mut active) = (0u64, 0u64, 0u64, 0u64);
+        let (mut btc_vol, mut xbtc_vol) = (0u64, 0u64);
+        let (mut fee_paid_total, mut fee_count) = (0u64, 0u64);
+        for r in &self.records {
+            let s = &r.swap;
+            let own_chain = match s.role {
+                Role::Maker => s.offer.maker_chain,
+                Role::Taker => s.offer.maker_chain.other(),
+            };
+            let own_locked = match s.role {
+                Role::Maker => s.maker_part,
+                Role::Taker => s.taker_part,
+            };
+            // What we paid the project on our own lock, only if we locked and the offer set a fee
+            // address for our chain. Recomputed from the terms with the same function that placed it.
+            let fee_paid = if r.funding.is_some() {
+                s.offer
+                    .fee
+                    .as_ref()
+                    .filter(|t| t.address(own_chain).is_some())
+                    .and_then(|t| {
+                        fee::fee_amount_min(
+                            FeeRates {
+                                maker_bps: t.maker_bps,
+                                taker_bps: t.taker_bps,
+                            },
+                            s.role,
+                            own_locked,
+                            self.min_trade_sat,
+                        )
+                        .ok()
+                    })
+                    .map(|a| a.to_sat())
+            } else {
+                None
+            };
+            if let Some(f) = fee_paid {
+                fee_paid_total += f;
+                fee_count += 1;
+            }
+            match s.phase {
+                Phase::Done => done += 1,
+                Phase::Refunded => refunded += 1,
+                Phase::Abandoned => abandoned += 1,
+                _ => active += 1,
+            }
+            for (c, amt) in [
+                (s.offer.maker_chain, s.maker_part),
+                (s.offer.maker_chain.other(), s.taker_part),
+            ] {
+                match c {
+                    Chain::Btc => btc_vol += amt.to_sat(),
+                    Chain::Xbtc => xbtc_vol += amt.to_sat(),
+                }
+            }
+            let id: String = s.id.iter().map(|b| format!("{b:02x}")).collect();
+            entries.push(serde_json::json!({
+                "id": id,
+                "role": match s.role { Role::Maker => "maker", Role::Taker => "taker" },
+                "phase": format!("{:?}", s.phase).to_lowercase(),
+                "maker_chain": chain(s.offer.maker_chain),
+                "taker_chain": chain(s.offer.maker_chain.other()),
+                "maker_amount_sat": s.maker_part.to_sat(),
+                "taker_amount_sat": s.taker_part.to_sat(),
+                "rate": s.taker_part.to_sat() as f64 / s.maker_part.to_sat().max(1) as f64,
+                "our_lock_txid": r.funding.as_ref().map(|t| t.compute_txid().to_string()),
+                "voluntary_fee_paid_sat": fee_paid,
+                "secret_revealed": s.learned_secret.is_some(),
+                "active": !matches!(s.phase, Phase::Done | Phase::Refunded | Phase::Abandoned),
+            }));
+        }
+        serde_json::json!({
+            "swaps": entries,
+            "totals": {
+                "count": self.records.len(),
+                "done": done,
+                "refunded": refunded,
+                "abandoned": abandoned,
+                "active": active,
+                "volume_sat": { "btc": btc_vol, "xbtc": xbtc_vol },
+                "voluntary_fee_paid": { "swaps": fee_count, "total_sat": fee_paid_total },
+            }
+        })
+    }
+
     pub fn seen_offers(&self) -> &[Offer] {
         &self.state.seen_offers
     }

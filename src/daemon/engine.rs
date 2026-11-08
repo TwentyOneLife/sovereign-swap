@@ -34,6 +34,8 @@ pub(crate) enum EngineCmd {
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
+    /// The operator reporting ledger (#67): per-swap history plus aggregate totals.
+    History(Sender<Value>),
     Take {
         offer_id: [u8; 16],
         maker_part: Amount,
@@ -168,6 +170,9 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                 j
             });
             let _ = reply.send(detail);
+        }
+        EngineCmd::History(reply) => {
+            let _ = reply.send(engine.history());
         }
         EngineCmd::Take {
             offer_id,
