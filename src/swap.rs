@@ -51,6 +51,33 @@ impl Chain {
             Chain::Xbtc => Chain::Btc,
         }
     }
+
+    /// Protocol target seconds per block, for normalizing timelock block-counts across the two
+    /// chains (#74). BTC targets 10 min; the BLAKE2b/xBTC chain (BIP-110 RDTS) targets ~13 min.
+    /// ASSUMPTION: 780 is from the design docs, not read from consensus params. A chain running far
+    /// from target (e.g. a stalled low-hashrate xBTC tip) breaks timelock safety regardless; that is
+    /// an operational gate, not something this static figure can model.
+    pub const fn target_block_secs(self) -> u32 {
+        match self {
+            Chain::Btc => 600,
+            Chain::Xbtc => 780,
+        }
+    }
+}
+
+/// Express `count` blocks measured on chain `from` as a number of blocks on chain `to`, by
+/// wall-clock, so a timelock requirement denominated on one chain can be compared against a budget
+/// denominated on the other (#74). Rounds up, and is clamped so it can only ever *tighten* a
+/// requirement, never loosen one: scaling a slow-chain (xBTC) count down to fast BTC blocks would
+/// otherwise shave the only cushion the low-hashrate xBTC chain has against block-time variance.
+/// Identity when the chains match. The result is therefore always >= `count`.
+pub(crate) fn blocks_as(count: u32, from: Chain, to: Chain) -> u32 {
+    if from == to {
+        return count;
+    }
+    let scaled = (u64::from(count) * u64::from(from.target_block_secs()))
+        .div_ceil(u64::from(to.target_block_secs()));
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(count)
 }
 
 /// The default smallest swap leg: below this a swap output is not worth making, and it keeps both
@@ -449,8 +476,16 @@ impl Swap {
             let deep = Self::depth(theirs, ha) >= self.depths.maker_lock;
             // Enough of the maker's lock must remain for our lock to confirm and run out, and for a
             // claim to become final, or a maker whose lock confirmed late could take both.
-            let needed = i64::from(self.depths.taker_lock)
-                + i64::from(self.offer.taker_lock_blocks)
+            // The taker's own lock (`taker_lock` confirmations and `taker_lock_blocks` duration) runs
+            // on the taker chain, but `remaining(Side::Maker)` below is a maker-chain budget. Convert
+            // those two taker-chain terms to maker-chain blocks before summing, or a BTC maker (whose
+            // ~10-min blocks undercount the taker's ~13-min xBTC blocks) would let the taker lock too
+            // late and lose both legs (#74). `maker_final` is already maker-chain; `margin_blocks` is
+            // the native buffer on the deciding (maker) chain.
+            let m = self.offer.maker_chain;
+            let t = m.other();
+            let needed = i64::from(blocks_as(self.depths.taker_lock, t, m))
+                + i64::from(blocks_as(u32::from(self.offer.taker_lock_blocks), t, m))
                 + i64::from(self.offer.margin_blocks)
                 + i64::from(self.depths.maker_final);
             let time_left = self
@@ -666,6 +701,64 @@ mod tests {
             s.decide(&view(101, 101, None, None), SECRET),
             vec![Action::Fund]
         );
+    }
+
+    #[test]
+    fn blocks_as_normalizes_by_wall_clock_and_never_loosens() {
+        // Same chain is identity.
+        assert_eq!(blocks_as(20, Chain::Btc, Chain::Btc), 20);
+        assert_eq!(blocks_as(20, Chain::Xbtc, Chain::Xbtc), 20);
+        // A slow-chain (xBTC ~13m) requirement expressed in fast BTC blocks grows: ceil(20*780/600)=26.
+        assert_eq!(blocks_as(20, Chain::Xbtc, Chain::Btc), 26);
+        // A fast-chain (BTC) requirement expressed in slow xBTC blocks is ceil(20*600/780)=16, but the
+        // clamp keeps it at 20 so the low-hashrate chain keeps its variance cushion.
+        assert_eq!(blocks_as(20, Chain::Btc, Chain::Xbtc), 20);
+        // The clamp guarantees the result never drops below the raw count, in any direction, for any
+        // count: this is what makes the normalized `depths`/`needed` at least as strict as before.
+        for &c in &[0u32, 1, 2, 5, 20, 100, 288, 10_000, u32::MAX] {
+            for pair in [
+                (Chain::Btc, Chain::Xbtc),
+                (Chain::Xbtc, Chain::Btc),
+                (Chain::Btc, Chain::Btc),
+            ] {
+                assert!(blocks_as(c, pair.0, pair.1) >= c, "{c} {pair:?} loosened");
+            }
+        }
+    }
+
+    #[test]
+    fn taker_refuses_to_lock_too_late_in_the_btc_maker_direction() {
+        // #74: a BTC-maker offer (maker locks BTC ~10m blocks, taker locks xBTC ~13m blocks). The
+        // taker's own leg (taker_lock_blocks = 20 xBTC blocks) burns more wall-clock than its bare
+        // count, so the maker-chain room the taker must see on the maker's lock is larger than the
+        // un-normalized sum:
+        //   un-normalized needed = taker_lock(2) + taker_lock_blocks(20) + margin(3) + maker_final(3) = 28
+        //   normalized    needed = blocks_as(2)=3 + blocks_as(20)=26 + margin(3) + maker_final(3)     = 35
+        // With 30 maker-chain blocks of room the old math (30 > 28) would have locked; the normalized
+        // math (30 > 35 is false) must refuse, or the maker could claim the taker's late lock and
+        // still refund its own leg - the "take both legs" loss.
+        let mut late = swap(Role::Taker);
+        late.offer.maker_chain = Chain::Btc; // taker chain is now xBTC
+                                             // maker lock confirmed at height 1; offer.maker_lock_blocks = 40, so at ha=10 the room is
+                                             // 1 + 40 - 1 - 10 = 30 maker-chain blocks, and depth 10 >= maker_lock 2 (deep).
+        assert_eq!(
+            late.decide(&view(10, 10, Some(lock(7, Some(1))), None), None),
+            vec![]
+        );
+        assert_eq!(
+            late.phase,
+            Phase::Abandoned,
+            "must not lock with only 30 blocks of room"
+        );
+
+        // Same BTC-maker offer with comfortable room (ha=2 -> room 38 > 35, depth 2 >= 2) still locks.
+        let mut ample = swap(Role::Taker);
+        ample.offer.maker_chain = Chain::Btc;
+        assert_eq!(
+            ample.decide(&view(2, 2, Some(lock(7, Some(1))), None), None),
+            vec![Action::Fund]
+        );
+        assert_eq!(ample.phase, Phase::Locking);
     }
 
     #[test]

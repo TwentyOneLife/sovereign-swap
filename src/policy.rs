@@ -4,7 +4,7 @@
 use bitcoin::Amount;
 use serde::{Deserialize, Serialize};
 
-use crate::swap::{Chain, Offer};
+use crate::swap::{blocks_as, Chain, Offer};
 
 /// Confirmations a swap waits for, fixed when the swap starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,9 +100,15 @@ impl Policy {
         // its own lock to confirm and run out plus a final claim; the maker needs room on the
         // taker's clock to reveal and see its claim final.
         let margin = offer.margin_blocks;
+        // `maker_room` bounds `maker_lock_blocks`, a maker-chain count, so the two taker-chain terms
+        // (`taker_lock` confirmations and the taker's `taker_lock_blocks` duration) must be converted
+        // to maker-chain blocks by wall-clock first, per term, before summing (#74). Without this a
+        // BTC maker's ~10-min blocks undercount the taker's ~13-min xBTC blocks and the room is too
+        // short. `maker_lock`, `maker_final` and `margin` are already maker-chain.
+        let (m, t) = (offer.maker_chain, offer.maker_chain.other());
         let maker_room = depths.maker_lock
-            + depths.taker_lock
-            + u32::from(offer.taker_lock_blocks)
+            + blocks_as(depths.taker_lock, t, m)
+            + blocks_as(u32::from(offer.taker_lock_blocks), t, m)
             + margin
             + maker_final;
         let taker_room = depths.taker_lock + margin + taker_final;
@@ -139,8 +145,16 @@ impl Policy {
         // includes the taker's lock blocks, so size the taker first.
         let headroom = 2;
         let taker_lock_blocks = taker_lock + margin + taker_final + headroom;
-        let maker_lock_blocks =
-            maker_lock + taker_lock + taker_lock_blocks + margin + maker_final + headroom;
+        // Mirror `depths` exactly: convert the two taker-chain terms to maker-chain blocks per term
+        // (never the sum) so the sizing a client computes here satisfies the normalized `depths`
+        // check above (#74). `t` is the taker chain.
+        let t = maker_chain.other();
+        let maker_lock_blocks = maker_lock
+            + blocks_as(taker_lock, t, maker_chain)
+            + blocks_as(taker_lock_blocks, t, maker_chain)
+            + margin
+            + maker_final
+            + headroom;
         Some((
             u16::try_from(maker_lock_blocks).ok()?,
             u16::try_from(taker_lock_blocks).ok()?,
@@ -263,5 +277,46 @@ mod tests {
                 .depths(&sized, sized.maker_amount, sized.taker_amount)
                 .expect("sized timelocks satisfy depths");
         }
+    }
+
+    #[test]
+    fn btc_maker_timelocks_are_normalized_to_wall_clock() {
+        // #74: a BTC-maker offer (maker locks BTC ~10m, taker locks xBTC ~13m). The two taker-chain
+        // terms in the maker's room must be scaled up to maker-chain blocks, so the required
+        // maker_lock_blocks is larger than the un-normalized sum.
+        let p = Policy::standard();
+        let amt = Amount::from_sat(500_000); // BTC side; depth(Btc)=1, depth(Xbtc)=6
+        let base = Offer {
+            maker_chain: Chain::Btc,
+            maker_amount: amt,
+            taker_amount: amt,
+            margin_blocks: 6,
+            ..offer(0, 0)
+        };
+        // The sizing helper satisfies `depths` in this direction too (per-term conversion matches).
+        let (m, t) = p
+            .min_lock_blocks(Chain::Btc, amt, amt, 1, 1, 6)
+            .expect("within the table");
+        // Normalized: maker 1 + ceil(6*780/600)=8 + ceil(20*780/600)=26 + margin 6 + final 1 + head 2
+        // = 44; the un-normalized formula would have been 36. Taker leg (all xBTC) is unchanged at 20.
+        assert_eq!((m, t), (44, 20));
+        let sized = Offer {
+            maker_lock_blocks: m,
+            taker_lock_blocks: t,
+            ..base.clone()
+        };
+        p.depths(&sized, amt, amt)
+            .expect("normalized sizing satisfies depths");
+        // An offer sized at the OLD (un-normalized) maker minimum of 36 is now rejected as too short:
+        // exactly the non-conservative gap #74 closed.
+        let old_min = Offer {
+            maker_lock_blocks: 36,
+            taker_lock_blocks: 20,
+            ..base
+        };
+        assert_eq!(
+            p.depths(&old_min, amt, amt),
+            Err(PolicyError::TimelocksTooShort)
+        );
     }
 }
