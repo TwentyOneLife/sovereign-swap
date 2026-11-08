@@ -159,3 +159,44 @@ fn routing_works_over_a_real_websocket() {
         "a directed bid leaked to another taker"
     );
 }
+
+/// Only the author of an offer may withdraw it: a withdraw from any other party is dropped (#71).
+#[test]
+fn only_the_offer_author_can_withdraw_it() {
+    let url = start_toy_relay();
+    let maker = party(&url, 1, 10);
+    let watcher = party(&url, 2, 20);
+    let imposter = party(&url, 3, 30);
+    thread::sleep(Duration::from_millis(200));
+
+    // The maker publishes; the watcher learns the offer and its author.
+    maker.send(&Message::Offer(offer()));
+    let seen = recv_until(&watcher, |m| !m.is_empty());
+    assert!(matches!(seen.as_slice(), [Message::Offer(o)] if o.id == offer().id));
+
+    // A forged withdraw from someone who is not the author must not reach the watcher's engine.
+    imposter.send(&Message::Withdraw {
+        offer_id: offer().id,
+    });
+    let after_forged = recv_until(&watcher, |_| false);
+    assert!(
+        !after_forged
+            .iter()
+            .any(|m| matches!(m, Message::Withdraw { .. })),
+        "a forged withdraw was delivered"
+    );
+
+    // The real author's withdraw is delivered.
+    maker.send(&Message::Withdraw {
+        offer_id: offer().id,
+    });
+    let after_real = recv_until(&watcher, |m| {
+        m.iter().any(|x| matches!(x, Message::Withdraw { .. }))
+    });
+    assert!(
+        after_real
+            .iter()
+            .any(|m| matches!(m, Message::Withdraw { offer_id } if *offer_id == offer().id)),
+        "the author's own withdraw was dropped"
+    );
+}

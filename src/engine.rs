@@ -159,10 +159,22 @@ impl<T: Transport> Engine<T> {
     fn reconcile_offers(&mut self) -> Result<(), EngineError> {
         let taken: std::collections::HashSet<[u8; 16]> =
             self.records.iter().map(|r| r.swap.offer.id).collect();
-        let before = self.state.own_offers.len();
+        let dropped: Vec<[u8; 16]> = self
+            .state
+            .own_offers
+            .iter()
+            .filter(|o| taken.contains(&o.id))
+            .map(|o| o.id)
+            .collect();
+        if dropped.is_empty() {
+            return Ok(());
+        }
         self.state.own_offers.retain(|o| !taken.contains(&o.id));
-        if self.state.own_offers.len() != before {
-            self.save_state()?;
+        self.save_state()?;
+        // Tell peers to drop these too, so a filled offer does not linger in their discovery (#70).
+        // The send queues on the transport and goes out once the relay connection is up.
+        for offer_id in dropped {
+            self.transport.send(&Message::Withdraw { offer_id });
         }
         Ok(())
     }

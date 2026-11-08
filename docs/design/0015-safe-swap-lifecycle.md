@@ -126,3 +126,20 @@ Bump the envelope note / protocol version alongside the `Message` change and rec
   (timelock refund). Confirm teardown uses the endpoints with no file edits, an unfunded maker
   self-abandons on schedule, a client restart re-animates nothing, and `active_swaps` reads correctly
   throughout. Run the monitoring agent and log to the infra findings runbook.
+
+## M1.1 addendum: taker Locking deadline (#72)
+
+Symmetric to change 1 (the maker deadline). `decide_taker` had the same gap: once a taker was in
+`Locking` with no own lock on chain, it returned `Fund` unconditionally, so a taker whose funding stalled
+(deposit UTXO not yet confirmed, RPC hiccup, brief shortfall) retried forever and could lock late against
+a `time_left` check made when it first entered `Locking`. That is the taker side of the "a late lock lets
+the counterparty take both legs" risk, and worse than the maker case because the taker can lose the leg,
+not just waste a lockup. Fix: when `Locking && !own_funded`, fall through to the same `Waiting` gate
+(`deep && time_left && fee_ok`, abandon past `lock_deadline` or when `!time_left`) instead of funding
+unconditionally; `Locked`, and `Locking && own_funded`, still rebroadcast. Reuses the `own_funded` signal
+on `ChainView`.
+
+Separately flagged for the owner (NOT fixed here, a policy/design decision): the `time_left` check and
+`policy::depths` add block *counts* across the two chains without normalizing block times, so in the
+BTC-maker direction (BTC ~10 min, xBTC ~13 min blocks) the taker's window is counted non-conservatively.
+Filed as a HIGH finding.

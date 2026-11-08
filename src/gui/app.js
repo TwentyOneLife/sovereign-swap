@@ -260,12 +260,16 @@ async function renderSwap(id) {
       : "not locked yet") +
     `</div>`;
   const done = ["done", "refunded", "abandoned"].includes(s.phase);
+  // Label the legs by our role: our own lock is on our side of the swap, which is the taker lock when
+  // we are the taker, not always the maker lock (#73).
+  const ownLock = s.role === "maker" ? c.maker_lock : c.taker_lock;
+  const cpLock = s.role === "maker" ? c.taker_lock : c.maker_lock;
   $("#swap-detail").innerHTML =
     `<div class="card"><div class="row between"><h2>Swap #${s.id.slice(0, 6)}</h2>` +
     `<span class="pill ${done ? "phase-" + s.phase : "phase-active"}">${s.phase}</span></div>` +
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
-    `<div class="legs">${leg("Your leg", c.maker_lock)}${leg("Counterparty", c.taker_lock)}</div>` +
+    `<div class="legs">${leg("Your leg", ownLock)}${leg("Counterparty", cpLock)}</div>` +
     (c.refund_in_blocks != null
       ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>`
       : "") +
