@@ -522,19 +522,22 @@ impl Daemon {
     fn status(&self) -> Value {
         let settings = self.state.lock().unwrap().settings.clone();
         let running = self.engine_running();
-        let active = if running {
-            self.engine_call(EngineCmd::Swaps)
-                .map(|v: Vec<SwapView>| v.iter().filter(|s| s.is_active()).count())
-                .unwrap_or(0)
+        let active_swaps = if running {
+            match self.engine_call::<Vec<SwapView>>(EngineCmd::Swaps) {
+                Ok(swaps) => json!(swaps.iter().filter(|s| s.is_active()).count()),
+                // The engine is up but did not answer (busy or timed out): report that it could not
+                // be read, not a misleading zero that once hid an armed, fund-retrying maker.
+                Err(_) => serde_json::Value::Null,
+            }
         } else {
-            0
+            json!(0)
         };
         json!({
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
             "relays": settings.relays.len(),
             "engine": running,
-            "active_swaps": active,
+            "active_swaps": active_swaps,
         })
     }
 
