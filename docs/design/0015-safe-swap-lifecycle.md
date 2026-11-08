@@ -55,19 +55,28 @@ design. This removes the only concurrency question from M1.
      abandon, so no funded swap can be orphaned.
 
 5. **Relay replay safety (#65, #64).** Two parts:
-   - Client `REQ` gains `since` (a persisted watermark) and `limit`, so a reconnect does not replay the
-     whole backlog. Persist the watermark and a small settled/withdrawn id set in `State` (new fields,
-     each `#[serde(default)]` so the live `engine.json` still loads), and consult them in `handle` so a
-     replay of a settled or withdrawn swap, or of a withdrawn offer, is ignored.
+   - Client `REQ` gains `since` and `limit`, so a reconnect does not replay the whole backlog. As built,
+     the `since` watermark lives in the `ws.rs` worker (it tracks the newest `created_at` it has seen and
+     resubscribes from it), not in persisted `State`: the worker already sees every event, so this avoids
+     coupling the transport to engine state. A one-time backlog replay on a fresh process start is
+     harmless because every `handle` path dedups. Cross-restart durability comes instead from a persisted
+     `withdrawn` id set in `State` (`#[serde(default)]`) consulted in `handle(Offer)`, plus swap records
+     persisting (abort marks `Abandoned`, never deletes), so a settled or withdrawn swap or offer is
+     ignored even if replayed after a restart.
    - Add a `Withdraw { offer_id }` variant to `Message` so a peer drops the offer from its `seen_offers`
-     (also fixes the sticky discovery in #63). In `relay_server.rs`, give kind 4859 events a TTL or an
-     explicit consume so a withdrawn or settled event is not served forever. The client watermark is the
-     primary re-animation guard; the relay TTL is defence in depth.
+     and records the id in `withdrawn` (also fixes the sticky discovery in #63). The client watermark plus
+     the `withdrawn` set are the re-animation guard. A relay-side TTL / NIP-09 tombstone in
+     `relay_server.rs` is deferred to M2 as defence in depth: it is not needed for correctness here (the
+     relay already expires events after its 7-day retention, and the client guards replays regardless).
 
-6. **Socket liveness and reconnect (#64).** In `ws.rs`, add ping/pong, reconnect, and resubscribe (with
-   the watermark from change 5) to the owner loop instead of letting the worker thread exit silently on
-   any error. On reconnect, re-announce only the reconciled live offer set (change 3). Make `/status`
-   `relays` reflect a verified-live socket rather than a merely configured one.
+6. **Socket liveness and reconnect (#64).** In `ws.rs`, add ping, reconnect with capped backoff, and
+   resubscribe (with the watermark from change 5) to the owner loop instead of letting the worker thread
+   exit silently on any error; a shutdown flag set on `WsConn` drop ends the loop cleanly. Re-announcing
+   own offers on reconnect is not needed: our offer events already live on the relay (the socket healing
+   is what matters), and load-time reconciliation (change 3) keeps filled offers from being re-served.
+   Making `/status` `relays` reflect a verified-live socket (rather than the configured count) needs a
+   liveness signal plumbed daemon -> engine -> transport; deferred to M2, since reconnect makes any dead
+   state transient.
 
 7. **`/status active_swaps` (#66).** Replace `unwrap_or(0)` in `status()` so an engine-call failure is
    surfaced as a distinct state (a null or an error field, as `reference_rate` already does) rather than

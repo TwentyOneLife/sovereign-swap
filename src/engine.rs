@@ -793,3 +793,18 @@ impl<T: Transport> Engine<T> {
         Ok(self.backend(chain).broadcast(&tx)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    #[test]
+    fn a_pre_m1_engine_state_still_loads() {
+        // An engine.json written before the withdrawn set existed must still deserialize, with the
+        // new field defaulting to empty (serde(default)).
+        let old = r#"{"next_index":3,"own_offers":[],"seen_offers":[],"bids":[]}"#;
+        let state: State = serde_json::from_str(old).unwrap();
+        assert_eq!(state.next_index, 3);
+        assert!(state.withdrawn.is_empty());
+    }
+}
