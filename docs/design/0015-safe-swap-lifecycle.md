@@ -139,7 +139,14 @@ not just waste a lockup. Fix: when `Locking && !own_funded`, fall through to the
 unconditionally; `Locked`, and `Locking && own_funded`, still rebroadcast. Reuses the `own_funded` signal
 on `ChainView`.
 
-Separately flagged for the owner (NOT fixed here, a policy/design decision): the `time_left` check and
-`policy::depths` add block *counts* across the two chains without normalizing block times, so in the
-BTC-maker direction (BTC ~10 min, xBTC ~13 min blocks) the taker's window is counted non-conservatively.
-Filed as a HIGH finding.
+Separately flagged for the owner (the `time_left` check and `policy::depths` added block *counts* across
+the two chains without normalizing block times, so in the BTC-maker direction - BTC ~10 min, xBTC ~13 min
+blocks - the taker's window was counted non-conservatively). Filed as a HIGH finding (#74).
+
+> **FIXED in v0.5.0 (#74).** Cross-chain timelock counts are now normalized to wall-clock: a
+> `Chain::target_block_secs` (BTC 600, xBTC 780) and a `blocks_as(count, from, to)` helper convert each
+> chain's block count before summing/comparing, in `policy::depths`, `policy::min_lock_blocks`, and
+> `decide_taker`'s `needed`. The conversion is *clamped to only ever tighten* (never loosen), so the
+> previously-safe xBTC-maker direction is unchanged and only the BTC-maker direction is made
+> conservative. 780 s is a design assumption (not read from consensus); a chain running far from target
+> breaks timelock safety regardless, which is an operational gate outside this check.
