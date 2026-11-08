@@ -69,6 +69,9 @@ pub enum EngineError {
     Policy(PolicyError),
     Node(NodeError),
     Io(std::io::Error),
+    NoSuchSwap,
+    /// Abort was asked for a swap that has already funded its lock; it can only time out to a refund.
+    AlreadyFunded,
 }
 
 impl From<NodeError> for EngineError {
@@ -203,6 +206,28 @@ impl<T: Transport> Engine<T> {
         }
         self.save_state()?;
         self.transport.send(&Message::Withdraw { offer_id });
+        Ok(())
+    }
+
+    /// Operator teardown of a swap that has not locked yet: mark it `Abandoned` so the engine stops
+    /// trying to fund it. Refused once our lock is funded: a locked swap can only reach a timelock
+    /// refund, never a forced abandon that would strand the coin. Idempotent on an already-terminal
+    /// swap.
+    pub fn abort(&mut self, swap_id: [u8; 16]) -> Result<(), EngineError> {
+        let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) else {
+            return Err(EngineError::NoSuchSwap);
+        };
+        if self.records[i].funding.is_some() {
+            return Err(EngineError::AlreadyFunded);
+        }
+        if matches!(
+            self.records[i].swap.phase,
+            Phase::Done | Phase::Refunded | Phase::Abandoned
+        ) {
+            return Ok(());
+        }
+        self.records[i].swap.phase = Phase::Abandoned;
+        self.save(&self.records[i])?;
         Ok(())
     }
 

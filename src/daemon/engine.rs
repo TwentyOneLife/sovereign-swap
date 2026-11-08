@@ -39,6 +39,16 @@ pub(crate) enum EngineCmd {
         maker_part: Amount,
         reply: Sender<Result<[u8; 16], String>>,
     },
+    /// Take one of our offers off the market.
+    Withdraw {
+        offer_id: [u8; 16],
+        reply: Sender<Result<(), String>>,
+    },
+    /// Abandon a swap that has not locked yet (operator teardown).
+    Abort {
+        swap_id: [u8; 16],
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 /// The slice of a swap the API exposes: id, phase, our role, the direction and amounts, and whether
@@ -180,6 +190,12 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                 None => Err("no such offer".to_owned()),
             };
             let _ = reply.send(res);
+        }
+        EngineCmd::Withdraw { offer_id, reply } => {
+            let _ = reply.send(engine.withdraw(offer_id).map_err(|e| format!("{e:?}")));
+        }
+        EngineCmd::Abort { swap_id, reply } => {
+            let _ = reply.send(engine.abort(swap_id).map_err(|e| format!("{e:?}")));
         }
     }
 }
