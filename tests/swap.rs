@@ -22,7 +22,7 @@ use sovereign_swap::transport::{memory_pair, Memory};
 /// Shallow depths keep regtest runs short; `Policy::standard` is tested on its own.
 fn config() -> Config {
     Config {
-        spend_fee: Amount::from_sat(2_000),
+        min_spend_fee: Amount::from_sat(2_000),
         fee_rate_sat_vb: 2,
         policy: Policy {
             btc: vec![(Amount::from_sat(100_000_000), 2)],

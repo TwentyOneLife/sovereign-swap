@@ -22,10 +22,22 @@ use crate::transport::Transport;
 /// Maker-chain blocks a taker waits, beyond the required depth, for the maker's lock before giving up.
 const LOCK_WAIT_BLOCKS: u32 = 10;
 
+/// Blocks to target when fee-estimating a claim or refund: short, because these spends race a
+/// timelock and must confirm promptly (F6).
+const SPEND_CONF_TARGET: u16 = 3;
+/// Conservative claim/refund fee rate (sat/vB) used when the node cannot estimate (a fresh regtest or
+/// the quiet xBTC chain returns nothing). Sized to today's effective flat fee (2000 sat / 142 vB claim
+/// = 14.1 sat/vB), rounded up, so a chain with no estimator keeps a safe, near-unchanged fee.
+const FALLBACK_SPEND_RATE_SAT_VB: u64 = 15;
+
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Fee of each claim and refund transaction.
-    pub spend_fee: Amount,
+    /// Lower bound (floor) on a claim/refund transaction fee, in sats. The actual fee is the greater
+    /// of this and the live fee-rate estimate applied to the transaction's real vsize (F6); the floor
+    /// is min-relay-safe so a spend still confirms when the mempool is empty.
+    pub min_spend_fee: Amount,
+    /// Fee rate (sat/vB) for the funding (lock) transaction, passed to walletcreatefundedpsbt. The
+    /// claim/refund spends do NOT use this; they fee from the live estimate (see `min_spend_fee`).
     pub fee_rate_sat_vb: u64,
     pub policy: Policy,
     /// Optional operator-owned payout address per chain, where this node's claimed proceeds and its
@@ -55,6 +67,12 @@ pub struct Record {
     /// fee output (design 0010). Absent until it arrives, hence `serde(default)`.
     #[serde(default)]
     pub received_fee: Option<FeeProof>,
+    /// The fee (sats) chosen for this swap's claim or refund spend, stored so every rebroadcast
+    /// rebuilds the identical transaction (F6). Set on the first spend from the live rate; a later
+    /// tick may raise it, never lower it, so any replacement only bumps the fee and stays within RBF
+    /// rules. Absent in older records, hence `serde(default)`.
+    #[serde(default)]
+    pub spend_fee_sat: Option<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -519,6 +537,7 @@ impl<T: Transport> Engine<T> {
             funding: None,
             fee: None,
             received_fee: None,
+            spend_fee_sat: None,
             swap,
         };
         let id: String = record.swap.id.iter().map(|b| format!("{b:02x}")).collect();
@@ -732,6 +751,23 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// Fee a claim or refund by the chain's live estimate (or the conservative fallback when it cannot
+    /// estimate), never below the configured floor and never below any fee already chosen for this
+    /// spend, so a rebuild only ever replaces upward and stays within RBF rules (F6).
+    fn rate_spend(
+        &self,
+        chain: Chain,
+        prior: Option<u64>,
+        build: impl Fn(Amount) -> Result<Transaction, crate::htlc::SpendError>,
+    ) -> Result<(Transaction, Amount), crate::htlc::SpendError> {
+        let rate = self
+            .backend(chain)
+            .estimate_fee_sat_vb(SPEND_CONF_TARGET)
+            .unwrap_or(FALLBACK_SPEND_RATE_SAT_VB);
+        let at_least = Amount::from_sat(self.config.min_spend_fee.to_sat().max(prior.unwrap_or(0)));
+        crate::htlc::spend_at_rate(build, rate, at_least)
+    }
+
     fn act(&mut self, i: usize, action: Action) -> Result<(), EngineError> {
         let record = self.records[i].clone();
         let swap = &record.swap;
@@ -801,29 +837,42 @@ impl<T: Transport> Engine<T> {
                 }
             },
             Action::Claim { lock, preimage } => {
-                let spend = Spend {
-                    outpoint: lock,
-                    value: other_amount,
-                    destination: record.claim_to.clone(),
-                    fee: self.config.spend_fee,
-                };
+                let spend_chain = own_chain.other();
                 let key = self.keys.key(swap.key_index, Use::Claim);
-                let tx = other_contract
-                    .claim(self.keys.secp(), &spend, &key, &preimage)
+                let secp = self.keys.secp();
+                let build = |fee| {
+                    let spend = Spend {
+                        outpoint: lock,
+                        value: other_amount,
+                        destination: record.claim_to.clone(),
+                        fee,
+                    };
+                    other_contract.claim(secp, &spend, &key, &preimage)
+                };
+                let (tx, fee) = self
+                    .rate_spend(spend_chain, record.spend_fee_sat, build)
                     .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
-                (own_chain.other(), tx)
+                self.records[i].spend_fee_sat = Some(fee.to_sat());
+                self.save(&self.records[i])?;
+                (spend_chain, tx)
             }
             Action::Refund { lock, value } => {
-                let spend = Spend {
-                    outpoint: lock,
-                    value,
-                    destination: record.refund_to.clone(),
-                    fee: self.config.spend_fee,
-                };
                 let key = self.keys.key(swap.key_index, Use::Refund);
-                let tx = own_contract
-                    .refund(self.keys.secp(), &spend, &key)
+                let secp = self.keys.secp();
+                let build = |fee| {
+                    let spend = Spend {
+                        outpoint: lock,
+                        value,
+                        destination: record.refund_to.clone(),
+                        fee,
+                    };
+                    own_contract.refund(secp, &spend, &key)
+                };
+                let (tx, fee) = self
+                    .rate_spend(own_chain, record.spend_fee_sat, build)
                     .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
+                self.records[i].spend_fee_sat = Some(fee.to_sat());
+                self.save(&self.records[i])?;
                 (own_chain, tx)
             }
         };

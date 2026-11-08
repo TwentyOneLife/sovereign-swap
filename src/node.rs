@@ -298,6 +298,14 @@ pub trait ChainBackend {
 
     /// Broadcasts `tx`; a transaction the backend already has counts as success.
     fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError>;
+
+    /// A fee-rate estimate in sat/vB to confirm within `conf_target` blocks, or `None` when the
+    /// backend cannot estimate (a fresh regtest, or the low-activity xBTC chain, returns nothing).
+    /// Used to fee the deadline-bound claim/refund spends (F6); the caller applies a conservative
+    /// fallback when this is `None`, so a chain with no estimate keeps a safe, near-today fee.
+    fn estimate_fee_sat_vb(&self, _conf_target: u16) -> Option<u64> {
+        None
+    }
 }
 
 pub struct ChainNode {
@@ -721,6 +729,19 @@ impl ChainBackend for ChainNode {
             Err(RpcError::Rpc { message, .. }) if message.contains("already") => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn estimate_fee_sat_vb(&self, conf_target: u16) -> Option<u64> {
+        // Conservative mode: estimatesmartfee errs toward overpaying, which is right for a spend that
+        // races a timelock (F6). `feerate` is BTC/kvB; convert to sat/vB. On a chain that cannot
+        // estimate (fresh regtest, quiet xBTC) the result has no `feerate` and we return None.
+        let v = self
+            .rpc
+            .call("estimatesmartfee", json!([conf_target, "CONSERVATIVE"]))
+            .ok()?;
+        let btc_per_kvb = v.get("feerate")?.as_f64()?;
+        let sat_vb = (btc_per_kvb * 100_000.0).round() as u64;
+        (sat_vb > 0).then_some(sat_vb)
     }
 }
 

@@ -236,6 +236,29 @@ impl Contract {
     }
 }
 
+/// Fee a claim or refund by its real vbytes (F6). `build` signs the spend for a given fee; we build
+/// once at `at_least` to learn the exact vsize, then rebuild at `max(at_least, rate_sat_vb * (vsize +
+/// 1))`. The +1 vB covers a signature that signs one byte longer on the rebuild (the sighash commits
+/// to the output value, so the second signature's `r`/`s` length can differ), so a spend aimed at the
+/// min-relay rate never lands a hair under it. `at_least` is the caller's lower bound: a min-relay
+/// floor, raised to any fee already broadcast for this spend so a rebuild only ever replaces upward
+/// (RBF-safe). Returns the signed spend and the fee it pays. Propagates `OutputBelowDust` when the leg
+/// is too small to pay the fee, exactly as a plain spend would.
+pub fn spend_at_rate(
+    build: impl Fn(Amount) -> Result<Transaction, SpendError>,
+    rate_sat_vb: u64,
+    at_least: Amount,
+) -> Result<(Transaction, Amount), SpendError> {
+    let probe = build(at_least)?;
+    let vsize = probe.vsize() as u64 + 1;
+    let fee = Amount::from_sat((vsize * rate_sat_vb).max(at_least.to_sat()));
+    if fee == at_least {
+        Ok((probe, at_least))
+    } else {
+        Ok((build(fee)?, fee))
+    }
+}
+
 /// A one-input, one-output version 2 transaction spending the contract, without witness.
 pub fn unsigned_spend(spend: &Spend, sequence: Sequence) -> Result<Transaction, SpendError> {
     let value = spend
@@ -476,6 +499,44 @@ mod tests {
         assert_eq!(refund.input[0].sequence, Sequence::from_height(144));
         assert_eq!(extract_preimage(&refund, &c), None);
         assert_eq!(extract_preimage(&lock_tx(vec![]), &c), None);
+    }
+
+    #[test]
+    fn spend_at_rate_fees_by_vbytes_with_a_floor() {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let preimage = [9u8; 32];
+        let c = Contract {
+            secret_hash: sha256::Hash::hash(&preimage).to_byte_array(),
+            claim_pkh: PublicKey::new(key.public_key(&secp)).pubkey_hash(),
+            ..contract()
+        };
+        let base = |fee| {
+            let s = Spend { fee, ..spend() };
+            c.claim(&secp, &s, &key, &preimage)
+        };
+        // Rate wins: at 50 sat/vB a ~142 vB claim pays well above the 500-sat floor, and the fee
+        // covers at least the rate times the actual vsize.
+        let (tx, fee) = spend_at_rate(base, 50, Amount::from_sat(500)).unwrap();
+        assert!(
+            fee > Amount::from_sat(500),
+            "the rate, not the floor, should win here"
+        );
+        assert!(
+            fee.to_sat() >= 50 * tx.vsize() as u64,
+            "fee {fee} must cover 50 sat/vB * vsize {}",
+            tx.vsize()
+        );
+        assert_eq!(
+            tx.output[0].value,
+            spend().value - fee,
+            "output = value - fee"
+        );
+        // Floor wins: at 1 sat/vB (~143 sat) the 2000-sat lower bound dominates, and the spend is
+        // built at exactly that.
+        let (tx2, fee2) = spend_at_rate(base, 1, Amount::from_sat(2_000)).unwrap();
+        assert_eq!(fee2, Amount::from_sat(2_000));
+        assert_eq!(tx2.output[0].value, spend().value - Amount::from_sat(2_000));
     }
 
     #[test]
