@@ -430,8 +430,14 @@ impl Swap {
 
         let Some(own) = &view.taker_lock else {
             match self.phase {
-                Phase::Locking | Phase::Locked => return vec![Action::Fund],
-                Phase::Waiting => {}
+                // Confirmed once then reorged away: we committed coin, so rebroadcast the same tx.
+                Phase::Locked => return vec![Action::Fund],
+                // Funded and awaiting its first confirmation: rebroadcast.
+                Phase::Locking if view.own_funded => return vec![Action::Fund],
+                // Not committed yet (Waiting, or Locking where funding has not succeeded): fall through
+                // to the lock gate below so a stalled taker re-checks the window and gives up instead
+                // of funding late against a stale safety check (#72).
+                Phase::Waiting | Phase::Locking => {}
                 _ => return vec![],
             }
             let Some(theirs) = &view.maker_lock else {
@@ -972,12 +978,33 @@ mod tests {
             s.decide(&view(101, 101, Some(lock(1, Some(100))), None), None),
             vec![Action::Fund]
         );
-        // Too late now for a fresh decision, but the lock is already out: keep it going.
+        assert_eq!(s.phase, Phase::Locking);
+        // Funded now (own_funded), lock not yet on chain. Too late for a fresh decision, but the lock
+        // is already out: keep rebroadcasting it, never abandon.
+        let funded_late = ChainView {
+            own_funded: true,
+            ..view(130, 130, Some(lock(1, Some(100))), None)
+        };
+        assert_eq!(s.decide(&funded_late, None), vec![Action::Fund]);
+        assert_eq!(s.phase, Phase::Locking);
+    }
+
+    #[test]
+    fn taker_abandons_if_its_lock_never_funds_in_time() {
+        let mut s = swap(Role::Taker);
+        // Decides to fund (Waiting -> Locking) while the window is open.
         assert_eq!(
-            s.decide(&view(130, 130, Some(lock(1, Some(100))), None), None),
+            s.decide(&view(101, 101, Some(lock(1, Some(100))), None), None),
             vec![Action::Fund]
         );
         assert_eq!(s.phase, Phase::Locking);
+        // Funding never succeeded (own_funded stays false) and the window has now closed: give up
+        // rather than fund late against a safety check made at height 101 (#72).
+        assert_eq!(
+            s.decide(&view(130, 130, Some(lock(1, Some(100))), None), None),
+            vec![]
+        );
+        assert_eq!(s.phase, Phase::Abandoned);
     }
 
     #[test]
