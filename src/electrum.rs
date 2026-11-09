@@ -93,7 +93,6 @@ impl ElectrumClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hex::FromHex;
 
     #[test]
     fn scripthash_matches_the_electrum_reference_vector() {
