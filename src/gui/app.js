@@ -35,7 +35,7 @@ const fmtRate = (r) =>
 
 // Relative time ("3m ago") with the absolute local time on hover (#88 time columns).
 function fmtTime(sec) {
-  if (!sec) return { text: "—", title: "" };
+  if (!sec) return { text: "-", title: "" };
   const d = new Date(sec * 1000);
   const diff = Date.now() / 1000 - sec;
   const text =
@@ -423,7 +423,7 @@ async function loadSwaps() {
 // shortened txid as plain text when no explorer URL is set. The explorer base comes from /status
 // (btc_explorer_url / xbtc_explorer_url); the default on StartOS is the operator's own mempool.
 function explorerLink(chain, txid) {
-  if (!txid) return "—";
+  if (!txid) return "-";
   const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
   const short = String(txid).slice(0, 16) + "…";
   return base
@@ -463,7 +463,7 @@ async function loadHistory() {
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
       { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
       { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
-      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "—" : fmtSats(s.voluntary_fee_paid_sat) },
+      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => {
@@ -501,7 +501,39 @@ async function fillSwapDetail(id, box) {
     `<div class="leg card"><strong>Counterparty (${cpChain.toUpperCase()})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
-    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>`;
+    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
+    // E2 (design 0017): when funding is parked for the user, show the PSBT handoff.
+    (s.pending_lock_psbt
+      ? `<div class="card" style="border-left:3px solid var(--orange)">` +
+        `<p><strong>Sign your funding (${ownChain.toUpperCase()})</strong></p>` +
+        `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
+        `in your own wallet (Sparrow for BTC, Shrike for xBTC), and paste the signed PSBT back. Your keys ` +
+        `never leave your wallet.</p>` +
+        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" onclick="this.select()">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+        `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
+        `<div class="row" style="justify-content:flex-end"><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
+        `<p class="muted" id="psbt-msg"></p></div>`
+      : "");
+  if (s.pending_lock_psbt) {
+    const btn = live.querySelector("#submit-psbt");
+    if (btn)
+      btn.onclick = async () => {
+        const psbt = (live.querySelector("#signed-psbt").value || "").trim();
+        const msg = live.querySelector("#psbt-msg");
+        if (!psbt) {
+          msg.textContent = "Paste the signed PSBT first.";
+          return;
+        }
+        msg.textContent = "Submitting…";
+        try {
+          await api("POST", "/swaps/" + id + "/signed-psbt", { psbt });
+          msg.textContent = "Funded. The swap will proceed.";
+          fillSwapDetail(id, live);
+        } catch (e) {
+          msg.textContent = (e.data && e.data.error) || "rejected";
+        }
+      };
+  }
 }
 
 // Refresh the open swap's detail each tick: confirmations and the refund countdown change per block
