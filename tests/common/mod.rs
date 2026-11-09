@@ -27,38 +27,54 @@ pub struct Node {
 impl Node {
     /// `fork_height` set means a Knots BLAKE2b node with the fork activating at that height.
     pub fn start(binary: &str, fork_height: Option<u32>) -> Node {
-        let base = 20_000 + (std::process::id() % 2_000) as u16 * 10;
-        let n = NEXT_PORT.fetch_add(2, Ordering::SeqCst);
-        let (rpc_port, p2p_port) = (base + n, base + n + 1);
-        let datadir = std::env::temp_dir().join(format!("sovswap-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&datadir).unwrap();
-        let mut conf = format!(
-            "regtest=1\n[regtest]\nrpcport={rpc_port}\nport={p2p_port}\nrpcuser=u\nrpcpassword=p\n\
-             listen=0\nconnect=0\ndnsseed=0\nfallbackfee=0.0001\ntxindex=1\nprinttoconsole=0\n"
-        );
-        if let Some(h) = fork_height {
-            conf.push_str(&format!("testactivationheight=blake2b@{h}\n"));
-        }
-        std::fs::write(datadir.join("bitcoin.conf"), conf).unwrap();
-        let child = Command::new(binary)
-            .arg(format!("-datadir={}", datadir.display()))
-            .spawn()
-            .unwrap();
-        let rpc = Client::new(&format!("127.0.0.1:{rpc_port}"), "u", "p");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match rpc.call("getblockchaininfo", json!([])) {
-                Ok(_) => break,
-                Err(e) if Instant::now() > deadline => panic!("{binary} did not start: {e:?}"),
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        // Concurrent test binaries share no port counter and can land in the same pid bucket, so two
+        // can pick the same rpcport; bitcoind then fails to bind its RPC server and exits. Try a fresh
+        // port (a new `n`) if the node does not come up, so a collision self-heals instead of flaking.
+        for _ in 0..8 {
+            let n = NEXT_PORT.fetch_add(2, Ordering::SeqCst);
+            let base = 20_000 + (std::process::id() % 2_000) as u16 * 10;
+            let (rpc_port, p2p_port) = (base + n, base + n + 1);
+            let datadir = std::env::temp_dir().join(format!("sovswap-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&datadir).unwrap();
+            let mut conf = format!(
+                "regtest=1\n[regtest]\nrpcport={rpc_port}\nport={p2p_port}\nrpcuser=u\nrpcpassword=p\n\
+                 listen=0\nconnect=0\ndnsseed=0\nfallbackfee=0.0001\ntxindex=1\nprinttoconsole=0\n"
+            );
+            if let Some(h) = fork_height {
+                conf.push_str(&format!("testactivationheight=blake2b@{h}\n"));
             }
+            std::fs::write(datadir.join("bitcoin.conf"), conf).unwrap();
+            let mut child = Command::new(binary)
+                .arg(format!("-datadir={}", datadir.display()))
+                .spawn()
+                .unwrap();
+            let rpc = Client::new(&format!("127.0.0.1:{rpc_port}"), "u", "p");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().ok().flatten().is_some() {
+                    break; // bitcoind exited (a port clash); the outer loop tries a fresh port
+                }
+                match rpc.call("getblockchaininfo", json!([])) {
+                    Ok(_) => {
+                        return Node {
+                            child,
+                            datadir,
+                            rpc,
+                            rpc_port,
+                        }
+                    }
+                    Err(_) if Instant::now() > deadline => {
+                        let _ = child.kill();
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&datadir);
         }
-        Node {
-            child,
-            datadir,
-            rpc,
-            rpc_port,
-        }
+        panic!("{binary} did not start after retries");
     }
 
     pub fn call(&self, method: &str, params: Value) -> Value {
