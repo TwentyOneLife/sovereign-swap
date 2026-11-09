@@ -77,19 +77,27 @@ impl ElectrumClient {
             .get_mut()
             .write_all(line.as_bytes())
             .map_err(|e| NodeError::Unexpected(format!("electrum write: {e}")))?;
-        let mut resp = String::new();
-        let read = guard
-            .read_line(&mut resp)
-            .map_err(|e| NodeError::Unexpected(format!("electrum read: {e}")))?;
-        if read == 0 {
-            return Err(NodeError::Unexpected("electrum: connection closed".into()));
+        // Read until the reply carrying our id arrives, skipping any server-pushed notification: a
+        // subscription (e.g. blockchain.headers.subscribe) pushes updates as id-less messages, which
+        // would otherwise be mistaken for this call's response and desync every later call.
+        loop {
+            let mut resp = String::new();
+            let read = guard
+                .read_line(&mut resp)
+                .map_err(|e| NodeError::Unexpected(format!("electrum read: {e}")))?;
+            if read == 0 {
+                return Err(NodeError::Unexpected("electrum: connection closed".into()));
+            }
+            let v: Value = serde_json::from_str(resp.trim())
+                .map_err(|e| NodeError::Unexpected(format!("electrum parse: {e}")))?;
+            if v.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                return Err(NodeError::Unexpected(format!("electrum {method}: {err}")));
+            }
+            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
         }
-        let v: Value = serde_json::from_str(resp.trim())
-            .map_err(|e| NodeError::Unexpected(format!("electrum parse: {e}")))?;
-        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-            return Err(NodeError::Unexpected(format!("electrum {method}: {err}")));
-        }
-        Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 }
 
