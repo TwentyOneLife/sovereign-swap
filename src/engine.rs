@@ -176,6 +176,11 @@ pub enum EngineError {
     /// already withdrawn/filled. `own_offers` holds only our own offers, so a peer's offer can never
     /// be withdrawn here. Report it instead of returning a misleading success (#78).
     NotYourOffer,
+    /// A signed funding PSBT was submitted for a swap that can no longer safely broadcast its lock:
+    /// it has abandoned (e.g. the counterparty's lock window ran out while we waited for the user's
+    /// signature) or already settled. Broadcasting now would strand the funds in an HTLC the engine
+    /// no longer drives to a refund, so the late submission is refused rather than honoured.
+    NoLongerFundable,
 }
 
 impl From<NodeError> for EngineError {
@@ -511,6 +516,27 @@ impl<T: Transport> Engine<T> {
                 "swap is not awaiting a funding signature".into(),
             )));
         };
+        // Broadcast the lock only if funding is still the right move, re-decided against a fresh chain
+        // view by the same path `tick` uses. A parked swap can stop being fundable between ticks: its
+        // phase is still `Locking` but the counterparty's lock window has already run out, so a phase
+        // check alone would let a late signature through and commit the user's coin to an HTLC the
+        // engine no longer drives to a refund (the #74 lose-both-legs case, and the same class as the
+        // maker-`Locking` loaded gun). When funding is no longer decided, clear the pending PSBT so the
+        // UI stops asking for a signature on a dead swap, and refuse. The user must also not broadcast
+        // the signed PSBT from their own wallet; the engine refusing cannot stop that.
+        let view = self.view(&self.records[i])?;
+        let secret = (self.records[i].swap.role == Role::Maker)
+            .then(|| self.keys.secret(self.records[i].swap.key_index));
+        let still_funding = self.records[i]
+            .swap
+            .decide(&view, secret)
+            .iter()
+            .any(|a| matches!(a, Action::Fund));
+        if !still_funding {
+            self.records[i].pending_lock_psbt = None;
+            self.save(&self.records[i])?;
+            return Err(EngineError::NoLongerFundable);
+        }
         let own_chain = match self.records[i].swap.role {
             Role::Maker => self.records[i].swap.offer.maker_chain,
             Role::Taker => self.records[i].swap.offer.maker_chain.other(),
@@ -1101,6 +1127,17 @@ impl<T: Transport> Engine<T> {
         let secret = (self.records[i].swap.role == Role::Maker)
             .then(|| self.keys.secret(self.records[i].swap.key_index));
         let actions = self.records[i].swap.decide(&view, secret);
+        // A swap parked on an unsigned funding PSBT that has now reached a terminal phase (it abandoned
+        // while waiting for the user's signature) must drop the pending PSBT, so the UI stops asking
+        // the user to sign a dead swap and submit_signed_lock's refusal is consistent with the store.
+        if self.records[i].pending_lock_psbt.is_some()
+            && matches!(
+                self.records[i].swap.phase,
+                Phase::Abandoned | Phase::Done | Phase::Refunded
+            )
+        {
+            self.records[i].pending_lock_psbt = None;
+        }
         self.save(&self.records[i])?;
         for action in actions {
             self.act(i, action)?;

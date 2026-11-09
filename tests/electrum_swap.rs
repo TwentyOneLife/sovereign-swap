@@ -1,0 +1,192 @@
+//! E1 (design 0016) at the *engine* level: a full two-party BTC/xBTC swap whose BTC-side chain reads
+//! and broadcasts all go through a real Fulcrum Electrum server (`set_read_backend`), while the xBTC
+//! side stays on the node RPC. This is the mixed per-chain configuration a thin client runs, and it
+//! exercises the path `electrum_regtest.rs` could not: the counterparty learning the secret from a
+//! claim seen *through Electrum* (`lock_view` populating `spend.preimage` from scripthash history),
+//! and a claim/refund broadcast over Electrum.
+//!
+//! Routed over the in-process relay like `relay_swap.rs`. Skipped without `BTC_BITCOIND`,
+//! `XBTC_BITCOIND` (common::binaries) and `FULCRUM_BIN` (scripts/fetch-nodes.sh +
+//! scripts/test-in-container.sh).
+
+mod common;
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use bitcoin::{Amount, Network};
+use serde_json::json;
+
+use common::{binaries, Fulcrum, Node};
+use sovereign_swap::electrum::ElectrumBackend;
+use sovereign_swap::engine::{Config, Engine};
+use sovereign_swap::envelope::Identity;
+use sovereign_swap::node::{ChainBackend, ChainNode};
+use sovereign_swap::policy::Policy;
+use sovereign_swap::relay::{InProcessConn, Relay};
+use sovereign_swap::routing::RelayTransport;
+use sovereign_swap::swap::{Chain, Offer, Phase};
+
+type Tp = RelayTransport<InProcessConn>;
+
+fn config() -> Config {
+    Config {
+        min_spend_fee: Amount::from_sat(2_000),
+        fee_rate_sat_vb: 2,
+        policy: Policy {
+            btc: vec![(Amount::ONE_BTC, 1)],
+            xbtc: vec![(Amount::ONE_BTC, 2)],
+            funding_minconf_btc: 1,
+            funding_minconf_xbtc: 1,
+        },
+        btc_payout: None,
+        xbtc_payout: None,
+    }
+}
+
+fn offer() -> Offer {
+    Offer {
+        id: [7; 16],
+        maker_chain: Chain::Xbtc,
+        maker_amount: Amount::from_sat(500_000),
+        taker_amount: Amount::from_sat(150_000),
+        min_maker_amount: Amount::from_sat(500_000),
+        maker_lock_blocks: 40,
+        taker_lock_blocks: 20,
+        maker_lock_depth: 1,
+        taker_lock_depth: 1,
+        margin_blocks: 2,
+        fee: None,
+    }
+}
+
+/// A party whose BTC reads and broadcasts go through `fulcrum_port`; xBTC stays on the node RPC.
+fn open_party(
+    dir: &Path,
+    name: &'static str,
+    seeds: (u8, u8),
+    relay: &Relay,
+    core: &Node,
+    knots: &Node,
+    fulcrum_port: u16,
+) -> Engine<Tp> {
+    let tp = RelayTransport::new(
+        Identity::from_seed(&[seeds.0; 32]),
+        &[seeds.1; 32],
+        InProcessConn::new(relay.clone()),
+    );
+    let btc = ChainNode::open(core.rpc.clone(), name).unwrap();
+    let xbtc = ChainNode::open(knots.rpc.clone(), name).unwrap();
+    let mut engine = Engine::open(dir, btc, xbtc, tp, config()).unwrap();
+    let electrum =
+        ElectrumBackend::connect("127.0.0.1", fulcrum_port, None, Network::Regtest).unwrap();
+    engine.set_read_backend(Chain::Btc, Box::new(electrum));
+    engine
+}
+
+fn tick(e: &mut Engine<Tp>) {
+    let errs = e.tick();
+    assert!(errs.is_empty(), "tick errors: {errs:?}");
+}
+
+/// Wait until Fulcrum has indexed up to the node's tip, so a tick that reads BTC through Electrum
+/// never acts on a chain view that is a block or two behind the node.
+fn wait_synced(probe: &ElectrumBackend, core: &Node) {
+    let tip = core.height() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while probe.height().unwrap_or(0) < tip {
+        assert!(Instant::now() < deadline, "Fulcrum did not reach tip {tip}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_full_swap_settles_with_btc_read_and_broadcast_over_electrum() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    // Mine before launching Fulcrum: it refuses to serve during initial block download, and this also
+    // matures coinbases so both node wallets can fund.
+    core.mine(101);
+    knots.mine(101);
+    let Some(fulcrum) = Fulcrum::start(&core) else {
+        eprintln!("skipped: set FULCRUM_BIN (scripts/fetch-nodes.sh)");
+        return;
+    };
+    let probe =
+        ElectrumBackend::connect("127.0.0.1", fulcrum.port, None, Network::Regtest).unwrap();
+    let relay = Relay::new();
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-eswap-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-eswap-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_party(
+        &mdir,
+        "maker",
+        (11, 101),
+        &relay,
+        &core,
+        &knots,
+        fulcrum.port,
+    );
+    let mut taker = open_party(
+        &tdir,
+        "taker",
+        (22, 202),
+        &relay,
+        &core,
+        &knots,
+        fulcrum.port,
+    );
+
+    // Maker locks xBTC, taker locks BTC: fund each party's node wallet on its own chain.
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 2.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+    wait_synced(&probe, &core);
+
+    maker.publish(offer()).unwrap();
+    tick(&mut taker); // discover the offer over the relay
+    taker.bid(&offer(), offer().maker_amount, [9; 16]).unwrap();
+
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        core.mine(1);
+        knots.mine(1);
+        wait_synced(&probe, &core);
+        tick(&mut maker);
+        tick(&mut taker);
+        rounds += 1;
+        assert!(
+            rounds < 100,
+            "stuck: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    drop(fulcrum);
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
