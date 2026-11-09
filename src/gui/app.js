@@ -150,7 +150,6 @@ function renderStatus() {
   const el = $("#status");
   if (!statusData) return; // loadStatus owns the "unreachable" text; don't clobber it from here
   const s = statusData;
-  const dot = (cls, title) => `<span class="dot ${cls}"${title ? ` title="${title}"` : ""}></span>`;
   const onoff = (ok) => (ok ? "on" : "off");
   const priceTitle =
     priceState === "on"
@@ -163,11 +162,20 @@ function renderStatus() {
   const xbtcTitle = `xBTC (Bitcoin Blake2b) node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
   const engineTitle = `Swap engine (the daemon's tick loop): ${s.engine ? "running" : "stopped"}`;
   const relayTitle = `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
-  const activeTitle = "Swaps currently in flight on this node";
-  el.innerHTML =
-    `${dot(onoff(s.btc_node), btcTitle)}BTC ${dot(onoff(s.xbtc_node), xbtcTitle)}xBTC ` +
-    `${dot(onoff(s.engine), engineTitle)}engine ${dot(onoff(s.relays > 0), relayTitle)}relay ` +
-    `${dot(priceState, priceTitle)}price · <span title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`;
+  const activeTitle = `Swaps currently in flight on this node: ${s.active_swaps ?? "unknown"}`;
+  // Each item groups its dot and label under one tooltip (hover either), and the items are spaced and
+  // separated by a thin divider so a glance reads them apart instead of as one run-on string.
+  const item = (cls, title, label) =>
+    `<span class="stat" title="${title}"><span class="dot ${cls}"></span>${label}</span>`;
+  const sep = `<span class="sep" aria-hidden="true">|</span>`;
+  el.innerHTML = [
+    item(onoff(s.btc_node), btcTitle, "BTC"),
+    item(onoff(s.xbtc_node), xbtcTitle, "xBTC"),
+    item(onoff(s.engine), engineTitle, "engine"),
+    item(onoff(s.relays > 0), relayTitle, "relay"),
+    item(priceState, priceTitle, "price"),
+    `<span class="stat" title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`,
+  ].join(sep);
 }
 
 async function loadStatus() {
