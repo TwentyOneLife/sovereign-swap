@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
-use bitcoin::Amount;
+use bitcoin::{Address, Amount, Network};
 use serde_json::{json, Value};
 
 use bitcoin::hashes::Hash;
@@ -19,7 +19,7 @@ use sovereign_swap::htlc::Contract;
 use sovereign_swap::node::{ChainBackend, ChainNode, FundingSigner, NodeError};
 use sovereign_swap::replay::UtxoLookup;
 use sovereign_swap::rpc::{Client, RpcError};
-use sovereign_swap::signer::RemoteSigner;
+use sovereign_swap::signer::{InteractiveSigner, RemoteSigner};
 
 /// Signs by delegating to a separate key-holding wallet, as a cold device would.
 struct ExternalSigner {
@@ -351,4 +351,70 @@ fn the_daemon_refuses_a_cold_start_when_the_signer_is_unreachable() {
         "a refused cold start must not create a funding wallet: {wallets}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E2 (design 0017): with an interactive signer, funding must not sign. It builds the unsigned funding
+/// PSBT on the watch-only wallet and hands it back as `AwaitingSignature` for the user to sign out of
+/// band; no spending key is on the engine host. The parked PSBT really pays the contract address.
+#[test]
+fn an_interactive_signer_parks_the_unsigned_lock_for_the_user() {
+    let Some((btc, _)) = binaries() else {
+        return;
+    };
+    let node = Node::start(&btc, None);
+    node.mine(101);
+
+    // Some account descriptors to drive a watch-only funding wallet; the signer is the user.
+    node.call("createwallet", json!(["isigner"]));
+    let descs = node
+        .rpc
+        .wallet("isigner")
+        .call("listdescriptors", json!([]))
+        .unwrap();
+    let (receive, change) = wpkh_descriptors(&descs);
+    let chain = ChainNode::open_cold(
+        node.rpc.clone(),
+        "ifund",
+        &receive,
+        &change,
+        Box::new(InteractiveSigner),
+    )
+    .expect("provisioning the watch-only funding wallet");
+
+    // Give the watch-only wallet a coin so it can build a funded PSBT.
+    let addr = node
+        .rpc
+        .wallet("ifund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    node.wallet()
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .unwrap();
+    node.mine(1);
+
+    let contract = Contract {
+        secret_hash: [5; 32],
+        claim_pkh: PubkeyHash::from_byte_array([6; 20]),
+        refund_pkh: PubkeyHash::from_byte_array([7; 20]),
+        lock_blocks: 20,
+    };
+    let amount = Amount::from_sat(500_000);
+    let err = chain
+        .fund(&contract, amount, 2, 1, &NoOtherChain, None)
+        .expect_err("an interactive signer must not sign; it parks the unsigned PSBT");
+    let NodeError::AwaitingSignature { psbt } = err else {
+        panic!("expected AwaitingSignature, got {err:?}");
+    };
+
+    // The parked PSBT is a real, unsigned transaction paying the contract address.
+    let decoded = node.call("decodepsbt", json!([psbt]));
+    let lock_addr = Address::from_script(&contract.script_pubkey(), Network::Regtest)
+        .unwrap()
+        .to_string();
+    let pays_lock = decoded["tx"]["vout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["scriptPubKey"]["address"] == lock_addr.as_str());
+    assert!(pays_lock, "the parked PSBT must pay the contract address");
 }

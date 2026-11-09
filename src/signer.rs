@@ -29,6 +29,20 @@ use serde_json::{json, Value};
 use crate::node::{FundingSigner, NodeError, SignerError};
 use crate::rpc::{Client, RpcError};
 
+/// A funding signer that does not sign: it returns the unsigned PSBT as
+/// [`NodeError::AwaitingSignature`], for a swap where the user signs in their own wallet (Sparrow for
+/// BTC, Shrike for xBTC) and submits the signed PSBT out of band (E2, design 0017). The engine parks
+/// the swap on this signal instead of funding; no spending key ever reaches the operator's side.
+pub struct InteractiveSigner;
+
+impl FundingSigner for InteractiveSigner {
+    fn sign(&self, unsigned_psbt: &str) -> Result<String, NodeError> {
+        Err(NodeError::AwaitingSignature {
+            psbt: unsigned_psbt.to_owned(),
+        })
+    }
+}
+
 /// A funding signer reached over the node transport. `chain` tags each request ("btc" or "xbtc").
 pub struct RemoteSigner {
     client: Client,

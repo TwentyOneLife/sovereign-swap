@@ -25,6 +25,10 @@ pub enum NodeError {
     Replay(ReplayError<RpcError>),
     Signer(SignerError),
     Unexpected(String),
+    /// The funding signer is the user, who signs out of band (E2, design 0017): this carries the
+    /// unsigned funding PSBT (already past the replay guard in `fund()`) so the engine parks the swap
+    /// awaiting the user's signature instead of funding it now. Not a failure, a checkpoint.
+    AwaitingSignature { psbt: String },
 }
 
 /// Why a remote (cold) funding signer did not return a usable signed PSBT (design 0012). Kept
