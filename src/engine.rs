@@ -176,6 +176,11 @@ pub enum EngineError {
     /// already withdrawn/filled. `own_offers` holds only our own offers, so a peer's offer can never
     /// be withdrawn here. Report it instead of returning a misleading success (#78).
     NotYourOffer,
+    /// A signed funding PSBT was submitted for a swap that can no longer safely broadcast its lock:
+    /// it has abandoned (e.g. the counterparty's lock window ran out while we waited for the user's
+    /// signature) or already settled. Broadcasting now would strand the funds in an HTLC the engine
+    /// no longer drives to a refund, so the late submission is refused rather than honoured.
+    NoLongerFundable,
 }
 
 impl From<NodeError> for EngineError {
@@ -511,6 +516,17 @@ impl<T: Transport> Engine<T> {
                 "swap is not awaiting a funding signature".into(),
             )));
         };
+        // Refuse a late submission once the swap can no longer safely broadcast its lock. A parked
+        // swap abandons when the counterparty's lock window runs out (decide_taker / decide_maker), and
+        // a terminal swap gets no further actions (Swap::decide), so broadcasting the lock now would
+        // commit the user's coin to an HTLC the engine never drives to a refund. The user recovers
+        // nothing by signing late, so reject it instead of stranding the funds.
+        if matches!(
+            self.records[i].swap.phase,
+            Phase::Abandoned | Phase::Done | Phase::Refunded | Phase::Refunding
+        ) {
+            return Err(EngineError::NoLongerFundable);
+        }
         let own_chain = match self.records[i].swap.role {
             Role::Maker => self.records[i].swap.offer.maker_chain,
             Role::Taker => self.records[i].swap.offer.maker_chain.other(),
