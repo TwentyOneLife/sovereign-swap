@@ -123,6 +123,69 @@ fn open_taker(
     Engine::open(dir, btc, xbtc, tp, config()).unwrap()
 }
 
+/// An offer where the maker locks BTC (so the maker's own funding leg is the interactive one).
+fn offer_btc() -> Offer {
+    Offer {
+        id: [7; 16],
+        maker_chain: Chain::Btc,
+        maker_amount: Amount::from_sat(150_000),
+        taker_amount: Amount::from_sat(500_000),
+        min_maker_amount: Amount::from_sat(150_000),
+        maker_lock_blocks: 40,
+        taker_lock_blocks: 20,
+        maker_lock_depth: 1,
+        taker_lock_depth: 1,
+        margin_blocks: 2,
+        fee: None,
+    }
+}
+
+/// A plain party: both chains on the node RPC (used as the non-interactive counterparty).
+fn open_plain(
+    dir: &Path,
+    name: &'static str,
+    seeds: (u8, u8),
+    relay: &Relay,
+    core: &Node,
+    knots: &Node,
+) -> Engine<Tp> {
+    let tp = RelayTransport::new(
+        Identity::from_seed(&[seeds.0; 32]),
+        &[seeds.1; 32],
+        InProcessConn::new(relay.clone()),
+    );
+    let btc = ChainNode::open(core.rpc.clone(), name).unwrap();
+    let xbtc = ChainNode::open(knots.rpc.clone(), name).unwrap();
+    Engine::open(dir, btc, xbtc, tp, config()).unwrap()
+}
+
+/// A maker whose BTC leg funds interactively (watch-only from the user's descriptors + the
+/// InteractiveSigner), xBTC a plain node. Mirrors open_taker for the maker role.
+fn open_maker_interactive(
+    dir: &Path,
+    relay: &Relay,
+    core: &Node,
+    knots: &Node,
+    receive: &str,
+    change: &str,
+) -> Engine<Tp> {
+    let tp = RelayTransport::new(
+        Identity::from_seed(&[11; 32]),
+        &[101; 32],
+        InProcessConn::new(relay.clone()),
+    );
+    let btc = ChainNode::open_cold(
+        core.rpc.clone(),
+        "makerfund",
+        receive,
+        change,
+        Box::new(InteractiveSigner),
+    )
+    .unwrap();
+    let xbtc = ChainNode::open(knots.rpc.clone(), "maker").unwrap();
+    Engine::open(dir, btc, xbtc, tp, config()).unwrap()
+}
+
 fn tick(e: &mut Engine<Tp>) {
     let errs = e.tick();
     assert!(errs.is_empty(), "tick errors: {errs:?}");
@@ -404,6 +467,106 @@ fn a_late_signed_lock_is_refused_after_the_swap_abandons() {
         Some(Phase::Abandoned),
         "the re-decision abandons the swap"
     );
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+#[test]
+fn a_full_swap_settles_with_an_interactive_maker_funding_lock() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    // The maker's own keyed wallet drives the maker's watch-only BTC funding wallet.
+    core.call("createwallet", json!(["makeruser"]));
+    let user = core.rpc.wallet("makeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-imaker-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-imaker-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker_interactive(&mdir, &relay, &core, &knots, &receive, &change);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+
+    // Maker locks BTC (interactively), taker locks xBTC (from its node wallet).
+    let maddr = core
+        .rpc
+        .wallet("makerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([maddr, 1.0]))
+        .unwrap();
+    let taddr = knots
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([taddr, 2.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(offer_btc()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&offer_btc(), offer_btc().maker_amount, [9; 16])
+        .unwrap();
+
+    // Drive until the maker parks its own funding lock (the maker locks first).
+    let mut rounds = 0;
+    let swap_id = loop {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        if let Some(id) = maker.swaps().next().map(|s| s.id) {
+            if maker.pending_lock_psbt(id).is_some() {
+                break id;
+            }
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "maker never parked: {:?}",
+            maker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    // The maker signs its own funding PSBT and submits it (the Role::Maker arm of submit_signed_lock).
+    let parked = maker.pending_lock_psbt(swap_id).unwrap();
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    assert_eq!(signed["complete"], true);
+    maker
+        .submit_signed_lock(swap_id, signed["psbt"].as_str().unwrap())
+        .unwrap();
+    assert!(maker.pending_lock_psbt(swap_id).is_none());
+
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "stuck: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
