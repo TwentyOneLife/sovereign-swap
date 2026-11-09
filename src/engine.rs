@@ -188,6 +188,11 @@ pub struct Engine<T: Transport> {
     dir: PathBuf,
     keys: Keys,
     nodes: HashMap<Chain, ChainNode>,
+    /// Optional per-chain read/broadcast backend override (E1, design 0016): when set for a chain,
+    /// `backend()` reads chain data and broadcasts through it (an Electrum server) instead of the
+    /// funding node's RPC. Funding and signing still use the `ChainNode` in `nodes`. Empty by
+    /// default, so without configuration the engine behaves exactly as before.
+    read: HashMap<Chain, Box<dyn ChainBackend + Send + Sync>>,
     transport: T,
     config: Config,
     /// Smallest swap leg either side will bid or accept, in sats. Defaults to
@@ -242,6 +247,7 @@ impl<T: Transport> Engine<T> {
             dir: dir.to_owned(),
             keys: Keys::open(dir)?,
             nodes: HashMap::from([(Chain::Btc, btc), (Chain::Xbtc, xbtc)]),
+            read: HashMap::new(),
             transport,
             config,
             min_swap_sat: crate::swap::MIN_SWAP_AMOUNT.to_sat(),
@@ -486,11 +492,22 @@ impl<T: Transport> Engine<T> {
         &self.nodes[&chain]
     }
 
-    /// The chain's node as the read/broadcast backend the engine depends on. Funding and signing
-    /// still need the concrete [`ChainNode`] (via `self.nodes`), so those call sites keep it; the
-    /// data and broadcast ones go through the trait (design 0014).
+    /// The chain's read/broadcast backend: a configured Electrum override (E1) if present, else the
+    /// funding node. Funding and signing still need the concrete [`ChainNode`] (via `self.nodes`), so
+    /// those call sites keep it; the data and broadcast ones go through the trait (design 0014/0016).
     fn backend(&self, chain: Chain) -> &dyn ChainBackend {
-        &self.nodes[&chain]
+        if let Some(b) = self.read.get(&chain) {
+            b.as_ref()
+        } else {
+            &self.nodes[&chain]
+        }
+    }
+
+    /// Point `chain`'s chain-data reads and broadcasts at an Electrum server instead of the funding
+    /// node's RPC (E1, design 0016). Funding and signing still use the node. Call right after
+    /// [`Engine::open`]; the daemon sets it from the operator's configured Electrum endpoint.
+    pub fn set_read_backend(&mut self, chain: Chain, backend: Box<dyn ChainBackend + Send + Sync>) {
+        self.read.insert(chain, backend);
     }
 
     fn save_state(&self) -> Result<(), EngineError> {

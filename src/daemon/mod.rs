@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 
 use crate::engine::Engine;
 use crate::envelope::Identity;
-use crate::node::ChainNode;
+use crate::electrum::ElectrumBackend;
+use crate::node::{ChainBackend, ChainNode};
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
 use crate::signer::RemoteSigner;
@@ -247,6 +248,26 @@ impl Daemon {
         engine.set_min_swap_sat(settings.min_swap_sat);
         engine.set_min_trade_sat(settings.min_trade_sat);
         engine.set_max_swap_sat(settings.max_swap_sat);
+        // E1 (design 0016): when a chain has an Electrum endpoint configured, point its chain-data
+        // reads and broadcasts at that server instead of the funding node's RPC. Empty leaves the
+        // engine reading from the node, exactly as before. Funding and signing still use the node.
+        for (chain, endpoint) in [
+            (Chain::Btc, settings.btc_electrum.trim()),
+            (Chain::Xbtc, settings.xbtc_electrum.trim()),
+        ] {
+            if endpoint.is_empty() {
+                continue;
+            }
+            let (host, port) = endpoint
+                .rsplit_once(':')
+                .and_then(|(h, p)| p.parse::<u16>().ok().map(|port| (h, port)))
+                .ok_or_else(|| format!("{chain:?} electrum endpoint not host:port: {endpoint}"))?;
+            let socks = endpoint.contains(".onion").then(|| tor_socks.to_owned());
+            let network = engine.node(chain).network();
+            let backend = ElectrumBackend::connect(host, port, socks.as_deref(), network)
+                .map_err(|e| format!("{chain:?} electrum {endpoint}: {e:?}"))?;
+            engine.set_read_backend(chain, Box::new(backend));
+        }
 
         let (tx, rx) = mpsc::channel();
         let events = Arc::clone(&self.events);
