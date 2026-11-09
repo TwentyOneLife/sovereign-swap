@@ -78,7 +78,7 @@ impl Party {
         let dir = std::env::temp_dir().join(format!("sovswap-lab-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Direct ws (None = no SOCKS5 proxy); inside the lab the circuit is the macvlan, not Tor.
-        let conn = WsConn::connect(relay_url, None).expect("connect to the lab relay");
+        let conn = WsConn::connect(relay_url, None);
         let tp = RelayTransport::new(
             Identity::from_seed(&[id_seed; 32]),
             &[routing_seed; 32],

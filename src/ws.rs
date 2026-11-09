@@ -56,11 +56,15 @@ pub enum WsError {
 impl WsConn {
     /// Connects to `url` (ws://host:port/...). With `socks`, dials through that Tor SOCKS5 proxy so
     /// an `.onion` host resolves inside Tor; without it, a direct TCP connection.
-    pub fn connect(url: &str, socks: Option<&str>) -> Result<WsConn, WsError> {
-        // The first connect is synchronous so an unreachable relay still fails here; later drops are
-        // healed by the worker's reconnect loop.
-        let mut socket = dial(url, socks)?;
-        subscribe(&mut socket, None)?;
+    pub fn connect(url: &str, socks: Option<&str>) -> WsConn {
+        // Attempt the first dial synchronously, so a reachable relay is live the instant this returns.
+        // But a failure is NOT fatal (#113): a transient Tor-SOCKS race at boot, or a briefly-down
+        // relay, would otherwise stop the engine from starting at all, leaving a node unable to drive
+        // its own in-flight swaps. Instead the worker connects (and later reconnects) asynchronously
+        // with backoff, so the engine always comes up and discovery catches up when the relay is ready.
+        let initial = dial(url, socks)
+            .and_then(|mut s| subscribe(&mut s, None).map(|()| s))
+            .ok();
         let incoming: Arc<Mutex<VecDeque<Event>>> = Arc::default();
         let buffer = Arc::clone(&incoming);
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
@@ -69,14 +73,21 @@ impl WsConn {
         let url = url.to_owned();
         let socks = socks.map(str::to_owned);
         let worker = std::thread::spawn(move || {
-            run(socket, &url, socks.as_deref(), rx, buffer, &worker_shutdown);
+            run(
+                &url,
+                socks.as_deref(),
+                rx,
+                buffer,
+                &worker_shutdown,
+                initial,
+            );
         });
-        Ok(WsConn {
+        WsConn {
             outgoing: tx,
             incoming,
             shutdown,
             _worker: worker,
-        })
+        }
     }
 }
 
@@ -123,37 +134,57 @@ fn subscribe(
         .map_err(|e| WsError::Handshake(e.to_string()))
 }
 
-/// The owner thread: serve the socket until it breaks, then reconnect (unless shutting down).
+/// Connects (or reconnects) with capped backoff, resubscribing from the watermark `since` so a
+/// reconnect does not replay the whole retention window. Returns `None` only if a shutdown is
+/// requested while it is still trying, so the caller stops cleanly. Used both for the initial connect
+/// when the first dial failed (#113) and for healing a dropped socket.
+fn connect_with_backoff(
+    url: &str,
+    socks: Option<&str>,
+    since: Option<u64>,
+    shutdown: &AtomicBool,
+) -> Option<tungstenite::WebSocket<TcpStream>> {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
+        match dial(url, socks).and_then(|mut s| subscribe(&mut s, since).map(|()| s)) {
+            Ok(s) => return Some(s),
+            Err(_) => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// The owner thread: connect if needed, serve the socket until it breaks, then reconnect (unless
+/// shutting down). `initial` is the socket from the synchronous first dial, or `None` when that dial
+/// failed and the first connection must be made here (#113).
 fn run(
-    mut socket: tungstenite::WebSocket<TcpStream>,
     url: &str,
     socks: Option<&str>,
     rx: Receiver<String>,
     buffer: Arc<Mutex<VecDeque<Event>>>,
     shutdown: &AtomicBool,
+    initial: Option<tungstenite::WebSocket<TcpStream>>,
 ) {
     let mut since: Option<u64> = None;
+    let mut next = initial;
     loop {
+        let mut socket = match next.take() {
+            Some(s) => s,
+            None => match connect_with_backoff(url, socks, since, shutdown) {
+                Some(s) => s,
+                None => return, // shutting down
+            },
+        };
         serve(&mut socket, &rx, &buffer, shutdown, &mut since);
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        // The socket broke. Reconnect with capped backoff, resubscribing from the watermark so new
-        // offers flow again and the relay does not replay the whole backlog.
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(backoff);
-            match dial(url, socks).and_then(|mut s| subscribe(&mut s, since).map(|()| s)) {
-                Ok(s) => {
-                    socket = s;
-                    break;
-                }
-                Err(_) => backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF),
-            }
-        }
+        // The socket broke; the next iteration reconnects from the watermark.
     }
 }
 
@@ -268,5 +299,17 @@ mod tests {
         );
         assert_eq!(parse_ws_url("ws://abc.onion:80").unwrap().1, 80);
         assert!(parse_ws_url("wss://x:1").is_err());
+    }
+
+    // #113: connecting to an unreachable relay must NOT fail or block. The first dial fails fast
+    // (connection refused), the worker reconnects in the background, and the engine can still start.
+    // Port 1 is privileged/unused, so the dial is refused immediately; dropping the conn stops the
+    // worker (shutdown on drop).
+    #[test]
+    fn connect_to_an_unreachable_relay_returns_a_pending_connection() {
+        let conn = WsConn::connect("ws://127.0.0.1:1/", None);
+        // It exists and did not panic; nothing has been received over the (never-established) socket.
+        assert!(conn.incoming.lock().unwrap().is_empty());
+        drop(conn); // sets shutdown; the reconnect loop exits at its next check
     }
 }

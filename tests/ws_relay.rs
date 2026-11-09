@@ -90,7 +90,7 @@ fn serve_client(
 }
 
 fn party(url: &str, id_seed: u8, routing_seed: u8) -> RelayTransport<WsConn> {
-    let conn = WsConn::connect(url, None).expect("connect to the toy relay");
+    let conn = WsConn::connect(url, None);
     RelayTransport::new(
         Identity::from_seed(&[id_seed; 32]),
         &[routing_seed; 32],
