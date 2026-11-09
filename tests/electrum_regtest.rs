@@ -21,11 +21,14 @@ fn electrum_backend_reads_a_funded_lock_from_a_live_fulcrum() {
         return;
     };
     let node = Node::start(&btc, None);
+    // Mine before launching Fulcrum: Fulcrum refuses to serve while bitcoind is in initial block
+    // download, and mining recent-timestamped blocks takes regtest out of IBD. Also matures a coinbase
+    // so the wallet can fund.
+    node.mine(101);
     let Some(fulcrum) = Fulcrum::start(&node) else {
         eprintln!("skipped: set FULCRUM_BIN (scripts/fetch-nodes.sh)");
         return;
     };
-    node.mine(101); // mature a coinbase so the wallet can fund
 
     let contract = Contract {
         secret_hash: sha256::Hash::hash(&[7u8; 32]).to_byte_array(),
