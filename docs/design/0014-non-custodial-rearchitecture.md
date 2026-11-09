@@ -46,6 +46,13 @@ no spend key, no seed, no funded-and-signable wallet. The operator may hold, and
 
 Every design choice below is checked against this line.
 
+> **IMPLEMENTED (F5): operator-owned payout destinations.** A node's claimed proceeds and its refunds
+> land at an operator-configured payout address per chain (`btc_payout` / `xbtc_payout`, engine config;
+> network-checked in `node.rs`), or, when none is set, a fresh address from the node's own funding
+> wallet. Directing proceeds to an external operator-owned address keeps claimed coin from accumulating
+> in the node's hot funding wallet, consistent with the custody line above. A payout address is a
+> destination only; it confers no control over a user's in-flight swap.
+
 ## The re-architecture
 
 ### 1. A chain backend trait

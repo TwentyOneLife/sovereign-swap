@@ -75,6 +75,14 @@ rate band in 0009 layer 2), so a mis-set rate cannot produce a fee larger than t
 > leg. It is belt-and-braces, guarding only against a later lowering of the swap minimum or a raising
 > of the floor/bps cap. It does NOT cap dust-fee economics; that would be a different, lower threshold.
 
+> **Not the claim/refund spend fee (F6).** The fee in this document is the *voluntary project fee*, an
+> extra output on the funding transaction. A separate *spend fee* is the miner fee the engine pays to
+> claim or refund a leg. That one is rate-based (`spend_at_rate`: vsize times the node's
+> `estimatesmartfee` CONSERVATIVE rate) with a `min_spend_fee` floor of 400 sat (min-relay-safe),
+> replacing the earlier flat 2,000-sat fee so a quiet mempool no longer overpays. It is engine config,
+> not part of `FeeTerms`, and the swap minimum (`MIN_SWAP_FLOOR_SAT`, 3,000) is validated to keep a leg
+> spendable after it.
+
 ## Silent payments on the funding path
 
 A silent payment address `sp1...` carries two public keys, scan and spend. The payer, who holds the
