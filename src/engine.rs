@@ -181,6 +181,12 @@ pub enum EngineError {
     /// signature) or already settled. Broadcasting now would strand the funds in an HTLC the engine
     /// no longer drives to a refund, so the late submission is refused rather than honoured.
     NoLongerFundable,
+    /// A signed funding PSBT was submitted while the swap is still live but not yet clear to fund (for
+    /// example the counterparty's fee proof has not been verified yet, which a transient backend read
+    /// or a restart can briefly leave pending). The swap is NOT dead: the parked PSBT is kept exactly
+    /// as it is (rebuilding it with fresh inputs would strand the signature) and the submission is
+    /// refused retryably, to try again shortly.
+    NotYetFundable,
 }
 
 impl From<NodeError> for EngineError {
@@ -533,9 +539,22 @@ impl<T: Transport> Engine<T> {
             .iter()
             .any(|a| matches!(a, Action::Fund));
         if !still_funding {
-            self.records[i].pending_lock_psbt = None;
-            self.save(&self.records[i])?;
-            return Err(EngineError::NoLongerFundable);
+            // A non-Fund decision is not the same as a dead swap. Only a terminal re-decision (the swap
+            // abandoned while the user was signing, or already settled) means the lock must never
+            // broadcast: drop the pending PSBT so the UI stops asking, and refuse for good. Any other
+            // non-Fund result is the swap still waiting on a precondition (e.g. the counterparty's fee
+            // proof, which a transient backend read or a restart can briefly leave pending), NOT dead:
+            // keep the parked PSBT exactly as it is (a rebuild with fresh inputs would strand the
+            // signature) and refuse retryably so the user tries again shortly.
+            if matches!(
+                self.records[i].swap.phase,
+                Phase::Abandoned | Phase::Done | Phase::Refunded | Phase::Refunding
+            ) {
+                self.records[i].pending_lock_psbt = None;
+                self.save(&self.records[i])?;
+                return Err(EngineError::NoLongerFundable);
+            }
+            return Err(EngineError::NotYetFundable);
         }
         let own_chain = match self.records[i].swap.role {
             Role::Maker => self.records[i].swap.offer.maker_chain,
