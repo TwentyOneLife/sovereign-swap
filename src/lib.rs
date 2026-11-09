@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod dleq;
+pub mod electrum;
 pub mod engine;
 pub mod envelope;
 pub mod fee;
