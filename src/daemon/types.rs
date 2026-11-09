@@ -129,6 +129,14 @@ pub struct Settings {
     /// floor is not configurable; it guards Bitcoin's dust limit.
     #[serde(default = "default_min_trade_sat")]
     pub min_trade_sat: u64,
+    /// Beta safety cap on the real-value (BTC) leg of a swap, in sats (#103). The BTC side carries the
+    /// value (xBTC is far cheaper), so capping it bounds what a tester can put at risk; the xBTC leg is
+    /// uncapped since the swap rate keeps the two sides roughly equal in value. Enforced locally at
+    /// offer creation (`NewOffer::validate`) and at bid time, so it never becomes part of counterparty
+    /// verification. Defaults to a conservative dust-beta ceiling; raise it for larger swaps. Absent in
+    /// older config, hence `serde(default)`.
+    #[serde(default = "default_max_swap_sat")]
+    pub max_swap_sat: u64,
     /// Node RPC credentials. Local to the daemon (data dir, mode 600); not a key to funds (the
     /// funding wallet is watch-only, 0008). Absent in older config, hence `serde(default)`.
     #[serde(default)]
@@ -212,6 +220,13 @@ fn default_min_swap_sat() -> u64 {
 fn default_min_trade_sat() -> u64 {
     crate::fee::MIN_TRADE_SAT
 }
+/// The default beta cap on the BTC leg: 100_000 sat (0.001 BTC). Small enough that a swap is a test
+/// amount you can lose, large enough that the real-rate dust swaps we run (a few thousand sat on the
+/// BTC side) are well within it. An operator raises `max_swap_sat` to allow larger swaps.
+pub(crate) const DEFAULT_MAX_SWAP_SAT: u64 = 100_000;
+fn default_max_swap_sat() -> u64 {
+    DEFAULT_MAX_SWAP_SAT
+}
 fn default_fee_maker_bps() -> u16 {
     20
 }
@@ -234,6 +249,7 @@ impl Default for Settings {
             margin_blocks: 2,
             min_swap_sat: default_min_swap_sat(),
             min_trade_sat: default_min_trade_sat(),
+            max_swap_sat: default_max_swap_sat(),
             btc_rpc_user: String::new(),
             btc_rpc_pass: String::new(),
             xbtc_rpc_user: String::new(),
@@ -417,8 +433,25 @@ impl NewOffer {
     /// defaults to [`DUST_SAT`]). Every "smallest leg" bound, both legs and the per-bid minimum, is
     /// this one value, so lowering the setting lets a small real-rate offer through; the engine's bid
     /// validation enforces the same value on the other side.
-    pub(crate) fn validate(&self, min_swap_sat: u64) -> Vec<String> {
+    pub(crate) fn validate(&self, min_swap_sat: u64, max_swap_sat: u64) -> Vec<String> {
         let mut e = Vec::new();
+        // #103 beta cap: bound the real-value (BTC) leg so a tester cannot swap a large amount. The BTC
+        // leg is `amount_sat` when selling BTC, else what the taker pays in BTC (the exact counter, or
+        // the price applied to the xBTC amount). The xBTC leg is uncapped: the swap rate keeps the two
+        // sides roughly equal in value, so capping the BTC side bounds the exposure.
+        let btc_leg = match self.sell_chain {
+            Chain::Btc => Some(self.amount_sat),
+            Chain::Xbtc => self
+                .counter_amount_sat
+                .or_else(|| self.price.map(|p| (self.amount_sat as f64 * p) as u64)),
+        };
+        if let Some(btc) = btc_leg {
+            if btc > max_swap_sat {
+                e.push(format!(
+                    "BTC leg ({btc} sat) exceeds the per-swap cap max_swap_sat ({max_swap_sat}); raise it to allow larger swaps"
+                ));
+            }
+        }
         if self.amount_sat < min_swap_sat {
             e.push(format!(
                 "amount_sat: below the minimum leg ({min_swap_sat})"
@@ -611,6 +644,40 @@ mod tests {
             counter_amount_sat: None,
             min_amount_sat: 50_000_000,
         }
+    }
+
+    #[test]
+    fn the_beta_cap_bounds_the_btc_leg_not_the_xbtc_leg_103() {
+        // Selling BTC: amount_sat is the BTC leg, so it is capped directly.
+        let mut sell_btc = a_new_offer();
+        sell_btc.sell_chain = Chain::Btc;
+        sell_btc.amount_sat = 200_000;
+        sell_btc.min_amount_sat = 200_000;
+        sell_btc.price = None;
+        sell_btc.counter_amount_sat = Some(3_000);
+        assert!(
+            sell_btc
+                .validate(3_000, 100_000)
+                .iter()
+                .any(|m| m.contains("per-swap cap")),
+            "a 200k-sat BTC leg should exceed the 100k cap"
+        );
+        assert!(
+            sell_btc.validate(3_000, u64::MAX).is_empty(),
+            "with no cap the same offer is fine"
+        );
+        // Selling xBTC at a real rate: the BTC leg is the small counter, not the large xBTC amount, so
+        // a realistic dust swap (large xBTC, tiny BTC) must NOT be blocked by the BTC-leg cap.
+        let mut sell_xbtc = a_new_offer();
+        sell_xbtc.sell_chain = Chain::Xbtc;
+        sell_xbtc.amount_sat = 942_043;
+        sell_xbtc.min_amount_sat = 942_043;
+        sell_xbtc.price = None;
+        sell_xbtc.counter_amount_sat = Some(3_500);
+        assert!(
+            sell_xbtc.validate(3_000, 100_000).is_empty(),
+            "a real-rate swap (large xBTC, tiny BTC) must pass the BTC-leg cap"
+        );
     }
 
     #[test]
@@ -817,9 +884,9 @@ mod tests {
             min_amount_sat: 1_000_000,
         };
         assert!(
-            o.validate(DUST_SAT).is_empty(),
+            o.validate(DUST_SAT, u64::MAX).is_empty(),
             "an exact counter amount is not band-checked: {:?}",
-            o.validate(DUST_SAT)
+            o.validate(DUST_SAT, u64::MAX)
         );
         let swap = o.into_swap_offer(&Settings::default());
         assert_eq!(swap.taker_amount, Amount::from_sat(287_000_000));
@@ -837,14 +904,14 @@ mod tests {
             min_amount_sat: 1_000_000,
         };
         assert!(partial
-            .validate(DUST_SAT)
+            .validate(DUST_SAT, u64::MAX)
             .iter()
             .any(|m| m.contains("min_amount_sat")));
         let atomic = NewOffer {
             min_amount_sat: 2_000_000,
             ..partial
         };
-        assert!(atomic.validate(DUST_SAT).is_empty());
+        assert!(atomic.validate(DUST_SAT, u64::MAX).is_empty());
     }
 
     #[test]
@@ -858,7 +925,7 @@ mod tests {
             min_amount_sat: 1_000_000,
         };
         assert!(both
-            .validate(DUST_SAT)
+            .validate(DUST_SAT, u64::MAX)
             .iter()
             .any(|m| m.contains("exactly one")));
         // Neither set: refused.
@@ -870,7 +937,7 @@ mod tests {
             min_amount_sat: 1_000_000,
         };
         assert!(neither
-            .validate(DUST_SAT)
+            .validate(DUST_SAT, u64::MAX)
             .iter()
             .any(|m| m.contains("one is required")));
     }
@@ -911,13 +978,13 @@ mod tests {
             min_amount_sat: 4_000,
         };
         assert!(
-            !priced.validate(DUST_SAT).is_empty(),
+            !priced.validate(DUST_SAT, u64::MAX).is_empty(),
             "4_000 is below the 10_000 default"
         );
         assert!(
-            priced.validate(3_000).is_empty(),
+            priced.validate(3_000, u64::MAX).is_empty(),
             "4_000 is accepted when the minimum is lowered: {:?}",
-            priced.validate(3_000)
+            priced.validate(3_000, u64::MAX)
         );
         let exact = NewOffer {
             sell_chain: Chain::Btc,
@@ -927,9 +994,9 @@ mod tests {
             min_amount_sat: 4_000,
         };
         assert!(
-            exact.validate(3_000).is_empty(),
+            exact.validate(3_000, u64::MAX).is_empty(),
             "an exact 4_000-sat counter leg is accepted when the minimum is lowered: {:?}",
-            exact.validate(3_000)
+            exact.validate(3_000, u64::MAX)
         );
     }
 

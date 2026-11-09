@@ -201,6 +201,10 @@ pub struct Engine<T: Transport> {
     /// leg. Threaded into both fee paths (funding and verify) so a funder and its counterparty agree.
     /// The fee floor ([`crate::fee::FLOOR_SAT`]) is deliberately not configurable: it guards dust.
     min_trade_sat: u64,
+    /// Beta safety cap on the real-value (BTC) leg, in sats (#103). Defaults to no cap (`u64::MAX`);
+    /// the daemon sets it from the operator's configured `max_swap_sat`. Enforced locally at bid time
+    /// (and at offer creation in the daemon), never in counterparty verification.
+    max_swap_sat: u64,
     state: State,
     records: Vec<Record>,
     /// Tests only: drop this many broadcasts instead of sending them.
@@ -242,6 +246,7 @@ impl<T: Transport> Engine<T> {
             config,
             min_swap_sat: crate::swap::MIN_SWAP_AMOUNT.to_sat(),
             min_trade_sat: crate::fee::MIN_TRADE_SAT,
+            max_swap_sat: u64::MAX,
             state,
             records,
             drop_broadcasts: 0,
@@ -283,6 +288,12 @@ impl<T: Transport> Engine<T> {
     /// first tick; the daemon sets it from the operator's configured `min_swap_sat`.
     pub fn set_min_swap_sat(&mut self, min_swap_sat: u64) {
         self.min_swap_sat = min_swap_sat;
+    }
+
+    /// Sets the beta cap on the BTC leg (#103), replacing the no-cap default. The daemon calls this
+    /// right after [`Engine::open`] from the operator's configured `max_swap_sat`.
+    pub fn set_max_swap_sat(&mut self, max_swap_sat: u64) {
+        self.max_swap_sat = max_swap_sat;
     }
 
     /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
@@ -525,6 +536,16 @@ impl<T: Transport> Engine<T> {
         let taker_part = offer
             .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
             .map_err(EngineError::Bid)?;
+        // #103 beta cap: refuse to take a swap whose real-value (BTC) leg exceeds the local cap. The
+        // BTC leg is `maker_part` when the maker sells BTC, else what we (the taker) pay in BTC.
+        let btc_leg = if offer.maker_chain == Chain::Btc {
+            maker_part
+        } else {
+            taker_part
+        };
+        if btc_leg.to_sat() > self.max_swap_sat {
+            return Err(EngineError::Bid(BidError::AboveMax));
+        }
         // F3 local band: refuse to take if our own voluntary fee would be a disproportionate fraction
         // of our leg. Local only (never the counterparty's fee verification), so an old and a new peer
         // never disagree over the offer.
