@@ -120,6 +120,12 @@ pub struct Record {
     pub refund_to: ScriptBuf,
     /// Our signed lock, stored before its first broadcast so a restart sends the same one again.
     pub funding: Option<Transaction>,
+    /// E2 (design 0017): the unsigned funding PSBT parked while the user signs it in their own wallet,
+    /// set when funding returned `AwaitingSignature` and cleared when `submit_signed_lock` broadcasts
+    /// the signed tx. A swap is either awaiting a signature or already funded, never both. Absent in
+    /// older records, hence `serde(default)`.
+    #[serde(default)]
+    pub pending_lock_psbt: Option<String>,
     /// The voluntary fee output's share and proof, stored with the lock so a restart resends the
     /// same proof to the counterparty (design 0010). `None` when no fee is due. Absent in older
     /// records, hence `serde(default)`.
@@ -488,6 +494,50 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// Resume a swap parked awaiting the user's funding signature (E2, design 0017): validate the
+    /// submitted signed PSBT against the parked unsigned one (it must be the same transaction),
+    /// finalize and broadcast it, record the lock, and clear the pending state. The swap proceeds on
+    /// the next tick exactly as if the node had signed.
+    pub fn submit_signed_lock(
+        &mut self,
+        swap_id: [u8; 16],
+        signed_psbt: &str,
+    ) -> Result<(), EngineError> {
+        let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) else {
+            return Err(EngineError::NoSuchSwap);
+        };
+        let Some(pending) = self.records[i].pending_lock_psbt.clone() else {
+            return Err(EngineError::Node(NodeError::Unexpected(
+                "swap is not awaiting a funding signature".into(),
+            )));
+        };
+        let own_chain = match self.records[i].swap.role {
+            Role::Maker => self.records[i].swap.offer.maker_chain,
+            Role::Taker => self.records[i].swap.offer.maker_chain.other(),
+        };
+        let (contract, amount) = match self.records[i].swap.role {
+            Role::Maker => (
+                self.records[i].swap.maker_contract.clone(),
+                self.records[i].swap.maker_part,
+            ),
+            Role::Taker => (
+                self.records[i].swap.taker_contract.clone(),
+                self.records[i].swap.taker_part,
+            ),
+        };
+        let tx = self.nodes[&own_chain].finalize_submitted_lock(
+            &pending,
+            signed_psbt,
+            &contract,
+            amount,
+        )?;
+        self.backend(own_chain).broadcast(&tx)?;
+        self.records[i].funding = Some(tx);
+        self.records[i].pending_lock_psbt = None;
+        self.save(&self.records[i])?;
+        Ok(())
+    }
+
     pub fn node(&self, chain: Chain) -> &ChainNode {
         &self.nodes[&chain]
     }
@@ -825,6 +875,7 @@ impl<T: Transport> Engine<T> {
             claim_to: self.destination(claim_chain)?,
             refund_to: self.destination(refund_chain)?,
             funding: None,
+            pending_lock_psbt: None,
             fee: None,
             received_fee: None,
             spend_fee_sat: None,
@@ -1091,6 +1142,12 @@ impl<T: Transport> Engine<T> {
             Action::Fund => match record.funding {
                 Some(tx) => (own_chain, tx, None),
                 None => {
+                    // E2 (0017): parked awaiting the user's funding signature? Do nothing until they
+                    // submit it via submit_signed_lock. Never rebuild a parked lock: a fresh
+                    // walletcreatefundedpsbt could pick different inputs and strand the signature.
+                    if record.pending_lock_psbt.is_some() {
+                        return Ok(());
+                    }
                     let other = &self.nodes[&own_chain.other()].rpc;
                     let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
                     // The voluntary fee (design 0010, 0013): terms come from the offer, the address
@@ -1118,18 +1175,30 @@ impl<T: Transport> Engine<T> {
                                 .map(|amount| (amount, dest))
                         }
                     };
-                    let (tx, fee_proof) = self.nodes[&own_chain].fund(
+                    match self.nodes[&own_chain].fund(
                         own_contract,
                         lock_amount,
                         self.config.fee_rate_sat_vb,
                         self.config.policy.funding_minconf(own_chain),
                         other,
                         fee.as_ref().map(|(a, dest)| (*a, dest)),
-                    )?;
-                    self.records[i].funding = Some(tx.clone());
-                    self.records[i].fee = fee_proof;
-                    self.save(&self.records[i])?;
-                    (own_chain, tx, None)
+                    ) {
+                        Ok((tx, fee_proof)) => {
+                            self.records[i].funding = Some(tx.clone());
+                            self.records[i].fee = fee_proof;
+                            self.save(&self.records[i])?;
+                            (own_chain, tx, None)
+                        }
+                        // E2 (0017): the user signs out of band. Park the unsigned PSBT (it has
+                        // already passed the replay guard) and wait for submit_signed_lock; do not
+                        // broadcast anything now.
+                        Err(NodeError::AwaitingSignature { psbt }) => {
+                            self.records[i].pending_lock_psbt = Some(psbt);
+                            self.save(&self.records[i])?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             },
             Action::Claim { lock, preimage } => {

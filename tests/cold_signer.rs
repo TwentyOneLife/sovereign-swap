@@ -418,3 +418,79 @@ fn an_interactive_signer_parks_the_unsigned_lock_for_the_user() {
         .any(|o| o["scriptPubKey"]["address"] == lock_addr.as_str());
     assert!(pays_lock, "the parked PSBT must pay the contract address");
 }
+
+/// E2 (design 0017): the full park/resume at the node level. Funding parks the unsigned PSBT; the
+/// user signs it in their own keyed wallet (keys never on the engine host); finalize_submitted_lock
+/// checks it is the same transaction, finalizes it, and the lock broadcasts and confirms.
+#[test]
+fn an_interactive_lock_resumes_after_the_user_signs_and_submits() {
+    let Some((btc, _)) = binaries() else {
+        return;
+    };
+    let node = Node::start(&btc, None);
+    node.mine(101);
+
+    // The user's own keyed wallet; its public descriptors drive a watch-only funding wallet.
+    node.call("createwallet", json!(["userwallet"]));
+    let user = node.rpc.wallet("userwallet");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+    let chain = ChainNode::open_cold(
+        node.rpc.clone(),
+        "ufund",
+        &receive,
+        &change,
+        Box::new(InteractiveSigner),
+    )
+    .expect("provisioning the watch-only funding wallet");
+
+    let addr = node
+        .rpc
+        .wallet("ufund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    node.wallet()
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .unwrap();
+    node.mine(1);
+
+    let contract = Contract {
+        secret_hash: [8; 32],
+        claim_pkh: PubkeyHash::from_byte_array([9; 20]),
+        refund_pkh: PubkeyHash::from_byte_array([10; 20]),
+        lock_blocks: 20,
+    };
+    let amount = Amount::from_sat(600_000);
+
+    // Funding parks the unsigned PSBT instead of signing.
+    let NodeError::AwaitingSignature { psbt } = chain
+        .fund(&contract, amount, 2, 1, &NoOtherChain, None)
+        .unwrap_err()
+    else {
+        panic!("funding should park for the user");
+    };
+
+    // The user signs it in their own wallet.
+    let signed = user.call("walletprocesspsbt", json!([psbt])).unwrap();
+    assert_eq!(
+        signed["complete"], true,
+        "the user's wallet fully signs the funding psbt"
+    );
+    let signed_psbt = signed["psbt"].as_str().unwrap();
+
+    // Resume: validate it is the same transaction, finalize, broadcast, confirm.
+    let tx = chain
+        .finalize_submitted_lock(&psbt, signed_psbt, &contract, amount)
+        .expect("the submitted lock finalizes");
+    chain.broadcast(&tx).expect("the lock broadcasts");
+    node.mine(1);
+    contract
+        .find_lock_output(&tx, amount)
+        .expect("the lock output is present");
+    let confirmations = node.call(
+        "getrawtransaction",
+        json!([tx.compute_txid().to_string(), true]),
+    )["confirmations"]
+        .as_u64()
+        .unwrap_or_default();
+    assert!(confirmations >= 1, "the resumed lock must be confirmed");
+}

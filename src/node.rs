@@ -596,6 +596,40 @@ impl ChainNode {
         Ok((tx, fee_proof))
     }
 
+    /// Resume a lock parked for the user's signature (E2, design 0017): the submitted PSBT must carry
+    /// the same unsigned transaction as the one handed out (the user may sign, not rewrite it), then
+    /// it is finalized and the lock transaction extracted, with the lock output re-checked. Does not
+    /// broadcast; the caller does.
+    pub fn finalize_submitted_lock(
+        &self,
+        pending_psbt: &str,
+        signed_psbt: &str,
+        contract: &Contract,
+        amount: Amount,
+    ) -> Result<Transaction, NodeError> {
+        let unsigned_txid = |p: &str| {
+            Psbt::from_str(p)
+                .map(|psbt| psbt.unsigned_tx.compute_txid())
+                .map_err(|e| NodeError::Unexpected(format!("psbt: {e}")))
+        };
+        if unsigned_txid(pending_psbt)? != unsigned_txid(signed_psbt)? {
+            return Err(NodeError::Unexpected(
+                "the submitted PSBT is a different transaction than the one to sign".into(),
+            ));
+        }
+        let finalized = self.rpc.call("finalizepsbt", json!([signed_psbt]))?;
+        if finalized["complete"] != true {
+            return Err(NodeError::Unexpected(
+                "the submitted funding PSBT is not fully signed".into(),
+            ));
+        }
+        let tx: Transaction = parse(&finalized["hex"])?;
+        contract
+            .find_lock_output(&tx, amount)
+            .map_err(|e| NodeError::Unexpected(format!("funded lock: {e:?}")))?;
+        Ok(tx)
+    }
+
     /// The prevout transactions of a decoded PSBT's inputs, fetched from this node, so a counterparty
     /// can authenticate the input public keys the fee proof is built over.
     fn input_prevouts(&self, tx: &Value) -> Result<Vec<Transaction>, NodeError> {
