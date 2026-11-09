@@ -67,8 +67,7 @@ impl ElectrumClient {
     /// field is the server's typed refusal; anything else is returned as the `result`.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, NodeError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut line = serde_json::to_string(&json!({"id": id, "method": method, "params": params}))
-            .map_err(|e| NodeError::Unexpected(e.to_string()))?;
+        let mut line = json!({"id": id, "method": method, "params": params}).to_string();
         line.push('\n');
         let mut guard = self.stream.lock().expect("electrum lock");
         guard
@@ -111,6 +110,10 @@ mod tests {
     fn scripthash_is_reversed_not_raw_sha256() {
         let spk = ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f1011121314").unwrap();
         let raw = sha256::Hash::hash(spk.as_bytes()).to_byte_array()[..].to_lower_hex_string();
-        assert_ne!(scripthash(&spk), raw, "scripthash must be byte-reversed, not raw sha256");
+        assert_ne!(
+            scripthash(&spk),
+            raw,
+            "scripthash must be byte-reversed, not raw sha256"
+        );
     }
 }
