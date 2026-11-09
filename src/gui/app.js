@@ -509,6 +509,9 @@ async function fillSwapDetail(id, box) {
         `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
         `in your own wallet (Sparrow for BTC, Shrike for xBTC), and paste the signed PSBT back. Your keys ` +
         `never leave your wallet.</p>` +
+        `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
+        `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
+        `lock only the engine can refund.</p>` +
         `<label>Unsigned PSBT (copy)<textarea readonly rows="3" onclick="this.select()">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
         `<div class="row" style="justify-content:flex-end"><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
@@ -530,7 +533,13 @@ async function fillSwapDetail(id, box) {
           msg.textContent = "Funded. The swap will proceed.";
           fillSwapDetail(id, live);
         } catch (e) {
-          msg.textContent = (e.data && e.data.error) || "rejected";
+          const err = (e.data && e.data.error) || "rejected";
+          msg.textContent =
+            err === "NoLongerFundable"
+              ? "This swap has ended and can no longer be funded. Do not broadcast the signed transaction; discard it."
+              : err === "NotYetFundable"
+                ? "This swap is not ready to fund yet (waiting on the counterparty). Keep the signed PSBT and submit it again in a moment."
+                : err;
         }
       };
   }
