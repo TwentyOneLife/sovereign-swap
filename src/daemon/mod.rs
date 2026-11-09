@@ -523,15 +523,22 @@ impl Daemon {
         // The reference must dial the same Tor proxy as the engine (SWAP_TOR_SOCKS, else the
         // setting), not a hardcoded default: on StartOS the proxy is at an injected address.
         let socks = resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
-        match self.reference.get(&socks) {
-            Ok(r) => (
-                200,
-                json!({
-                    "enabled": true,
-                    "rate": r.rate, "bid": r.bid, "ask": r.ask,
-                    "source": "nonkyc BTCB2/BTC, over Tor",
-                }),
-            ),
+        match self.reference.get(&settings.relays, &socks) {
+            Ok((r, via)) => {
+                let source = match via {
+                    crate::daemon::reference::RateVia::Relay => "nonkyc BTCB2/BTC, via relay (Tor)",
+                    crate::daemon::reference::RateVia::Direct => "nonkyc BTCB2/BTC, direct (Tor)",
+                };
+                (
+                    200,
+                    json!({
+                        "enabled": true,
+                        "rate": r.rate, "bid": r.bid, "ask": r.ask,
+                        "source": source,
+                        "verify_url": "https://nonkyc.io/market/BTCB2_BTC",
+                    }),
+                )
+            }
             Err(e) => (200, json!({ "enabled": true, "error": e })),
         }
     }
