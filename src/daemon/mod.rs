@@ -252,8 +252,8 @@ impl Daemon {
         // reads and broadcasts at that server instead of the funding node's RPC. Empty leaves the
         // engine reading from the node, exactly as before. Funding and signing still use the node.
         for (chain, endpoint) in [
-            (Chain::Btc, settings.btc_electrum.trim()),
-            (Chain::Xbtc, settings.xbtc_electrum.trim()),
+            (crate::swap::Chain::Btc, settings.btc_electrum.trim()),
+            (crate::swap::Chain::Xbtc, settings.xbtc_electrum.trim()),
         ] {
             if endpoint.is_empty() {
                 continue;
