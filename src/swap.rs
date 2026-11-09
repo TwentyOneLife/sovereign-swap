@@ -148,6 +148,9 @@ pub enum BidError {
     OwnOffer,
     /// The taker's own voluntary fee would exceed the per-trade sanity band (F3). Local refusal.
     FeeTooHigh,
+    /// The swap's real-value (BTC) leg exceeds the local beta cap (#103). Local refusal, never part
+    /// of counterparty verification.
+    AboveMax,
 }
 
 impl Offer {

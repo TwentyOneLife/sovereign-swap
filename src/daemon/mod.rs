@@ -246,6 +246,7 @@ impl Daemon {
             .map_err(|e| format!("engine: {e:?}"))?;
         engine.set_min_swap_sat(settings.min_swap_sat);
         engine.set_min_trade_sat(settings.min_trade_sat);
+        engine.set_max_swap_sat(settings.max_swap_sat);
 
         let (tx, rx) = mpsc::channel();
         let events = Arc::clone(&self.events);
@@ -704,8 +705,11 @@ impl Daemon {
         let Ok(new) = serde_json::from_slice::<NewOffer>(body) else {
             return (400, json!({"error": "offer must be a valid JSON object"}));
         };
-        let min_swap_sat = self.state.lock().unwrap().settings.min_swap_sat;
-        let errors = new.validate(min_swap_sat);
+        let (min_swap_sat, max_swap_sat) = {
+            let s = &self.state.lock().unwrap().settings;
+            (s.min_swap_sat, s.max_swap_sat)
+        };
+        let errors = new.validate(min_swap_sat, max_swap_sat);
         if !errors.is_empty() {
             return (422, json!({"error": "invalid offer", "fields": errors}));
         }

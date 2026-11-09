@@ -78,8 +78,7 @@ fn offers_are_validated_and_need_a_running_engine() {
 
     // A well-formed offer still cannot be published without a live engine: the daemon never
     // fabricates offers, so it returns 503 rather than storing a placeholder.
-    let good =
-        r#"{"sell_chain":"xbtc","amount_sat":50000000,"price":0.997,"min_amount_sat":50000000}"#;
+    let good = r#"{"sell_chain":"xbtc","amount_sat":50000,"price":0.997,"min_amount_sat":50000}"#;
     let (code, body) = request(&addr, "POST", "/offers", Some(&token), good);
     assert_eq!(code, 503, "offer should need a running engine: {body}");
     assert!(body.contains("engine not running"), "wrong reason: {body}");
