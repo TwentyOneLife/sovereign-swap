@@ -538,6 +538,16 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// The unsigned funding PSBT a swap is parked on, for the user to sign (E2, design 0017); `None`
+    /// when the swap is not awaiting a funding signature.
+    pub fn pending_lock_psbt(&self, id: [u8; 16]) -> Option<String> {
+        self.records
+            .iter()
+            .find(|r| r.swap.id == id)?
+            .pending_lock_psbt
+            .clone()
+    }
+
     pub fn node(&self, chain: Chain) -> &ChainNode {
         &self.nodes[&chain]
     }

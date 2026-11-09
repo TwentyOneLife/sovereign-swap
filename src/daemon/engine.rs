@@ -51,6 +51,12 @@ pub(crate) enum EngineCmd {
         swap_id: [u8; 16],
         reply: Sender<Result<(), String>>,
     },
+    /// E2 (design 0017): the user submits the signed funding PSBT for a swap parked awaiting it.
+    SubmitSignedLock {
+        swap_id: [u8; 16],
+        psbt: String,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 /// The slice of a swap the API exposes: id, phase, our role, the direction and amounts, and whether
@@ -164,7 +170,13 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     s.offer.taker_lock_blocks,
                 )
             });
+            // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
+            // unsigned PSBT so the user can sign it and POST it back to /swaps/{id}/signed-psbt.
+            let pending = engine.pending_lock_psbt(id);
             let detail = base.map(|(mut j, side, mlb, tlb)| {
+                if let Some(psbt) = &pending {
+                    j["pending_lock_psbt"] = json!(psbt);
+                }
                 match engine.chain_view(id) {
                     Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
                     Some(Err(e)) => j["chain_error"] = json!(format!("{e:?}")),
@@ -204,6 +216,17 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
         }
         EngineCmd::Abort { swap_id, reply } => {
             let _ = reply.send(engine.abort(swap_id).map_err(|e| format!("{e:?}")));
+        }
+        EngineCmd::SubmitSignedLock {
+            swap_id,
+            psbt,
+            reply,
+        } => {
+            let _ = reply.send(
+                engine
+                    .submit_signed_lock(swap_id, &psbt)
+                    .map_err(|e| format!("{e:?}")),
+            );
         }
     }
 }
