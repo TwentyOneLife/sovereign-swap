@@ -525,8 +525,12 @@ impl<T: Transport> Engine<T> {
                 self.records[i].swap.taker_part,
             ),
         };
-        let tx = self.nodes[&own_chain]
-            .finalize_submitted_lock(&pending, signed_psbt, &contract, amount)?;
+        let tx = self.nodes[&own_chain].finalize_submitted_lock(
+            &pending,
+            signed_psbt,
+            &contract,
+            amount,
+        )?;
         self.backend(own_chain).broadcast(&tx)?;
         self.records[i].funding = Some(tx);
         self.records[i].pending_lock_psbt = None;
