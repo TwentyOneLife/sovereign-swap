@@ -355,8 +355,8 @@ $("#new-offer").onclick = createSheet;
 // and the caveat is explicit: coins sent to the wrong network do not arrive as the intended asset.
 function donateSheet() {
   const addrs = [
-    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
-    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
+    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1p37x3ehmhdy6s40fuy0haw9sv9pmyjdqz5wulvm93jry4fy63ttksxja9sh" },
+    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1pe62v4m0p6njpxn2ej9hx307tm0xlccnxe652vxk9r76g2qync7sqkfly4t" },
   ];
   const rows = addrs.map((a) =>
     `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
