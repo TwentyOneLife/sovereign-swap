@@ -763,10 +763,7 @@ impl Daemon {
             psbt: submit.psbt,
             reply,
         }) {
-            Ok(Ok(())) => (
-                200,
-                json!({ "funded": swap_id.to_hex_string(Case::Lower) }),
-            ),
+            Ok(Ok(())) => (200, json!({ "funded": swap_id.to_hex_string(Case::Lower) })),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }
