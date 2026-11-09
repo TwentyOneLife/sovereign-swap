@@ -291,7 +291,12 @@ function createSheet() {
       refRate = r.rate;
       const sell = $("#f-chain").value;
       const shown = sell === "xbtc" ? r.rate : 1 / r.rate; // price is per-unit of what you sell
-      box.innerHTML = `Reference: <strong>${shown.toFixed(sell === "xbtc" ? 8 : 4)}</strong> (${r.source}). You still set the price.`;
+      const verify = r.verify_url
+        ? ` · <a href="${escapeHtml(r.verify_url)}" target="_blank" rel="noopener noreferrer">verify on nonkyc</a>`
+        : "";
+      box.innerHTML =
+        `Reference: <strong>${shown.toFixed(sell === "xbtc" ? 8 : 4)}</strong> ` +
+        `(${escapeHtml(r.source)})${verify}. You still set the price.`;
     } catch (e) { box.textContent = ""; refRate = null; }
   }
   function checkDeviation() {

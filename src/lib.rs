@@ -11,6 +11,7 @@ pub mod node;
 pub mod nostr;
 pub mod policy;
 pub mod relay;
+pub mod relay_price;
 pub mod relay_server;
 pub mod replay;
 pub mod routing;

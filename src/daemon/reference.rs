@@ -1,5 +1,10 @@
-//! Optional, opt-in external price reference (design 0009): the daemon fetches nonkyc's BTCB2/BTC
-//! ticker over Tor as a pricing *hint*, never something the protocol relies on. Off by default.
+//! Optional, opt-in external price reference (design 0009): a pricing *hint*, never something the
+//! protocol relies on. Off by default.
+//!
+//! Source, in order (#106): a **relay's price proxy** first (the relay fetches the exchange
+//! clearnet-side and serves the rate in its NIP-11 document, so the client reads it over Tor and the
+//! client's IP never reaches the exchange), then a **direct** fetch of the exchange over Tor as a
+//! fallback. Both go through the Tor SOCKS proxy; the client never fetches clearnet.
 //!
 //! Privacy: the fetch always goes through the Tor SOCKS proxy, so the user's IP never reaches a
 //! centralized exchange; it is the daemon that fetches (not the browser), and the route is
@@ -12,7 +17,7 @@
 //! fetch silently failed while the rest of the daemon worked.
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -30,30 +35,110 @@ pub(crate) struct ReferenceRate {
     pub(crate) ask: f64,
 }
 
+/// Where a reference rate came from: a relay's price proxy, or a direct fetch of the exchange. Both
+/// go over Tor; the distinction is shown to the operator and lets the relay path be preferred.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum RateVia {
+    Relay,
+    Direct,
+}
+
+/// A cached outcome (success carries the rate and where it came from) and when it was taken.
+type Cached = (Result<(ReferenceRate, RateVia), String>, Instant);
+
 #[derive(Default)]
 pub(crate) struct Reference {
     /// The last outcome and when it was taken. Both success and failure are cached (failure for a
     /// shorter window), so the header polling the rate every few seconds never spawns a fresh curl
     /// per request.
-    cache: Mutex<Option<(Result<ReferenceRate, String>, Instant)>>,
+    cache: Mutex<Option<Cached>>,
 }
 
 impl Reference {
-    /// The reference rate, cached. Fetches over Tor (through `socks`) on a miss or once stale.
-    pub(crate) fn get(&self, socks: &str) -> Result<ReferenceRate, String> {
+    /// The reference rate, cached. Prefers a relay's price proxy (#106): the relay fetches the
+    /// exchange clearnet-side and serves the rate in its NIP-11 document, so the client reads it over
+    /// Tor and its IP never reaches the exchange. Falls back to a direct fetch of the exchange over
+    /// Tor when no relay offers a fresh price. Never fetches clearnet from the client.
+    pub(crate) fn get(
+        &self,
+        relays: &[String],
+        socks: &str,
+    ) -> Result<(ReferenceRate, RateVia), String> {
         if let Some((res, at)) = self.cache.lock().unwrap().as_ref() {
             let ttl = if res.is_ok() { TTL_OK } else { TTL_ERR };
             if at.elapsed() < ttl {
                 return res.clone();
             }
         }
-        let result = fetch(socks).and_then(|body| {
-            parse_reference_rate(&body)
-                .ok_or_else(|| "could not parse the reference ticker".to_owned())
+        // 1) A relay's price proxy, over Tor. First relay with a fresh price wins.
+        let mut result = None;
+        for relay in relays {
+            if let Some(rate) = fetch_relay_price(relay, socks) {
+                result = Some(Ok((rate, RateVia::Relay)));
+                break;
+            }
+        }
+        // 2) Fall back to a direct fetch of the exchange, still over Tor.
+        let result = result.unwrap_or_else(|| {
+            fetch(socks)
+                .and_then(|body| {
+                    parse_reference_rate(&body)
+                        .ok_or_else(|| "could not parse the reference ticker".to_owned())
+                })
+                .map(|r| (r, RateVia::Direct))
         });
         *self.cache.lock().unwrap() = Some((result.clone(), Instant::now()));
         result
     }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Fetches a relay's NIP-11 document over Tor and reads `swap_relay.price`, if the relay runs the
+/// price proxy and the value is fresh (within [`crate::relay_price::MAX_AGE_SECS`]). Returns `None`
+/// on any error, a missing price, or a stale one, so the caller moves on to the next relay or the
+/// direct fetch. A `ws(s)://host:port` relay URL maps to `http(s)://host:port`; only this GET is made,
+/// never a websocket, and always through the Tor proxy for an onion.
+fn fetch_relay_price(relay: &str, socks: &str) -> Option<ReferenceRate> {
+    let url = relay
+        .trim_end_matches('/')
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
+    let onion = url.contains(".onion");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "--fail", "--max-time", "8"]);
+    if onion {
+        cmd.args(["--socks5-hostname", socks]);
+    }
+    cmd.args(["-H", "Accept: application/nostr+json", &url]);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    parse_relay_price(&body, now_unix())
+}
+
+/// Reads `swap_relay.price` from a relay's NIP-11 document, rejecting a value staler than
+/// [`crate::relay_price::MAX_AGE_SECS`] (a relay whose own fetch has been failing must not have its
+/// old number trusted as live). Pure (`now` is passed in) so it is unit-testable without a relay.
+fn parse_relay_price(body: &str, now: u64) -> Option<ReferenceRate> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let price = &v["swap_relay"]["price"];
+    let as_of = price["as_of"].as_u64()?;
+    if now.saturating_sub(as_of) >= crate::relay_price::MAX_AGE_SECS {
+        return None;
+    }
+    Some(ReferenceRate {
+        rate: price["rate"].as_f64()?,
+        bid: price["bid"].as_f64().unwrap_or(f64::NAN),
+        ask: price["ask"].as_f64().unwrap_or(f64::NAN),
+    })
 }
 
 /// Always over Tor: the user's IP must not reach a centralized exchange. Shelling out to curl keeps
@@ -125,6 +210,26 @@ pub(crate) fn parse_reference_rate(json: &str) -> Option<ReferenceRate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_price_is_taken_when_fresh_and_rejected_when_stale_or_absent() {
+        let now = 1_000_000u64;
+        let doc = |as_of: u64| {
+            format!(
+                r#"{{"swap_relay":{{"price":{{"source":"x","rate":0.00385,"bid":null,"ask":0.00386,"as_of":{as_of}}}}}}}"#
+            )
+        };
+        // Fresh: parsed, with the rate; a null bid comes through as NaN.
+        let r = parse_relay_price(&doc(now), now).unwrap();
+        assert!((r.rate - 0.00385).abs() < 1e-12);
+        assert!(r.bid.is_nan());
+        assert!((r.ask - 0.00386).abs() < 1e-12);
+        // Stale (older than the max age): rejected, so a dead relay fetch is not trusted.
+        assert!(parse_relay_price(&doc(now - crate::relay_price::MAX_AGE_SECS - 1), now).is_none());
+        // No price field (proxy off) or no as_of: rejected.
+        assert!(parse_relay_price(r#"{"swap_relay":{}}"#, now).is_none());
+        assert!(parse_relay_price("not json", now).is_none());
+    }
 
     #[test]
     fn parses_the_nonkyc_ticker() {

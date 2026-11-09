@@ -30,6 +30,9 @@ pub struct RelayConfig {
     /// Events older than this (by `created_at`) are not stored or served.
     pub retention_secs: u64,
     pub store_cap: usize,
+    /// Run the optional price proxy (#106): fetch the nonkyc BTCB2/BTC ticker over clearnet and serve
+    /// it in the NIP-11 document for clients to read over Tor. Off by default; the operator opts in.
+    pub price_proxy: bool,
 }
 
 impl Default for RelayConfig {
@@ -41,6 +44,7 @@ impl Default for RelayConfig {
             max_events_per_min: 240,
             retention_secs: 7 * 24 * 3600,
             store_cap: 100_000,
+            price_proxy: false,
         }
     }
 }
@@ -170,6 +174,9 @@ pub struct RelayServer {
     subs: Arc<Mutex<Vec<Subscription>>>,
     connections: Arc<AtomicUsize>,
     stats: Arc<Stats>,
+    /// The optional price-proxy cache (#106). `None` until the first successful fetch; served in the
+    /// NIP-11 document only when `cfg.price_proxy` is set and the value is still fresh.
+    price: crate::relay_price::PriceCache,
 }
 
 impl RelayServer {
@@ -185,6 +192,7 @@ impl RelayServer {
             subs: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(AtomicUsize::new(0)),
             stats: Arc::new(Stats::new()),
+            price: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -194,7 +202,7 @@ impl RelayServer {
     fn relay_info(&self) -> String {
         let s = &self.stats;
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        serde_json::json!({
+        let mut doc = serde_json::json!({
             "name": "sovereign-swap relay",
             "description": "A hardened Nostr relay that carries only sovereign-swap messages (kind 4859). Holds no funds.",
             "software": "https://github.com/TwentyOneLife/sovereign-swap",
@@ -223,13 +231,46 @@ impl RelayServer {
                     "outside_retention": n(&s.rejected_stale),
                 },
             },
-        })
-        .to_string()
+        });
+        // Price proxy (#106): include the cached price only when the proxy is enabled AND the value is
+        // still fresh. A stale value (fetch failing for longer than MAX_AGE_SECS) is withheld so the
+        // client never treats an old number as live. Nested under `swap_relay` so the top level stays
+        // standard NIP-11. bid/ask are null when the ticker omitted them (never NaN in the JSON).
+        if self.cfg.price_proxy {
+            if let Some(p) = *self.price.lock().unwrap() {
+                if Store::now().saturating_sub(p.as_of) < crate::relay_price::MAX_AGE_SECS {
+                    let fin = |x: f64| {
+                        if x.is_finite() {
+                            serde_json::json!(x)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    };
+                    doc["swap_relay"]["price"] = serde_json::json!({
+                        "source": crate::relay_price::SOURCE,
+                        "rate": p.rate,
+                        "bid": fin(p.bid),
+                        "ask": fin(p.ask),
+                        "as_of": p.as_of,
+                    });
+                }
+            }
+        }
+        doc.to_string()
+    }
+
+    /// Starts the optional price-proxy fetch loop when the operator enabled it. Done once at bring-up,
+    /// before the accept loop takes `self`.
+    fn start_price_proxy(&self) {
+        if self.cfg.price_proxy {
+            crate::relay_price::spawn(self.price.clone());
+        }
     }
 
     /// Binds and serves forever, a thread per connection. Returns the bound address.
     pub fn serve(self, bind: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(bind)?;
+        self.start_price_proxy();
         self.accept_loop(listener);
         Ok(())
     }
@@ -238,6 +279,7 @@ impl RelayServer {
     pub fn spawn(self, bind: &str) -> std::io::Result<String> {
         let listener = TcpListener::bind(bind)?;
         let addr = listener.local_addr()?;
+        self.start_price_proxy();
         std::thread::spawn(move || self.accept_loop(listener));
         Ok(format!("ws://{addr}/"))
     }
@@ -650,6 +692,49 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_price(proxy: bool, as_of: u64) -> RelayServer {
+        let server = RelayServer::new(RelayConfig {
+            price_proxy: proxy,
+            ..Default::default()
+        });
+        *server.price.lock().unwrap() = Some(crate::relay_price::CachedPrice {
+            rate: 0.00385,
+            bid: f64::NAN,
+            ask: 0.00386,
+            as_of,
+        });
+        server
+    }
+
+    #[test]
+    fn nip11_price_is_served_only_when_enabled_and_fresh() {
+        let now = Store::now();
+
+        // Enabled + fresh: the price is present, with the rate and source, and a null bid (NaN -> null).
+        let info: Value = serde_json::from_str(&with_price(true, now).relay_info()).unwrap();
+        let price = &info["swap_relay"]["price"];
+        assert!(price.is_object(), "fresh price should be served");
+        assert_eq!(price["rate"], serde_json::json!(0.00385));
+        assert_eq!(price["source"], "nonkyc BTCB2/BTC");
+        assert_eq!(price["bid"], Value::Null);
+        assert_eq!(price["ask"], serde_json::json!(0.00386));
+
+        // Enabled but stale (older than MAX_AGE_SECS): withheld, so a dead fetch cannot look live.
+        let stale = now.saturating_sub(crate::relay_price::MAX_AGE_SECS + 10);
+        let info: Value = serde_json::from_str(&with_price(true, stale).relay_info()).unwrap();
+        assert!(
+            info["swap_relay"]["price"].is_null(),
+            "stale price must be withheld"
+        );
+
+        // Disabled: even a fresh cached value is not served.
+        let info: Value = serde_json::from_str(&with_price(false, now).relay_info()).unwrap();
+        assert!(
+            info["swap_relay"]["price"].is_null(),
+            "disabled proxy serves no price"
+        );
+    }
 
     #[test]
     fn stats_count_rejections_and_surface_in_the_nip11_document() {
