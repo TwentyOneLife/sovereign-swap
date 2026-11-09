@@ -501,7 +501,39 @@ async function fillSwapDetail(id, box) {
     `<div class="leg card"><strong>Counterparty (${cpChain.toUpperCase()})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
-    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>`;
+    `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
+    // E2 (design 0017): when funding is parked for the user, show the PSBT handoff.
+    (s.pending_lock_psbt
+      ? `<div class="card" style="border-left:3px solid var(--orange)">` +
+        `<p><strong>Sign your funding (${ownChain.toUpperCase()})</strong></p>` +
+        `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
+        `in your own wallet (Sparrow for BTC, Shrike for xBTC), and paste the signed PSBT back. Your keys ` +
+        `never leave your wallet.</p>` +
+        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" onclick="this.select()">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+        `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
+        `<div class="row" style="justify-content:flex-end"><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
+        `<p class="muted" id="psbt-msg"></p></div>`
+      : "");
+  if (s.pending_lock_psbt) {
+    const btn = live.querySelector("#submit-psbt");
+    if (btn)
+      btn.onclick = async () => {
+        const psbt = (live.querySelector("#signed-psbt").value || "").trim();
+        const msg = live.querySelector("#psbt-msg");
+        if (!psbt) {
+          msg.textContent = "Paste the signed PSBT first.";
+          return;
+        }
+        msg.textContent = "Submitting…";
+        try {
+          await api("POST", "/swaps/" + id + "/signed-psbt", { psbt });
+          msg.textContent = "Funded. The swap will proceed.";
+          fillSwapDetail(id, live);
+        } catch (e) {
+          msg.textContent = (e.data && e.data.error) || "rejected";
+        }
+      };
+  }
 }
 
 // Refresh the open swap's detail each tick: confirmations and the refund countdown change per block

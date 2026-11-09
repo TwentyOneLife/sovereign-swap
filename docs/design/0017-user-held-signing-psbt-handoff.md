@@ -44,16 +44,25 @@ This is the `signer_server` seam turned inside out: instead of the daemon callin
 the daemon *publishes* the unsigned PSBT and *waits* for the user to call back. The validation and the
 same-txid guard are reused verbatim.
 
-### Minimise liveness: pre-sign the refund
-A swap's timelocked **refund** can be signed up front. So at funding the user signs **two** things in
-one wallet session: the funding lock, and a refund that only becomes valid after the timelock. After
-that, the sole remaining interactive signature is the **claim** (which needs the secret the counterparty
-reveals on chain). The user must return to sign the claim within the timelock window; the pre-signed
-refund protects them if they do not. The product must make this online-presence responsibility explicit
-(a session watcher that prompts the user to come back and sign the claim when the secret appears).
+### CORRECTION (verified against the code): only the funding lock is user-signed
+An earlier draft of this design assumed the user also signs the **claim** and **refund** in their own
+wallet, which would create a claim-liveness problem (the user must return to sign the claim when the
+secret appears). **That is wrong for this architecture.** The claim and refund are HTLC spends signed by
+the engine's own per-swap keys (`self.keys`, derived from the user's seed; `engine.rs` uses
+`self.keys.key(index, Use::Claim)` / `Use::Refund`), **automatically**, and broadcast over E1. Only the
+**funding lock** uses the user's big-balance wallet, which is what E2 moved to PSBT handoff.
 
-Per role: the party that reveals the secret (claims first) must be present at that moment; the party
-that claims with the revealed secret has until its timelock. Both pre-sign their refund at funding.
+Consequences:
+- There is **no refund-liveness problem** and **no pre-signed-refund step (the old E2b)**: the thin
+  client signs the refund itself when the timelock passes.
+- There is **no interactive-claim step or watcher (the old E2c)** for the self-hosted thin client: the
+  thin client signs the claim itself when the secret appears. It only needs to keep running, as any swap
+  daemon does; the user is never prompted to sign a claim.
+- The self-hosted thin client is therefore **complete with E1 + E2 funding + `self.keys` claim/refund**.
+  The only remaining work is the UI (select Interactive mode; the GUI PSBT handoff).
+
+Interactive/user-held claim and refund keys become relevant only in a **hosted multi-tenant** model
+(#46), where each session's HTLC keys must be the user's, not the operator's. That is out of scope here.
 
 ### Watch-only funding input
 The daemon builds the unsigned funding PSBT from the user's **watch-only descriptors / xpub** (0012
@@ -81,21 +90,25 @@ operator never imports a spendable key. This is the E3 funding half.
    `a_cold_lock_is_funded_end_to_end_through_a_remote_signer`). The only thin-client difference is that
    the descriptors are the user's and the signer is the user, which is E2, not new funding code. So the
    first genuinely new step is E2a.
-2. **E2a interactive funding signer + the awaiting-signature swap state.** The park/resume state
-   machine for the funding lock; the `signed-psbt` submit action; broadcast via E1. Reuse the
-   same-txid validation. Regtest with an external PSBT round-trip.
-3. **E2b pre-signed refund** at funding, so refund never needs the user again.
-4. **E2c interactive claim signing** (the one live-presence point), plus the session watcher UX.
-5. **GUI handoff** in the open client (show unsigned PSBT, accept signed PSBT).
+2. **E2a interactive funding signer + the awaiting-signature swap state , DONE** (#128, #129, #130).
+   The park/resume state machine for the funding lock, the `signed-psbt` submit action, broadcast via
+   E1, the same-txid validation, and `FundingMode::Interactive`, all regtest-proven.
+3. ~~**E2b pre-signed refund.**~~ **MOOT** (see the correction above): the refund is signed by the thin
+   client's own `self.keys` automatically; the user never signs it, so there is nothing to pre-sign.
+4. ~~**E2c interactive claim + watcher.**~~ **MOOT for the self-hosted thin client**: the claim is signed
+   by `self.keys` automatically when the secret appears. Relevant only to the hosted multi-tenant model
+   (#46), where the per-session HTLC keys would be user-held.
+5. **GUI handoff + Interactive config** in the open client (show the unsigned PSBT, accept the signed
+   one; a funding-mode option). The last remaining usability bit for the self-hosted thin client.
 6. **(#46) multi-tenant + proprietary web frontend** on top, per the private spec.
 
 ## Risks (ranked)
-1. **Liveness** , the user must return to sign the claim within the timelock. The pre-signed refund
-   bounds the loss, but a missed claim window is a real UX hazard; the watcher must be honest and loud.
-2. **State-machine correctness** , parking/resuming a half-funded swap across restarts must never fund
-   twice, never broadcast a stale PSBT, and must survive the replay guards already in the engine.
-3. **Per-role signing** , maker vs taker sign at different moments; the design must not assume one flow.
-4. **xBTC signing UX** , manual PSBT via Shrike works; a smooth flow is a later upgrade, not a blocker.
+1. **State-machine correctness** , parking/resuming a half-funded swap across restarts must never fund
+   twice, never broadcast a stale PSBT, and must survive the replay guards (handled in E2a: a pending
+   PSBT is never rebuilt, funding and pending are mutually exclusive).
+2. **xBTC signing UX** , manual PSBT via Shrike works; a smooth flow is a later upgrade, not a blocker.
+3. **Hosted multi-tenant claim/refund keys** , only for #46: the per-session HTLC keys must be the
+   user's, not the operator's. Out of scope for the self-hosted thin client.
 
 ## Relationship to the hosted service
 E2 is the per-session signing model the hosted multi-tenant engine uses (#46, Model 2b). Everything here
