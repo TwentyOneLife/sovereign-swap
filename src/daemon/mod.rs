@@ -25,9 +25,9 @@ use bitcoin::Amount;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::electrum::ElectrumBackend;
 use crate::engine::Engine;
 use crate::envelope::Identity;
-use crate::electrum::ElectrumBackend;
 use crate::node::{ChainBackend, ChainNode};
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
