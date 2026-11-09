@@ -358,7 +358,9 @@ impl Daemon {
         if req.method == "GET" {
             match req.path.as_str() {
                 "/" | "/index.html" => {
-                    let page = INDEX_HTML.replace("__TOKEN__", &self.token);
+                    let page = INDEX_HTML
+                        .replace("__TOKEN__", &self.token)
+                        .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
                     return self.write_asset(
                         &mut stream,
                         "text/html; charset=utf-8",

@@ -149,13 +149,20 @@ function renderStatus() {
   const onoff = (ok) => (ok ? "on" : "off");
   const priceTitle =
     priceState === "on"
-      ? "price reference: live"
+      ? "External price reference (nonkyc BTCB2/BTC, over Tor): live"
       : priceState === "err"
-        ? "price reference: enabled, but the fetch is failing"
-        : "price reference: off";
+        ? "External price reference: enabled, but the fetch is failing (often a blocked Tor exit; it retries)"
+        : "External price reference: off (price discovery is this relay's order book)";
+  // Each dot names the exact connection it reports, so a red dot points at the right place.
+  const btcTitle = `BTC node RPC: ${s.btc_node ? "reachable" : "unreachable"}`;
+  const xbtcTitle = `xBTC (Bitcoin Blake2b) node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
+  const engineTitle = `Swap engine (the daemon's tick loop): ${s.engine ? "running" : "stopped"}`;
+  const relayTitle = `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
+  const activeTitle = "Swaps currently in flight on this node";
   el.innerHTML =
-    `${dot(onoff(s.btc_node))}BTC ${dot(onoff(s.xbtc_node))}xBTC ${dot(onoff(s.engine))}engine ` +
-    `${dot(onoff(s.relays > 0))}relay ${dot(priceState, priceTitle)}price · ${s.active_swaps ?? "?"} active`;
+    `${dot(onoff(s.btc_node), btcTitle)}BTC ${dot(onoff(s.xbtc_node), xbtcTitle)}xBTC ` +
+    `${dot(onoff(s.engine), engineTitle)}engine ${dot(onoff(s.relays > 0), relayTitle)}relay ` +
+    `${dot(priceState, priceTitle)}price · <span title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`;
 }
 
 async function loadStatus() {
@@ -337,6 +344,30 @@ function takeSheet(o) {
   };
 }
 $("#new-offer").onclick = createSheet;
+
+// Donation sheet (footer). Both addresses are already public on the TwentyOne.Life profile. They
+// share Bitcoin's address format but are DIFFERENT assets on different networks, so each is labelled
+// and the caveat is explicit: coins sent to the wrong network do not arrive as the intended asset.
+function donateSheet() {
+  const addrs = [
+    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
+    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
+  ];
+  const rows = addrs.map((a) =>
+    `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
+    `<input readonly value="${escapeHtml(a.addr)}" onclick="this.select()"></label>`,
+  ).join("");
+  return (
+    `<div class="row between"><strong>Donate to TwentyOne.Life</strong>` +
+    `<button class="link" id="f-x" title="Close">✕</button></div>` +
+    `<p class="muted">These two addresses share Bitcoin's address format but are different assets on ` +
+    `different networks. Send only the matching coin to each; anything sent to the other network is a ` +
+    `different asset and will not arrive as intended.</p>${rows}` +
+    `<div class="row" style="justify-content:flex-end"><button class="ghost" id="f-cancel">Close</button></div>`
+  );
+}
+const donateBtn = $("#donate");
+if (donateBtn) donateBtn.onclick = () => openSheet(donateSheet());
 
 // --- swaps ---
 let lastSwaps = [];
