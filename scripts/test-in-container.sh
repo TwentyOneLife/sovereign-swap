@@ -10,6 +10,10 @@ MOUNTS=""
 if [ -n "${CORE_DIR:-}" ] && [ -n "${KNOTS_DIR:-}" ]; then
     MOUNTS="-v $CORE_DIR:/core:ro -v $KNOTS_DIR:/knots:ro -e BTC_BITCOIND=/core/bin/bitcoind -e XBTC_BITCOIND=/knots/bin/bitcoind"
 fi
+# Fulcrum (the Electrum server for the E1 ChainBackend regtest); without it that one test skips.
+if [ -n "${FULCRUM_BIN:-}" ]; then
+    MOUNTS="$MOUNTS -v $(dirname "$FULCRUM_BIN"):/fulcrum:ro -e FULCRUM_BIN=/fulcrum/Fulcrum"
+fi
 # shellcheck disable=SC2086
 exec docker run --rm -v "$REPO":/src -w /src $MOUNTS \
     -v sovereign-swap-cargo:/usr/local/cargo/registry -v sovereign-swap-target:/target \

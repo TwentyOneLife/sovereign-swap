@@ -1,8 +1,10 @@
 //! Regtest nodes for the integration tests.
 #![allow(dead_code)]
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,7 @@ pub struct Node {
     child: Child,
     datadir: PathBuf,
     pub rpc: Client,
+    pub rpc_port: u16,
 }
 
 impl Node {
@@ -54,6 +57,7 @@ impl Node {
             child,
             datadir,
             rpc,
+            rpc_port,
         }
     }
 
@@ -170,6 +174,71 @@ impl Drop for Node {
             std::thread::sleep(Duration::from_millis(200));
         }
         let _ = self.child.kill();
+        let _ = std::fs::remove_dir_all(&self.datadir);
+    }
+}
+
+/// A Fulcrum Electrum server launched against a `Node`'s regtest bitcoind, for the E1 ChainBackend
+/// regtest. Present only when `FULCRUM_BIN` is set (scripts/fetch-nodes.sh + test-in-container.sh);
+/// the live-Electrum test skips otherwise. Serves plaintext Electrum on `port`.
+pub struct Fulcrum {
+    child: Child,
+    datadir: PathBuf,
+    pub port: u16,
+}
+
+impl Fulcrum {
+    pub fn start(node: &Node) -> Option<Fulcrum> {
+        let binary = std::env::var("FULCRUM_BIN").ok()?;
+        let n = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        let port = 40_000 + (std::process::id() % 2_000) as u16 * 10 + n;
+        let datadir = std::env::temp_dir().join(format!("fulcrum-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&datadir).unwrap();
+        let conf = format!(
+            "datadir = {dd}\nbitcoind = 127.0.0.1:{rpc}\nrpcuser = u\nrpcpassword = p\n\
+             tcp = 127.0.0.1:{port}\npolltime = 1\n",
+            dd = datadir.display(),
+            rpc = node.rpc_port,
+        );
+        std::fs::write(datadir.join("fulcrum.conf"), &conf).unwrap();
+        let log = datadir.join("fulcrum.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let child = Command::new(&binary)
+            .arg(datadir.join("fulcrum.conf"))
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out))
+            .spawn()
+            .unwrap();
+        // Ready once it answers server.version on the Electrum port (i.e. synced and listening).
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let probe = b"{\"id\":1,\"method\":\"server.version\",\"params\":[]}\n";
+                let mut buf = [0u8; 32];
+                if s.write_all(probe).is_ok() && s.read(&mut buf).map(|r| r > 0).unwrap_or(false) {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Fulcrum did not become ready; log:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Some(Fulcrum {
+            child,
+            datadir,
+            port,
+        })
+    }
+}
+
+impl Drop for Fulcrum {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.datadir);
     }
 }
