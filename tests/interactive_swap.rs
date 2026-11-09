@@ -374,34 +374,35 @@ fn a_late_signed_lock_is_refused_after_the_swap_abandons() {
 
     let (swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
 
-    // The user did sign it, but took too long: before it is submitted, the maker-chain height runs
-    // past the taker's lock deadline, so the taker abandons rather than lock too late. Only the taker
-    // ticks here (the maker's lock stays put); mining the maker chain is what runs out the window.
+    // The user did sign it, but took too long. Crucially, DON'T tick the taker before submitting: the
+    // maker-chain height runs past the taker's lock deadline while the swap still sits in `Locking`
+    // (its phase only flips to `Abandoned` on a tick). This is the dangerous between-ticks gap a plain
+    // phase check misses. The submit itself must re-decide against the fresh chain view and refuse.
     let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
     let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Locking),
+        "the parked swap is still in Locking (no tick has flipped it to Abandoned)"
+    );
+    knots.mine(160); // run the maker-chain height well past the taker's lock deadline
 
-    let mut rounds = 0;
-    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Abandoned) {
-        knots.mine(1);
-        tick(&mut taker);
-        rounds += 1;
-        assert!(
-            rounds < 160,
-            "the parked taker never abandoned: {:?}",
-            taker.swaps().next().map(|s| s.phase)
-        );
-    }
-
-    // The late signed lock is refused, and nothing is broadcast: submitting would otherwise commit the
-    // user's coin to an HTLC the engine no longer drives to a refund.
+    // The late signed lock is refused, nothing is broadcast, and the dead PSBT is cleared so the UI
+    // stops asking for a signature. Submitting would otherwise commit the user's coin to an HTLC the
+    // engine no longer drives to a refund.
     let err = taker.submit_signed_lock(swap_id, &signed_psbt).unwrap_err();
     assert!(
         matches!(err, EngineError::NoLongerFundable),
-        "a late submit on an abandoned swap must be refused, got {err:?}"
+        "a late submit past the lock deadline must be refused, got {err:?}"
     );
     assert!(
-        taker.pending_lock_psbt(swap_id).is_some(),
-        "the refusal leaves the parked PSBT untouched (nothing broadcast)"
+        taker.pending_lock_psbt(swap_id).is_none(),
+        "the refusal clears the dead parked PSBT"
+    );
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Abandoned),
+        "the re-decision abandons the swap"
     );
 
     let _ = std::fs::remove_dir_all(&mdir);
