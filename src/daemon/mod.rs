@@ -31,7 +31,7 @@ use crate::envelope::Identity;
 use crate::node::{ChainBackend, ChainNode};
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
-use crate::signer::RemoteSigner;
+use crate::signer::{InteractiveSigner, RemoteSigner};
 use crate::ws::WsConn;
 
 /// How often the engine thread drives a swap forward when no command arrives.
@@ -214,6 +214,16 @@ impl Daemon {
                     )
                     .map_err(|e| format!("{e:?}"))
                 }
+                // E2 (design 0017): a watch-only funding wallet as for cold, but the user signs out of
+                // band. Funding parks the unsigned PSBT; the user submits it via /swaps/{id}/signed-psbt.
+                FundingMode::Interactive => ChainNode::open_cold(
+                    client,
+                    &wallet,
+                    &funding.descriptor_receive,
+                    &funding.descriptor_change,
+                    Box::new(InteractiveSigner),
+                )
+                .map_err(|e| format!("{e:?}")),
             }
         };
         let btc = open_chain(
@@ -504,6 +514,13 @@ impl Daemon {
             {
                 self.post_abort(path_id(p, "/swaps/", "/abort"))
             }
+            ("POST", p)
+                if p.starts_with("/swaps/")
+                    && p.ends_with("/signed-psbt")
+                    && valid_id(path_id(p, "/swaps/", "/signed-psbt")) =>
+            {
+                self.post_signed_psbt(path_id(p, "/swaps/", "/signed-psbt"), &req.body)
+            }
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -717,6 +734,36 @@ impl Daemon {
                 200,
                 json!({ "aborted": swap_id.to_hex_string(Case::Lower) }),
             ),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// E2 (design 0017): the user submits the signed funding PSBT for a swap parked awaiting it. The
+    /// engine validates it is the same transaction, finalizes, broadcasts, and the swap proceeds.
+    fn post_signed_psbt(&self, swap_id_hex: &str, body: &[u8]) -> (u16, Value) {
+        let Ok(swap_id) = <[u8; 16]>::from_hex(swap_id_hex) else {
+            return (400, json!({"error": "bad swap id"}));
+        };
+        #[derive(Deserialize)]
+        struct Submit {
+            psbt: String,
+        }
+        let Ok(submit) = serde_json::from_slice::<Submit>(body) else {
+            return (
+                400,
+                json!({"error": "expected a JSON object with a base64 psbt field"}),
+            );
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::SubmitSignedLock {
+            swap_id,
+            psbt: submit.psbt,
+            reply,
+        }) {
+            Ok(Ok(())) => (200, json!({ "funded": swap_id.to_hex_string(Case::Lower) })),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }

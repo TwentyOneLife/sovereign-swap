@@ -50,6 +50,10 @@ pub enum FundingMode {
     #[default]
     Hot,
     Cold,
+    /// The user signs funding in their own wallet out of band (E2, design 0017): a watch-only funding
+    /// wallet from the account descriptors (as cold), but no external signer. Funding parks the
+    /// unsigned PSBT; the user submits the signed one via `POST /swaps/{id}/signed-psbt`.
+    Interactive,
 }
 
 /// A chain's funding configuration (design 0012): the mode, and for cold mode the external signer
@@ -620,17 +624,21 @@ fn valid_host_port(s: &str) -> bool {
 /// descriptor or a credential: the messages are logged.
 fn validate_funding(name: &str, cfg: &FundingConfig, tor_socks: &str) -> Vec<String> {
     let mut e = Vec::new();
-    if cfg.mode != FundingMode::Cold {
+    // Hot needs nothing. Cold and Interactive both fund from a watch-only wallet built from account
+    // descriptors; only Cold also needs an external signer endpoint (Interactive's signer is the user).
+    if cfg.mode == FundingMode::Hot {
         return e;
     }
-    if cfg.signer_endpoint.trim().is_empty() {
-        e.push(format!("{name}: cold mode needs a signer_endpoint"));
-    } else if let Err(msg) = validate_node(&cfg.signer_endpoint, &cfg.signer_ca, tor_socks) {
-        e.push(format!("{name} signer_endpoint: {msg}"));
+    if cfg.mode == FundingMode::Cold {
+        if cfg.signer_endpoint.trim().is_empty() {
+            e.push(format!("{name}: cold mode needs a signer_endpoint"));
+        } else if let Err(msg) = validate_node(&cfg.signer_endpoint, &cfg.signer_ca, tor_socks) {
+            e.push(format!("{name} signer_endpoint: {msg}"));
+        }
     }
     if cfg.descriptor_receive.trim().is_empty() || cfg.descriptor_change.trim().is_empty() {
         e.push(format!(
-            "{name}: cold mode needs a receive and a change account descriptor"
+            "{name}: cold and interactive modes need a receive and a change account descriptor"
         ));
     }
     e

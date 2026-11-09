@@ -18,4 +18,4 @@ fi
 exec docker run --rm -v "$REPO":/src -w /src $MOUNTS \
     -v sovereign-swap-cargo:/usr/local/cargo/registry -v sovereign-swap-target:/target \
     -e CARGO_TARGET_DIR=/target -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-    "$IMAGE" sh -c 'cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked "$@"; rc=$?; chown "$HOST_UID:$HOST_GID" Cargo.lock; exit $rc' sh "$@"
+    "$IMAGE" sh -c 'cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked "$@" -- --test-threads=4; rc=$?; chown "$HOST_UID:$HOST_GID" Cargo.lock; exit $rc' sh "$@"
