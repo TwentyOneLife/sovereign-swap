@@ -35,17 +35,24 @@ get() { # url file
     esac
 }
 
-fetch() { # name url tarball sha keyfile signers
+FULCRUM_VERSION=2.1.4
+FULCRUM_URL=https://github.com/cculianu/Fulcrum/releases/download/v$FULCRUM_VERSION
+FULCRUM_TAR=Fulcrum-$FULCRUM_VERSION-x86_64-linux.tar.gz
+FULCRUM_SHA=faf7cb36266c1694c834ad551d9592c0aef357bca66fdb5efdfe0d131c4b38ae
+FULCRUM_SIGNERS="D465135F97D0047E18E99DC321810A542031C02C"
+
+fetch() { # name url tarball sha keyfile signers [sumsfile]
     dir=$DEST/$1
+    sums=${7:-SHA256SUMS}
     mkdir -p "$dir"
-    for f in "$3" SHA256SUMS SHA256SUMS.asc; do
+    for f in "$3" "$sums" "$sums.asc"; do
         [ -f "$dir/$f" ] || get "$2/$f" "$dir/$f"
     done
     echo "$4  $dir/$3" | sha256sum -c --quiet
-    grep -q "^$4  $3\$" "$dir/SHA256SUMS"
+    grep -q "^$4  $3\$" "$dir/$sums"
     gnupg=$(mktemp -d)
     gpg --homedir "$gnupg" --quiet --import "$REPO/keys/$5" 2>/dev/null
-    status=$(gpg --homedir "$gnupg" --status-fd 1 --verify "$dir/SHA256SUMS.asc" "$dir/SHA256SUMS" 2>/dev/null || true)
+    status=$(gpg --homedir "$gnupg" --status-fd 1 --verify "$dir/$sums.asc" "$dir/$sums" 2>/dev/null || true)
     rm -rf "$gnupg"
     for signer in $6; do
         echo "$status" | grep -qE "^\[GNUPG:\] VALIDSIG .* $signer\$" || { echo "no valid signature by $signer on $1" >&2; exit 1; }
@@ -55,5 +62,10 @@ fetch() { # name url tarball sha keyfile signers
 
 fetch core "$CORE_URL" "$CORE_TAR" "$CORE_SHA" core-builders.asc "$CORE_SIGNERS"
 fetch knots "$KNOTS_URL" "$KNOTS_TAR" "$KNOTS_SHA" knots-luke-dashjr.asc "$KNOTS_SIGNERS"
+# Fulcrum ships its own shasums file name and a single signed static binary (the Electrum server the
+# E1 ChainBackend regtest runs against). Signer: Calin Culianu (the Fulcrum release key).
+fetch fulcrum "$FULCRUM_URL" "$FULCRUM_TAR" "$FULCRUM_SHA" fulcrum-calin-culianu.asc "$FULCRUM_SIGNERS" \
+    "Fulcrum-$FULCRUM_VERSION-shasums.txt"
 echo "CORE_DIR=$DEST/core/bitcoin-$CORE_VERSION"
 echo "KNOTS_DIR=$DEST/knots/bitcoin-$KNOTS_VERSION"
+echo "FULCRUM_BIN=$DEST/fulcrum/Fulcrum-$FULCRUM_VERSION-x86_64-linux/Fulcrum"
