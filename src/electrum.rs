@@ -131,9 +131,10 @@ impl ChainBackend for ElectrumBackend {
     }
 
     fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
-        let r = self
-            .client
-            .call("blockchain.transaction.get", json!([txid.to_string(), false]))?;
+        let r = self.client.call(
+            "blockchain.transaction.get",
+            json!([txid.to_string(), false]),
+        )?;
         let hex = r.as_str().ok_or_else(|| {
             NodeError::Unexpected("electrum: transaction.get returned no hex".into())
         })?;
@@ -231,10 +232,10 @@ impl ChainBackend for ElectrumBackend {
     }
 
     fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError> {
-        match self
-            .client
-            .call("blockchain.transaction.broadcast", json!([serialize_hex(tx)]))
-        {
+        match self.client.call(
+            "blockchain.transaction.broadcast",
+            json!([serialize_hex(tx)]),
+        ) {
             Ok(_) => Ok(()),
             // An already-known transaction counts as success, as the trait requires.
             Err(NodeError::Unexpected(m)) if m.contains("already") => Ok(()),
