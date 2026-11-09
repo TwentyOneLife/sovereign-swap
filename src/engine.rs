@@ -44,6 +44,22 @@ fn short_id(id: &[u8; 16]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The fee output a leg owes, or `None` when none is due. A leg below the minimum trade owes no fee
+/// (design 0013 / `fee.rs`), so `BelowMinimum` maps to `None`, NOT an error (#107): the payer funds
+/// with no fee output and the counterparty verifies as not-required, so a leg in `[min_swap,
+/// min_trade)` with a fee address completes instead of stranding the first locker's coin. Pure, so the
+/// both-paths-agree contract is unit-tested directly.
+fn fee_amount_or_none(
+    rates: FeeRates,
+    role: Role,
+    locked: Amount,
+    min_trade: u64,
+) -> Option<Amount> {
+    // The only error fee_amount_min returns is BelowMinimum, which here means "no fee output", so
+    // `.ok()` is exactly the right mapping.
+    fee::fee_amount_min(rates, role, locked, min_trade).ok()
+}
+
 /// How long a discovered offer stays in the local market without being re-seen before it ages out
 /// (#88/#70/#65). Matches the relay's event retention (7 days), so an offer the relay would still
 /// serve is never dropped first, but a dead or withdrawn offer whose maker is gone - including a
@@ -860,9 +876,12 @@ impl<T: Transport> Engine<T> {
             maker_bps: terms.maker_bps,
             taker_bps: terms.taker_bps,
         };
-        let Ok(required) = fee::fee_amount_min(rates, cp_role, cp_locked, self.min_trade_sat)
+        // A counterparty leg below the minimum trade owes no fee output, so there is nothing to verify
+        // (design 0013 / fee.rs). This matches the payer's fund path, which also emits no fee output
+        // for such a leg (#107); treating it as Failed broke the swap end to end.
+        let Some(required) = fee_amount_or_none(rates, cp_role, cp_locked, self.min_trade_sat)
         else {
-            return FeeState::Failed;
+            return FeeState::NotRequired;
         };
         let Ok(lock_tx) = cp_chain.get_tx(lock_txid) else {
             return FeeState::Pending; // not on chain yet, or not readable: wait
@@ -1038,9 +1057,11 @@ impl<T: Transport> Engine<T> {
                     let lock_amount = self.lock_amount_override.unwrap_or(own_amount);
                     // The voluntary fee (design 0010, 0013): terms come from the offer, the address
                     // for the chain we lock, the amount from our role and what we lock. If the offer
-                    // sets no fee address for our chain, we lock without a fee output. If it sets one
-                    // we cannot honour (a bad address, or a trade below the minimum), funding fails
-                    // loudly: we never lock without the fee the counterparty will look for.
+                    // sets no fee address for our chain, we lock without a fee output. A leg below the
+                    // minimum trade owes no fee (design 0013 / fee.rs semantics), so BelowMinimum means
+                    // "no fee output" here too, not a failure: treating it as a failure stranded the
+                    // first locker's coin for any leg in [min_swap, min_trade) with a fee address (#107).
+                    // The counterparty's fee verification reaches the same conclusion (NotRequired).
                     let fee = match swap
                         .offer
                         .fee
@@ -1055,14 +1076,8 @@ impl<T: Transport> Engine<T> {
                                 maker_bps: terms.maker_bps,
                                 taker_bps: terms.taker_bps,
                             };
-                            let amount = fee::fee_amount_min(
-                                rates,
-                                swap.role,
-                                lock_amount,
-                                self.min_trade_sat,
-                            )
-                            .map_err(|e| NodeError::Unexpected(format!("fee amount: {e:?}")))?;
-                            Some((amount, dest))
+                            fee_amount_or_none(rates, swap.role, lock_amount, self.min_trade_sat)
+                                .map(|amount| (amount, dest))
                         }
                     };
                     let (tx, fee_proof) = self.nodes[&own_chain].fund(
@@ -1135,7 +1150,37 @@ impl<T: Transport> Engine<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{fee_amount_or_none, State};
+    use crate::fee::FeeRates;
+    use crate::swap::Role;
+    use bitcoin::Amount;
+
+    #[test]
+    fn a_leg_below_the_minimum_trade_owes_no_fee_output_107() {
+        let rates = FeeRates {
+            maker_bps: 20,
+            taker_bps: 30,
+        };
+        let min_trade = 100_000;
+        // Below the minimum trade: no fee output, on either role. Before #107 this returned an error
+        // that the fund path turned into a hard failure, stranding the first locker's coin.
+        assert_eq!(
+            fee_amount_or_none(rates, Role::Maker, Amount::from_sat(50_000), min_trade),
+            None
+        );
+        assert_eq!(
+            fee_amount_or_none(rates, Role::Taker, Amount::from_sat(99_999), min_trade),
+            None
+        );
+        // At or above the minimum trade: a fee is owed (floored), so an output is required.
+        assert!(
+            fee_amount_or_none(rates, Role::Maker, Amount::from_sat(100_000), min_trade).is_some()
+        );
+        assert!(
+            fee_amount_or_none(rates, Role::Taker, Amount::from_sat(1_000_000), min_trade)
+                .is_some()
+        );
+    }
 
     #[test]
     fn a_pre_m1_engine_state_still_loads() {
