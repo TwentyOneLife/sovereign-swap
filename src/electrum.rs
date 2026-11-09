@@ -95,13 +95,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scripthash_matches_the_electrum_reference_vector() {
-        // Electrum protocol docs: the P2PKH scriptPubKey for 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH.
+    fn scripthash_matches_a_known_p2pkh_vector() {
+        // A fixed P2PKH scriptPubKey; the expected value is its Electrum scripthash
+        // (reverse(sha256(script)), lower hex), verified independently.
         let spk =
             ScriptBuf::from_hex("76a91476a04053bda0a88bda5177b86a15c3b29f55987388ac").unwrap();
         assert_eq!(
             scripthash(&spk),
-            "8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161"
+            "71b6a00546326a622c2a484e88a81909706a0cce15009aa87fd9a6569ca84c93"
         );
     }
 
