@@ -605,6 +605,30 @@ impl ChainNode {
     }
 }
 
+/// Every entry in a watch wallet's transaction history, paged so nothing is missed (#108). A single
+/// `listtransactions "*" 1000` capped the view at the newest 1000 entries, so on a busy market-making
+/// node a live swap's lock, or the counterparty spend that carries the revealed secret, could age out
+/// of the window and the engine would stop seeing it, a missed claim and a lost leg. This walks the
+/// whole history in pages until a short page (the end), bounded so a pathological wallet cannot spin
+/// forever. On a small wallet the first page is already the last, so it costs exactly one call.
+fn all_watch_transactions(watch: &Client) -> Result<Vec<Value>, NodeError> {
+    const PAGE: usize = 1000;
+    const MAX_ENTRIES: usize = 100_000; // ~50k swaps; a safety bound, not an expected limit
+    let mut all = Vec::new();
+    let mut skip = 0usize;
+    loop {
+        let batch = watch.call("listtransactions", json!(["*", PAGE, skip, true]))?;
+        let page = batch.as_array().cloned().unwrap_or_default();
+        let n = page.len();
+        all.extend(page);
+        if n < PAGE || all.len() >= MAX_ENTRIES {
+            break;
+        }
+        skip += PAGE;
+    }
+    Ok(all)
+}
+
 /// bitcoind is the first `ChainBackend`: chain data from the node's RPC, locks tracked by the
 /// watch-only wallet (`watch_contract`, `lock_view`), and broadcast over `sendrawtransaction`.
 impl ChainBackend for ChainNode {
@@ -651,10 +675,7 @@ impl ChainBackend for ChainNode {
         ours: &[ScriptBuf],
     ) -> Result<Option<LockView>, NodeError> {
         let address = self.address(contract).to_string();
-        let history = self
-            .watch
-            .call("listtransactions", json!(["*", 1000, 0, true]))?;
-        let entries = history.as_array().cloned().unwrap_or_default();
+        let entries = all_watch_transactions(&self.watch)?;
         let live = |e: &Value| e["confirmations"].as_i64().unwrap_or(-1) >= 0;
         let receives: Vec<&Value> = entries
             .iter()
