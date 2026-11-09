@@ -35,7 +35,7 @@ const fmtRate = (r) =>
 
 // Relative time ("3m ago") with the absolute local time on hover (#88 time columns).
 function fmtTime(sec) {
-  if (!sec) return { text: "—", title: "" };
+  if (!sec) return { text: "-", title: "" };
   const d = new Date(sec * 1000);
   const diff = Date.now() / 1000 - sec;
   const text =
@@ -423,7 +423,7 @@ async function loadSwaps() {
 // shortened txid as plain text when no explorer URL is set. The explorer base comes from /status
 // (btc_explorer_url / xbtc_explorer_url); the default on StartOS is the operator's own mempool.
 function explorerLink(chain, txid) {
-  if (!txid) return "—";
+  if (!txid) return "-";
   const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
   const short = String(txid).slice(0, 16) + "…";
   return base
@@ -463,7 +463,7 @@ async function loadHistory() {
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
       { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
       { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
-      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "—" : fmtSats(s.voluntary_fee_paid_sat) },
+      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => {
