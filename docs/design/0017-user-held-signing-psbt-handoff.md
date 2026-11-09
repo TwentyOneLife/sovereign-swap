@@ -73,8 +73,14 @@ operator never imports a spendable key. This is the E3 funding half.
 - The operator only builds unsigned PSBTs, broadcasts signed ones, and reads chain data.
 
 ## Build order (each a separate design/PR, after this design)
-1. **E3a watch-only funding input.** Build the unsigned funding PSBT from user descriptors / UTXOs,
-   with no spendable wallet. Regtest: fund a lock from a watch-only descriptor + an external signer.
+1. **E3a watch-only funding input , ALREADY DELIVERED by 0012.** The cold path already builds the
+   unsigned funding PSBT on a watch-only funding wallet (`open_cold`: `disable_private_keys=true`,
+   imported from account descriptors; it refuses a keyed wallet), and `fund()` uses
+   `walletcreatefundedpsbt` there with no spendable key on the host. Proven by
+   `tests/cold_signer.rs` (`the_engine_wallet_holds_no_keys_and_an_external_signer_funds_the_lock`,
+   `a_cold_lock_is_funded_end_to_end_through_a_remote_signer`). The only thin-client difference is that
+   the descriptors are the user's and the signer is the user, which is E2, not new funding code. So the
+   first genuinely new step is E2a.
 2. **E2a interactive funding signer + the awaiting-signature swap state.** The park/resume state
    machine for the funding lock; the `signed-psbt` submit action; broadcast via E1. Reuse the
    same-txid validation. Regtest with an external PSBT round-trip.
