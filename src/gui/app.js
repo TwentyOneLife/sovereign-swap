@@ -400,16 +400,64 @@ async function loadSwaps() {
   });
 }
 
-// A txid rendered as a link to the operator's configured explorer (#67), or plain text when none set.
+// A bare txid rendered as a link to the operator's configured per-chain explorer (#67/#32), or the
+// shortened txid as plain text when no explorer URL is set. The explorer base comes from /status
+// (btc_explorer_url / xbtc_explorer_url); the default on StartOS is the operator's own mempool.
+function explorerLink(chain, txid) {
+  if (!txid) return "—";
+  const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
+  const short = String(txid).slice(0, 16) + "…";
+  return base
+    ? `<a href="${escapeHtml(base.replace(/\/$/, ""))}/tx/${escapeHtml(txid)}" target="_blank" rel="noopener">${short}</a>`
+    : short;
+}
+
+// A lock (txid + confirmation state) rendered for the live per-swap detail.
 function explorerTx(chain, lock) {
   if (!lock || !lock.txid) return "not locked yet";
-  const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
-  const short = String(lock.txid).slice(0, 16) + "…";
-  const link = base
-    ? `<a href="${escapeHtml(base.replace(/\/$/, ""))}/tx/${escapeHtml(lock.txid)}" target="_blank" rel="noopener">${short}</a>`
-    : short;
   const state = `${lock.confirmations == null ? "unconfirmed" : lock.confirmations + " conf"} · ${lock.spent ? "spent" : "locked"}`;
-  return `${link}<br>${state}`;
+  return `${explorerLink(chain, lock.txid)}<br>${state}`;
+}
+
+// History / ledger (#67): the daemon derives per-swap entries + totals from its own records at
+// GET /history; this view only renders them. Each entry already carries the realized rate and the
+// voluntary fee paid, so the detail needs no extra fetch (unlike the live Swaps detail).
+async function loadHistory() {
+  const h = await api("GET", "/history").catch(() => null);
+  const entries = (h && h.swaps) || [];
+  const t = h && h.totals;
+  $("#history-empty").style.display = entries.length ? "none" : "block";
+  $("#history-totals").innerHTML = t
+    ? `${t.count} swap(s) · ${t.done} done · ${t.refunded} refunded · ${t.abandoned} abandoned` +
+      (t.active ? ` · ${t.active} in flight` : "") +
+      ` · volume ${fmtSats(t.volume_sat.btc)} BTC / ${fmtSats(t.volume_sat.xbtc)} xBTC` +
+      ` · voluntary fee paid ${fmtSats(t.voluntary_fee_paid.total_sat)} over ${t.voluntary_fee_paid.swaps} swap(s)`
+    : "";
+  mountTable($("#history-table"), {
+    rows: entries,
+    rowId: (s) => s.id,
+    defaultSort: 0, // Started, newest first
+    defaultDir: "desc",
+    columns: [
+      { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const tt = fmtTime(s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
+      { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
+      { label: "Role", get: (s) => s.role, cell: (s) => s.role },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
+      { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
+      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "—" : fmtSats(s.voluntary_fee_paid_sat) },
+      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+    ],
+    detailInto: (s, box) => {
+      const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
+      box.innerHTML =
+        `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ` +
+        `${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()} · realized rate ${fmtRate(s.rate)}` +
+        (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
+        `<p class="muted">Voluntary fee paid: ${s.voluntary_fee_paid_sat == null ? "none" : fmtSats(s.voluntary_fee_paid_sat) + " " + ownChain.toUpperCase()}</p>` +
+        `<p class="muted">Your lock (${ownChain.toUpperCase()}): ${explorerLink(ownChain, s.our_lock_txid)}</p>` +
+        `<p class="muted">The counterparty leg's txids are on the live Swaps view while a swap is in flight.</p>`;
+    },
+  });
 }
 
 async function fillSwapDetail(id, box) {
@@ -480,6 +528,7 @@ function onEvent() {
 function refresh(tab) {
   if (tab === "market") loadMarket();
   else if (tab === "swaps") loadSwaps();
+  else if (tab === "history") loadHistory();
 }
 
 loadStatus();

@@ -13,6 +13,7 @@
   <nav>
     <button class="tab active" data-tab="market" title="Offers from other people">Market</button>
     <button class="tab" data-tab="swaps" title="Your swaps, live and past">Swaps</button>
+    <button class="tab" data-tab="history" title="Settled swaps, with realized rate, fees and totals">History</button>
   </nav>
   <div id="status" class="status" title="Node and Tor connectivity">…</div>
 </header>
@@ -49,6 +50,24 @@
       <tbody></tbody>
     </table>
     <p id="swaps-empty" class="muted center">No swaps yet.</p>
+  </section>
+
+  <!-- HISTORY -->
+  <section id="history" class="view">
+    <h1>History</h1>
+    <p class="muted">A ledger of your settled swaps, built from this node's own records. Fees received
+      at the project addresses are verified separately with a watch-only wallet, not shown here.</p>
+    <p id="history-totals" class="muted"></p>
+    <table id="history-table">
+      <thead><tr>
+        <th>Started</th><th>Swap</th><th title="Your role">Role</th><th>Direction</th>
+        <th class="num" title="Realized rate: taker amount / maker amount">Rate</th>
+        <th class="num" title="Voluntary fee you paid on your own lock">Fee paid</th>
+        <th title="Final outcome">Phase</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <p id="history-empty" class="muted center">No swaps yet.</p>
   </section>
 
 </main>
