@@ -232,7 +232,10 @@ impl Daemon {
             "xbtc",
         )?;
         let socks = relay.contains(".onion").then(|| tor_socks.to_owned());
-        let conn = WsConn::connect(relay, socks.as_deref()).map_err(|e| format!("relay: {e:?}"))?;
+        // Infallible by design (#113): a relay that is momentarily unreachable (a Tor-SOCKS race at
+        // boot) must not stop the engine from starting and driving in-flight swaps. The connection's
+        // worker attaches to the relay, and reconnects, asynchronously; /status shows the relay state.
+        let conn = WsConn::connect(relay, socks.as_deref());
         let transport = RelayTransport::new(
             Identity::from_seed(&self.identity_seed),
             &self.routing_seed,

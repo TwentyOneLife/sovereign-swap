@@ -148,8 +148,8 @@ fn the_rate_limit_throttles_a_flood() {
 #[test]
 fn our_wsconn_client_talks_to_the_relay() {
     let url = relay(RelayConfig::default());
-    let maker = WsConn::connect(&url, None).unwrap();
-    let taker = WsConn::connect(&url, None).unwrap();
+    let maker = WsConn::connect(&url, None);
+    let taker = WsConn::connect(&url, None);
     thread::sleep(Duration::from_millis(200));
 
     let secp = Secp256k1::new();

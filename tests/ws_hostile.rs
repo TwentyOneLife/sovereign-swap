@@ -72,7 +72,7 @@ fn a_hostile_relay_cannot_break_the_client() {
     let valid = Event::build(&secp, &author, 1, vec![], &[1, 2, 3, 4]);
     let url = start_hostile_relay(valid.clone());
 
-    let conn = WsConn::connect(&url, None).expect("connect");
+    let conn = WsConn::connect(&url, None);
     let subscriber = Keypair::from_seckey_slice(&secp, &[9; 32])
         .unwrap()
         .x_only_public_key()

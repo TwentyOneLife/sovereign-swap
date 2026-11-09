@@ -27,6 +27,11 @@ function parseBtc(s) {
   return Number(w || "0") * 1e8 + Number(f);
 }
 const fmtSats = (sat) => (sat / 1e8).toFixed(8).replace(/\.?0+$/, "");
+// A rate (counter coin per unit) spans a huge range: roughly 0.004 BTC per xBTC one way, ~270 the
+// other. Show enough significant digits for the small direction (where toFixed(4) rounded away the
+// real xBTC/BTC price) without a wall of zeros for the large one (#89).
+const fmtRate = (r) =>
+  !isFinite(r) ? "?" : r >= 100 ? r.toFixed(2) : r >= 1 ? r.toFixed(4) : r.toFixed(8);
 
 // Relative time ("3m ago") with the absolute local time on hover (#88 time columns).
 function fmtTime(sec) {
@@ -217,7 +222,7 @@ async function loadMarket() {
       { label: "Selling", get: (o) => o.sell_chain, cell: (o) => o.sell_chain.toUpperCase() },
       { label: "Amount", num: true, get: (o) => o.amount_sat, cell: (o) => fmtSats(o.amount_sat) },
       { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}` },
-      { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => (o.counter_amount_sat / o.amount_sat).toFixed(6) },
+      { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => fmtRate(o.counter_amount_sat / o.amount_sat) },
     ],
     actions: () => `<button class="link take-btn">Take</button> `,
     wireActions: (tr, o) => { const b = tr.querySelector(".take-btn"); if (b) b.addEventListener("click", (e) => { e.stopPropagation(); takeSheet(o); }); },
@@ -227,7 +232,7 @@ async function loadMarket() {
         `<div class="row between"><strong>Offer #${escapeHtml(o.id.slice(0, 8))}</strong>` +
         `<button class="primary take-btn2">Take this offer</button></div>` +
         `<p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${o.sell_chain.toUpperCase()}</strong> for ` +
-        `<strong>${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}</strong> · rate ${(o.counter_amount_sat / o.amount_sat).toFixed(8)} · seen ${t.text}</p>` +
+        `<strong>${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)} · seen ${t.text}</p>` +
         `<p class="muted">Lock windows: maker ${o.maker_lock_blocks} blk, taker ${o.taker_lock_blocks} blk · smallest take ${fmtSats(o.min_amount_sat)}.</p>`;
       const b = box.querySelector(".take-btn2");
       if (b) b.addEventListener("click", () => takeSheet(o));
@@ -238,9 +243,9 @@ async function loadMarket() {
 function offerForm(o) {
   const sell = o ? o.sell_chain : "xbtc";
   const hint = o ? null : rateHint(sell);
-  const price = o ? (o.counter_amount_sat / o.amount_sat).toFixed(4) : (hint ? hint.mid.toFixed(4) : "0.997");
+  const price = o ? fmtRate(o.counter_amount_sat / o.amount_sat) : (hint ? fmtRate(hint.mid) : "0.997");
   const hintLine = hint
-    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${hint.min.toFixed(4)} - ${hint.max.toFixed(4)}. You set your own price.</p>`
+    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${fmtRate(hint.min)} - ${fmtRate(hint.max)}. You set your own price.</p>`
     : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
   return `<div class="row between"><h2>${o ? "Take offer" : "Create offer"}</h2>
       <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
@@ -276,7 +281,7 @@ function createSheet() {
   // Re-suggest the price from the order book when the direction changes.
   $("#f-chain").onchange = () => {
     const h = rateHint($("#f-chain").value);
-    if (h) $("#f-price").value = h.mid.toFixed(4);
+    if (h) $("#f-price").value = fmtRate(h.mid);
     showReference();
   };
   // Optional external reference (nonkyc, over Tor) + a fat-finger deviation warning.
