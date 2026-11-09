@@ -94,10 +94,9 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
     // Let both engines' relay subscriptions register before the offer is published.
     std::thread::sleep(Duration::from_millis(500));
 
-    // Publish a 0.5 BTC offer via the API. The daemon sizes the timelocks to the amount from
+    // Publish a small xBTC->BTC offer (BTC leg within the beta cap) via the API. The daemon sizes the timelocks to the amount from
     // policy, so this is accepted where a fixed 40/20 default would be rejected as too short.
-    let offer =
-        r#"{"sell_chain":"xbtc","amount_sat":50000000,"price":0.997,"min_amount_sat":50000000}"#;
+    let offer = r#"{"sell_chain":"xbtc","amount_sat":50000,"price":0.997,"min_amount_sat":50000}"#;
     let (code, body) = request(&maker, "POST", "/offers", &maker_tok, offer);
     assert_eq!(code, 200, "publish failed: {body}");
 
@@ -108,7 +107,7 @@ fn a_maker_publishes_and_a_taker_discovers_over_the_relay() {
         let (_, list) = request(&taker, "GET", "/offers", &taker_tok, "");
         // The market row needs taker_chain too: the web UI renders it (o.taker_chain), so a missing
         // field throws and the Market table renders empty with no Take button.
-        if list.contains("\"amount_sat\":50000000")
+        if list.contains("\"amount_sat\":50000")
             && list.contains("\"sell_chain\":\"xbtc\"")
             && list.contains("\"taker_chain\":\"btc\"")
         {
