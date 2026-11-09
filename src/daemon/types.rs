@@ -197,6 +197,13 @@ pub struct Settings {
     pub btc_rpc_ca: String,
     #[serde(default)]
     pub xbtc_rpc_ca: String,
+    /// Optional Electrum endpoint `host:port` (Fulcrum for BTC, Shulcrum for xBTC) for this chain's
+    /// chain-data reads and broadcasts (E1, design 0016); empty uses the funding node's RPC. An
+    /// `.onion` endpoint is dialled through `tor_socks`. Funding and signing still use the node.
+    #[serde(default)]
+    pub btc_electrum: String,
+    #[serde(default)]
+    pub xbtc_electrum: String,
     /// Tor SOCKS5 proxy used to dial an `.onion` node RPC and an `.onion` relay. One setting for both,
     /// replacing the former hardcoded default (design 0011). The StartOS Tor proxy on a node install.
     #[serde(default = "default_tor_socks")]
@@ -272,6 +279,8 @@ impl Default for Settings {
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
             xbtc_rpc_ca: String::new(),
+            btc_electrum: String::new(),
+            xbtc_electrum: String::new(),
             tor_socks: default_tor_socks(),
             btc_funding: FundingConfig::default(),
             xbtc_funding: FundingConfig::default(),
