@@ -359,20 +359,31 @@ $("#new-offer").onclick = createSheet;
 // share Bitcoin's address format but are DIFFERENT assets on different networks, so each is labelled
 // and the caveat is explicit: coins sent to the wrong network do not arrive as the intended asset.
 function donateSheet() {
-  const addrs = [
-    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1p37x3ehmhdy6s40fuy0haw9sv9pmyjdqz5wulvm93jry4fy63ttksxja9sh" },
-    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1pe62v4m0p6njpxn2ej9hx307tm0xlccnxe652vxk9r76g2qync7sqkfly4t" },
+  // Silent payment (BIP352): one published address for both chains. Each donation lands on a fresh,
+  // unlinkable taproot output the sender derives, so nothing clusters to this address. Receiving needs
+  // only scanning on our side (no BIP352-aware signer), unlike the swap fee we pay out.
+  const sp = "sp1qq25802j9uk3t2yvthqmpxhp7pjus8rrvxyvlw27445qwhu3agd0kuqnqpct3v645d8x058tas4p83em7qdam8dr6t0ntecf2n00ywet7xc682jk7";
+  // Standard-address fallback for wallets that cannot send to a silent-payment address: the project's
+  // published per-chain donation addresses.
+  const fallback = [
+    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
+    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
   ];
-  const rows = addrs.map((a) =>
+  const fb = fallback.map((a) =>
     `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
     `<input readonly value="${escapeHtml(a.addr)}" onclick="this.select()"></label>`,
   ).join("");
   return (
     `<div class="row between"><strong>Donate to TwentyOne.Life</strong>` +
     `<button class="link" id="f-x" title="Close">✕</button></div>` +
-    `<p class="muted">These two addresses share Bitcoin's address format but are different assets on ` +
-    `different networks. Send only the matching coin to each; anything sent to the other network is a ` +
-    `different asset and will not arrive as intended.</p>${rows}` +
+    `<p class="muted"><strong>Silent payment (recommended).</strong> One address for both BTC and xBTC. ` +
+    `Each donation lands on a fresh, unlinkable address, so nothing clusters to this one. It settles on ` +
+    `whichever chain you send from. Needs a wallet that supports silent payments (BIP352).</p>` +
+    `<label>Silent payment (BTC or xBTC)` +
+    `<input readonly value="${escapeHtml(sp)}" onclick="this.select()"></label>` +
+    `<p class="muted">Or a standard address, if your wallet cannot send to a silent-payment one. These ` +
+    `two share Bitcoin's address format but are different assets on different networks: send only the ` +
+    `matching coin to each, or it will not arrive as intended.</p>${fb}` +
     `<div class="row" style="justify-content:flex-end"><button class="ghost" id="f-cancel">Close</button></div>`
   );
 }
