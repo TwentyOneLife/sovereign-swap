@@ -29,7 +29,7 @@ use sovereign_swap::policy::Policy;
 use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::signer::InteractiveSigner;
-use sovereign_swap::swap::{Chain, Offer, Phase};
+use sovereign_swap::swap::{Chain, FeeTerms, Offer, Phase};
 
 type Tp = RelayTransport<InProcessConn>;
 
@@ -833,6 +833,293 @@ fn a_refused_late_submit_then_user_broadcast_is_refunded() {
             taker.swaps().next().map(|s| s.phase)
         );
     }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Design 0017 + 0018, #135 item 1: a fee-paying interactive swap. The offer carries a voluntary fee
+/// with NORMAL regtest fee addresses (per 0018, interactive funding cannot build an sp1 fee output),
+/// so the taker's parked PSBT includes the fee output, the maker verifies it from chain, the swap
+/// settles, and `history()` reports the fee the taker paid. This exercises the production fee path
+/// under interactive funding, which every prior interactive test skipped with `fee: None`.
+#[test]
+fn a_fee_paying_interactive_taker_swap_settles_and_reports_the_fee() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    // The project's per-chain fee addresses are normal regtest addresses (design 0018): no proof and no
+    // BIP352-aware signer needed, and the counterparty verifies the fee output directly on chain.
+    let btc_fee = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-ifee-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-ifee-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    // Drive to parked with the fee-bearing offer (drive_until_parked hardcodes the fee-less offer()).
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .unwrap();
+    let mut rounds = 0;
+    let (swap_id, parked) = loop {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        if let Some(id) = taker.swaps().next().map(|s| s.id) {
+            if let Some(psbt) = taker.pending_lock_psbt(id) {
+                break (id, psbt);
+            }
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "taker never parked a fee'd funding lock: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    // The user signs the PSBT (which already carries the fee output) and submits it.
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    assert_eq!(signed["complete"], true, "the user's wallet fully signs it");
+    taker
+        .submit_signed_lock(swap_id, signed["psbt"].as_str().unwrap())
+        .unwrap();
+
+    // Both legs carry a verified fee, so the swap runs to completion.
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "a fee'd interactive swap did not settle: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    // The taker locked 150_000 at 30 bps = 450, lifted to the 1_000-sat floor. history() recomputes the
+    // fee from the offer terms (not from a stored proof), so an interactive swap reports it correctly:
+    // this is the confirmation for #135 item 2 (no under-report for a normal fee).
+    let hist = taker.history();
+    assert_eq!(
+        hist["totals"]["voluntary_fee_paid"]["total_sat"], 1000,
+        "the interactive taker reports its 1000-sat fee: {hist}"
+    );
+    assert_eq!(hist["totals"]["voluntary_fee_paid"]["swaps"], 1);
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// A taker whose BTC refund/claim destination is a configured payout address (the user's own wallet),
+/// otherwise identical to `open_taker`. Exercises custody: an interactive refund must return the coin
+/// to an address the user controls, not to a node-generated one.
+fn open_taker_payout(
+    dir: &Path,
+    relay: &Relay,
+    core: &Node,
+    knots: &Node,
+    receive: &str,
+    change: &str,
+    btc_payout: String,
+) -> Engine<Tp> {
+    let tp = RelayTransport::new(
+        Identity::from_seed(&[22; 32]),
+        &[202; 32],
+        InProcessConn::new(relay.clone()),
+    );
+    let btc = ChainNode::open_cold(
+        core.rpc.clone(),
+        "takerfund",
+        receive,
+        change,
+        Box::new(InteractiveSigner),
+    )
+    .unwrap();
+    let xbtc = ChainNode::open(knots.rpc.clone(), "taker").unwrap();
+    let config = Config {
+        btc_payout: Some(btc_payout),
+        ..config()
+    };
+    Engine::open(dir, btc, xbtc, tp, config).unwrap()
+}
+
+/// Design 0017, #135 item 4: interactive refund custody. The taker funds BTC interactively and its
+/// refund destination is a configured address in the user's own wallet. After the funding window
+/// closes the user broadcasts the lock late; the engine adopts it (design 0019) and refunds with
+/// self.keys, and the refunded coin must land at the user's payout address (`ismine`), not a
+/// node-generated one.
+#[test]
+fn an_interactive_taker_refund_lands_at_the_user_payout_address() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+    // The user's own payout address (ismine in the takeruser wallet).
+    let payout = user
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-icustody-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-icustody-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker_payout(
+        &tdir,
+        &relay,
+        &core,
+        &knots,
+        &receive,
+        &change,
+        payout.clone(),
+    );
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    let (swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+
+    // The user walks away; the engine abandons the parked swap at the funding window.
+    knots.mine(160);
+    let mut r = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Abandoned) {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        r += 1;
+        assert!(
+            r < 30,
+            "did not abandon: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    // The user broadcasts the lock late; the engine adopts it and refunds (maker not driven).
+    let fin = core.call("finalizepsbt", json!([signed_psbt]));
+    let hex = fin["hex"].as_str().expect("the finalized funding tx hex");
+    core.call("sendrawtransaction", json!([hex]));
+    core.mine(1);
+    let mut rounds = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Refunded) {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 120,
+            "the interactive refund did not complete: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+    assert!(
+        taker.pending_lock_psbt(swap_id).is_none(),
+        "the prompt is clear after the refund"
+    );
+
+    // The refunded coin landed at the user's own payout address, not a node-generated one.
+    core.mine(1);
+    let received = user
+        .call("getreceivedbyaddress", json!([payout, 0]))
+        .unwrap();
+    assert!(
+        received.as_f64().unwrap_or(0.0) > 0.0,
+        "the interactive refund lands at the user's payout address, got {received}"
+    );
 
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
