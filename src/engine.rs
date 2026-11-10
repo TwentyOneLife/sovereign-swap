@@ -241,6 +241,17 @@ impl From<std::io::Error> for EngineError {
     }
 }
 
+/// Tests only: how a cheating counterparty tampers with the voluntary fee output it funds, so the
+/// honest party's fee verification (design 0010/0013) can be exercised against a real on-chain lock
+/// that carries a wrong or underpaid fee. Mirrors [`Engine::lock_amount_override`].
+#[derive(Clone)]
+pub enum FeeTamper {
+    /// Pay the full required fee amount, but to this (valid) address instead of the agreed one.
+    WrongAddress(String),
+    /// Pay the agreed address, but only this many sats (below the required amount).
+    Underpay(u64),
+}
+
 pub struct Engine<T: Transport> {
     dir: PathBuf,
     keys: Keys,
@@ -294,6 +305,9 @@ pub struct Engine<T: Transport> {
     pub drop_broadcasts: u32,
     /// Tests only: lock this amount instead of the agreed one, as a cheating counterparty would.
     pub lock_amount_override: Option<Amount>,
+    /// Tests only: fund a tampered fee output (wrong address or underpaid), as a fee-cheating
+    /// counterparty would, to exercise the honest party's fee verification.
+    pub fee_tamper: Option<FeeTamper>,
 }
 
 impl<T: Transport> Engine<T> {
@@ -341,6 +355,7 @@ impl<T: Transport> Engine<T> {
             last_reannounce: Instant::now(),
             drop_broadcasts: 0,
             lock_amount_override: None,
+            fee_tamper: None,
         };
         engine.reconcile_offers()?;
         engine.prune_stale_offers()?;
@@ -1477,6 +1492,18 @@ impl<T: Transport> Engine<T> {
                                 .map(|amount| (amount, dest))
                         }
                     };
+                    // Tests only: a fee-cheating counterparty tampers with the owed fee output, so the
+                    // honest party's on-chain fee verification can be exercised against a wrong or
+                    // underpaid fee. Only applies when a fee is actually owed.
+                    let fee = fee.map(|(amount, dest)| match &self.fee_tamper {
+                        Some(FeeTamper::WrongAddress(addr)) => {
+                            let wrong = FeeDest::parse(addr, self.nodes[&own_chain].network())
+                                .expect("test fee_tamper address parses");
+                            (amount, wrong)
+                        }
+                        Some(FeeTamper::Underpay(sat)) => (Amount::from_sat(*sat), dest),
+                        None => (amount, dest),
+                    });
                     match self.nodes[&own_chain].fund(
                         own_contract,
                         lock_amount,
