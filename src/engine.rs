@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
@@ -29,6 +30,14 @@ const SPEND_CONF_TARGET: u16 = 3;
 /// the quiet xBTC chain returns nothing). Sized to today's effective flat fee (2000 sat / 142 vB claim
 /// = 14.1 sat/vB), rounded up, so a chain with no estimator keeps a safe, near-unchanged fee.
 const FALLBACK_SPEND_RATE_SAT_VB: u64 = 15;
+
+/// Default period between re-announcements of our own live offers (design 0020 decision 2). A relay's
+/// bounded store (design 0020 phase 1) can evict an offer under a flood; nothing re-publishes it today
+/// (not even a reconnect, which only re-subscribes), so a peer that subscribes after the eviction never
+/// discovers it. Re-announcing on this period makes eviction self-healing. Five minutes bounds how long
+/// an evicted offer stays undiscoverable, sends only a few small events per period, and stays far below
+/// `SEEN_OFFER_TTL_SECS` so a peer never ages a live offer out between announces.
+const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Unix seconds now, for a swap's local creation timestamp (web UI time column). A clock before the
 /// epoch falls back to 0 rather than panicking.
@@ -274,6 +283,13 @@ pub struct Engine<T: Transport> {
     adopt_watch_cap_blocks: u32,
     state: State,
     records: Vec<Record>,
+    /// How often `tick` re-announces our own live offers (design 0020 decision 2). Runtime-only (not
+    /// persisted): reset to [`REANNOUNCE_INTERVAL`] at `open`. A test lowers it (to `Duration::ZERO`)
+    /// to make every tick re-announce.
+    reannounce_interval: Duration,
+    /// When we last re-announced (monotonic). Set to `Instant::now()` at `open`, so the first
+    /// re-announce is one interval after start, not at boot: the initial `publish` already announced.
+    last_reannounce: Instant,
     /// Tests only: drop this many broadcasts instead of sending them.
     pub drop_broadcasts: u32,
     /// Tests only: lock this amount instead of the agreed one, as a cheating counterparty would.
@@ -321,6 +337,8 @@ impl<T: Transport> Engine<T> {
             adopt_watch_cap_blocks: ADOPT_WATCH_CAP_BLOCKS,
             state,
             records,
+            reannounce_interval: REANNOUNCE_INTERVAL,
+            last_reannounce: Instant::now(),
             drop_broadcasts: 0,
             lock_amount_override: None,
         };
@@ -387,6 +405,31 @@ impl<T: Transport> Engine<T> {
     /// Lowers the handed-out-lock watch horizon (design 0019 bound) from its block default, for tests.
     pub fn set_adopt_watch_cap_blocks(&mut self, blocks: u32) {
         self.adopt_watch_cap_blocks = blocks;
+    }
+
+    /// Overrides the offer re-announce period (design 0020 decision 2), replacing
+    /// [`REANNOUNCE_INTERVAL`]. Call it right after [`Engine::open`]. A test sets it to
+    /// `Duration::ZERO` so every `tick` re-announces.
+    pub fn set_reannounce_interval(&mut self, interval: Duration) {
+        self.reannounce_interval = interval;
+    }
+
+    /// Re-announces our own live offers once the period has elapsed, so an offer a relay evicted from
+    /// its bounded store (design 0020) is re-published and becomes discoverable again without waiting
+    /// for a reconnect (which only re-subscribes, it does not re-publish). Each
+    /// [`Transport::send`] builds a fresh event (new id and `created_at`), so a relay's dedupe does not
+    /// drop the re-send and a reconnecting peer's `since` watermark does not hide it. Peer handling of
+    /// a repeated `Offer` is idempotent (`handle`), so this needs no wire change. `own_offers` already
+    /// holds only live offers (a taken or withdrawn one is removed), so a filled offer is never
+    /// re-announced.
+    fn reannounce_offers(&mut self) {
+        if self.last_reannounce.elapsed() < self.reannounce_interval {
+            return;
+        }
+        self.last_reannounce = Instant::now();
+        for offer in &self.state.own_offers {
+            self.transport.send(&Message::Offer(offer.clone()));
+        }
     }
 
     /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
@@ -1196,6 +1239,7 @@ impl<T: Transport> Engine<T> {
         if let Err(e) = self.prune_stale_offers() {
             errors.push(([0; 16], e));
         }
+        self.reannounce_offers();
         for i in 0..self.records.len() {
             // Terminal swaps are skipped, with one exception (design 0019): a swap that abandoned while
             // a handed-out funding PSBT could still land keeps its `expected_lock_txid` marker and is

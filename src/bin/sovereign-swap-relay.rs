@@ -40,6 +40,13 @@ fn main() -> std::io::Result<()> {
         (env_usize("RELAY_REQ_DEADLINE_SECS", cfg.req_deadline_secs as usize) as u64).max(5);
     cfg.max_outbox_events = env_usize("RELAY_MAX_OUTBOX_EVENTS", cfg.max_outbox_events).max(1);
     cfg.store_cap = env_usize("RELAY_STORE_CAP", cfg.store_cap);
+    cfg.max_store_bytes = env_usize("RELAY_MAX_STORE_BYTES", cfg.max_store_bytes);
+    cfg.directed_store_cap = env_usize("RELAY_DIRECTED_STORE_CAP", cfg.directed_store_cap);
+    cfg.directed_store_bytes = env_usize("RELAY_DIRECTED_STORE_BYTES", cfg.directed_store_bytes);
+    cfg.directed_retention_secs = env_usize(
+        "RELAY_DIRECTED_RETENTION_SECS",
+        cfg.directed_retention_secs as usize,
+    ) as u64;
     cfg.retention_secs = env_usize("RELAY_RETENTION_SECS", cfg.retention_secs as usize) as u64;
     cfg.price_proxy = env_bool("RELAY_PRICE_PROXY", cfg.price_proxy);
     eprintln!(
