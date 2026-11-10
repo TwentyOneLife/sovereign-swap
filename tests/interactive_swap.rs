@@ -193,12 +193,34 @@ fn tick(e: &mut Engine<Tp>) {
 
 /// Drive the two engines until the taker parks its funding lock awaiting the user's signature, and
 /// return the swap id and the parked unsigned PSBT.
+/// Wait until `wallet` on `node` reports a confirmed (minconf 1) UTXO, mining a block per retry so it
+/// is self-healing whether or not the caller pre-mined. Building the funding PSBT on an early tick
+/// otherwise races bitcoind's asynchronous wallet update after a freshly mined block, which
+/// intermittently surfaced as an "Insufficient funds" error on that tick (#148).
+fn wait_for_confirmed_utxo(node: &Node, wallet: &str) {
+    let w = node.rpc.wallet(wallet);
+    for _ in 0..60 {
+        let utxos = w.call("listunspent", json!([1])).unwrap();
+        if utxos.as_array().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        node.mine(1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("funding wallet {wallet} never showed a confirmed UTXO");
+}
+
 fn drive_until_parked(
     maker: &mut Engine<Tp>,
     taker: &mut Engine<Tp>,
     core: &Node,
     knots: &Node,
 ) -> ([u8; 16], String) {
+    // The maker funds its lock from "maker" on knots, the taker builds its funding PSBT from the
+    // watch-only "takerfund" on core. Make sure both wallets have actually registered their confirmed
+    // deposits before driving, so the first funding build never races the wallet (#148).
+    wait_for_confirmed_utxo(knots, "maker");
+    wait_for_confirmed_utxo(core, "takerfund");
     maker.publish(offer()).unwrap();
     tick(taker); // discover the offer over the relay
     taker.bid(&offer(), offer().maker_amount, [9; 16]).unwrap();

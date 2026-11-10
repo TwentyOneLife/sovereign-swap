@@ -302,7 +302,10 @@ fn a_lowered_min_trade_lets_the_fee_apply_to_a_small_swap() {
     // Lower the minimum on both engines, as a test deployment would through its settings.
     maker.engine().set_min_trade_sat(1_000);
     taker.engine().set_min_trade_sat(1_000);
-    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+    // Wider round budget than the other happy-path rows (#141/#155): the fee-bearing small swap adds a
+    // fee-output step, so 30 rounds can run out on a slow CI runner and time out spuriously. The loop
+    // returns as soon as both reach Done, so the headroom costs nothing on success.
+    w.run(&mut maker, &mut taker, 60, always, false, both(Phase::Done));
 }
 
 #[test]

@@ -12,6 +12,7 @@ use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction};
 use serde_json::{json, Value};
 
+use sovereign_swap::electrum::ElectrumBackend;
 use sovereign_swap::htlc::Contract;
 use sovereign_swap::rpc::{Client, RpcError};
 
@@ -256,6 +257,26 @@ impl Drop for Fulcrum {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.datadir);
+    }
+}
+
+/// Connect an `ElectrumBackend` to a just-started Fulcrum, retrying briefly. Fulcrum can momentarily
+/// refuse connections while it (re)binds its listener during startup, so an immediate connect right
+/// after the readiness probe occasionally fails with "Connection refused" (#155). Retrying removes
+/// that race without masking a genuinely unreachable server (it still fails after the deadline).
+pub fn connect_electrum(host: &str, port: u16, network: Network) -> ElectrumBackend {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match ElectrumBackend::connect(host, port, None, network) {
+            Ok(be) => return be,
+            Err(e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "electrum connect kept failing: {e:?}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
     }
 }
 
