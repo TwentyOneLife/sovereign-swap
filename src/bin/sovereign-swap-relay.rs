@@ -34,6 +34,11 @@ fn main() -> std::io::Result<()> {
         env_usize("RELAY_MAX_REQS_PER_MIN", cfg.max_reqs_per_min as usize) as u32;
     cfg.max_req_events = env_usize("RELAY_MAX_REQ_EVENTS", cfg.max_req_events);
     cfg.max_subscriptions = env_usize("RELAY_MAX_SUBSCRIPTIONS", cfg.max_subscriptions);
+    // Clamp operator input away from the degenerate values: a 0 deadline would drop every connection
+    // before it could subscribe, and a 0 outbox would be a rendezvous channel that drops every event.
+    cfg.req_deadline_secs =
+        (env_usize("RELAY_REQ_DEADLINE_SECS", cfg.req_deadline_secs as usize) as u64).max(5);
+    cfg.max_outbox_events = env_usize("RELAY_MAX_OUTBOX_EVENTS", cfg.max_outbox_events).max(1);
     cfg.store_cap = env_usize("RELAY_STORE_CAP", cfg.store_cap);
     cfg.retention_secs = env_usize("RELAY_RETENTION_SECS", cfg.retention_secs as usize) as u64;
     cfg.price_proxy = env_bool("RELAY_PRICE_PROXY", cfg.price_proxy);

@@ -436,3 +436,150 @@ fn a_fresh_connection_gets_only_a_small_burst() {
         "cold burst too large: {accepted} accepted at once"
     );
 }
+
+/// Detects the relay closing the connection (an abrupt TCP close, or a Close frame) within `within`,
+/// distinguishing it from an ordinary read timeout.
+fn wait_closed(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(WsMessage::Close(_)) => return true,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+#[test]
+fn an_idle_connection_that_never_subscribes_is_dropped() {
+    let cfg = RelayConfig {
+        req_deadline_secs: 1,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+
+    // A socket that never sends a REQ is reclaimed after the deadline (connection-cap squatter defence).
+    let mut idle = raw(&url);
+    assert!(
+        wait_closed(&mut idle, Duration::from_secs(4)),
+        "an idle, never-subscribed connection was not reclaimed"
+    );
+
+    // A connection that DID subscribe is exempt and stays open well past the same deadline.
+    let mut sub = raw(&url);
+    sub.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+    ))
+    .unwrap();
+    drain(&mut sub);
+    assert!(
+        !wait_closed(&mut sub, Duration::from_secs(2)),
+        "a subscribed connection was wrongly dropped by the idle deadline"
+    );
+}
+
+/// Publishes `n` large (~40 KB envelope) uniquely-keyed events over its own connection, draining its
+/// own OK replies. Used to put enough bytes in the store / in flight to exceed loopback socket buffers.
+fn fill_big(url: &str, signer: u8, n: u16, env_len: usize) {
+    let secp = Secp256k1::new();
+    let mut c = raw(url);
+    for i in 0..n {
+        let mut env = vec![0xABu8; env_len];
+        // Unique content -> unique event id (dedupe would drop identical ones).
+        env[0..2].copy_from_slice(&i.to_le_bytes());
+        let ev = Event::build(&secp, &key(signer), Event::now_for_test(), vec![], &env);
+        c.send(WsMessage::Text(
+            format!(r#"["EVENT",{}]"#, ev.to_json()).into(),
+        ))
+        .unwrap();
+    }
+    drain(&mut c);
+}
+
+/// Reads until an `OK ... true` line or the deadline; returns whether the accept arrived in time.
+fn got_ok(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(WsMessage::Text(t)) if t.contains(r#""OK""#) && t.contains("true") => return true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+#[test]
+fn a_non_reading_req_client_cannot_freeze_publishing() {
+    let cfg = RelayConfig {
+        max_events_per_min: 100_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    // Enough bytes that one backfill exceeds socket buffers (~12 x ~80 KB JSON ~ 1 MB).
+    fill_big(&url, 40, 200, 50_000);
+
+    // A REQ client that never reads its (large) backfill: its ws.send stalls on a full TCP buffer.
+    let mut stuck = raw(&url);
+    stuck
+        .send(WsMessage::Text(
+            format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+        ))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400)); // let the backfill start and block on send
+
+    // Publishing on a fresh connection must still be served promptly: the store lock is not held across
+    // the stalled backfill. (With the lock held across sends, this OK never arrives in time.)
+    let mut publisher = raw(&url);
+    let secp = Secp256k1::new();
+    let ev = Event::build(&secp, &key(41), Event::now_for_test(), vec![], &[9, 9, 9]);
+    publisher
+        .send(WsMessage::Text(
+            format!(r#"["EVENT",{}]"#, ev.to_json()).into(),
+        ))
+        .unwrap();
+    assert!(
+        got_ok(&mut publisher, Duration::from_secs(3)),
+        "a non-reading REQ client froze publishing relay-wide"
+    );
+}
+
+#[test]
+fn a_subscriber_whose_outbox_overflows_is_disconnected() {
+    let cfg = RelayConfig {
+        max_outbox_events: 1,
+        max_events_per_min: 100_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+
+    // Subscribe, then stop reading.
+    let mut sub = raw(&url);
+    sub.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+    ))
+    .unwrap();
+    drain(&mut sub); // consume the EOSE; now subscribed and idle
+
+    // Flood large events from another connection so the subscriber's bounded outbox overflows.
+    fill_big(&url, 42, 24, 50_000);
+
+    // The subscriber's connection must be closed (so a real client would reconnect from `since`), not
+    // left open and silently deaf.
+    assert!(
+        wait_closed(&mut sub, Duration::from_secs(6)),
+        "an overflowed subscriber was left connected but deaf instead of being disconnected"
+    );
+}
