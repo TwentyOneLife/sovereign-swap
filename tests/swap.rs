@@ -529,7 +529,9 @@ fn a_taker_back_too_late_does_not_lock() {
 fn swap_completes_after_the_takers_claim_is_reorged_out() {
     let Some(w) = World::start() else { return };
     let (mut maker, mut taker) = w.parties(Chain::Xbtc);
-    w.run(&mut maker, &mut taker, 30, always, false, |_, t| {
+    // Wider round budgets than the other rows (#141): a reorg adds a re-confirmation and a re-claim on
+    // top of the normal depths, so 30 rounds can run out on a slow CI runner and time out spuriously.
+    w.run(&mut maker, &mut taker, 60, always, false, |_, t| {
         t.phase() == Some(Phase::Claiming)
     });
     w.xbtc.mine(1);
@@ -541,7 +543,7 @@ fn swap_completes_after_the_takers_claim_is_reorged_out() {
         Some(Phase::Claiming),
         "not done while the claim is unconfirmed"
     );
-    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+    w.run(&mut maker, &mut taker, 60, always, false, both(Phase::Done));
 }
 
 /// Row 15 (`test_15_variable_amount`): the taker takes 40 % of the offer.
