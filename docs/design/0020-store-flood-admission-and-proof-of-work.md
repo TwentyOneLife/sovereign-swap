@@ -1,7 +1,8 @@
 # 0020 Store-flood admission and proof of work (abuse deterrence, 0007 item 2)
 
 Status: proposal, 2026-11-10. Phase 1 (decision 1) shipped in #153; the periodic re-announce
-(decision 2) shipped separately; phase 2 proof of work (decisions 3 and 4) is still open. The owner
+(decision 2) is implemented in #154 (pending merge); phase 2 proof of work (decisions 3 and 4) is
+still open. The owner
 decisions are listed at the end. Addresses gap 2
 of the #149 relay-flood audit, the one gap the per-connection controls in #150 and #151 cannot close.
 Builds on [0006](0006-nostr-client-and-relay.md) (Nostr transport) and
@@ -29,9 +30,9 @@ already in place soften it:
 - **Re-announcement.** VERIFIED (2026-11-10): nothing re-announced a live offer before this design.
   A reconnect only re-subscribes (`src/ws.rs`), it does not re-publish; `engine.rs` `reconcile_offers`
   runs once at open and only drops taken offers. So an evicted offer never returned on its own, and a
-  taker who subscribed after the eviction never discovered it. This is now fixed: `Engine::tick`
-  re-announces our own live offers on a timer (`REANNOUNCE_INTERVAL`, 5 min), making eviction
-  self-healing. Each re-send is a fresh event, so a relay's id-dedupe does not drop it and a
+  taker who subscribed after the eviction never discovered it. This is addressed in #154 (pending
+  merge): `Engine::tick` re-announces our own live offers on a timer (`REANNOUNCE_INTERVAL`, 5 min),
+  making eviction self-healing. Each re-send is a fresh event, so a relay's id-dedupe does not drop it and a
   reconnecting peer's `since` watermark does not hide it; peer handling of a repeated offer is already
   idempotent, so there is no wire change. This was the single highest-value change here (decision 2).
 
