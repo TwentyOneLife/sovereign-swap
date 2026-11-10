@@ -2,7 +2,7 @@
 
 A plain-language, end-to-end walkthrough of doing one BTC/xBTC swap, with the things a real
 operator actually runs into. For the protocol mechanics and diagrams see
-[`swap-flow.md`](../swap-flow.md); this guide is the "what do I do, and what will I see" companion.
+[how it works](../guide/how-it-works.md); this guide is the "what do I do, and what will I see" companion.
 
 A swap is peer to peer and non-custodial: your keys stay on your node, and every swap ends either
 claimed (both sides get the other coin) or refunded (each side gets its own coin back). No third

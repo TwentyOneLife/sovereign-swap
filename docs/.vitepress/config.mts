@@ -12,8 +12,9 @@ export default defineConfig({
   base: '/sovereign-swap/',
   cleanUrls: true,
   lastUpdated: true,
-  // Tightened to false before the v1 PR; kept permissive only while sections are being written.
-  ignoreDeadLinks: true,
+  // Only 0021/0022 are still on their own PR branches (#158/#159); every other link is checked, so a
+  // real broken link fails the build. Drop these two entries once those design notes are on main.
+  ignoreDeadLinks: [/0021-relay-tombstone/, /0022-sp1-fee-collection/],
   head: [
     ['link', { rel: 'icon', type: 'image/png', href: '/sovereign-swap/icon.png' }],
     ['meta', { name: 'theme-color', content: '#F7931A' }],
