@@ -1,6 +1,9 @@
 # 0013 Fee collection: silent payment or normal address, with daemon-side chain scanning
 
-Status: partly implemented. Extends 0010 (which made the fee a silent-payment-only output). The
+Status: partly implemented. The default stated below (silent payment) is revised by
+[0018](0018-interactive-funding-and-the-fee-output.md): normal is the default so the fee works under
+Interactive funding (0017), with silent payment kept as an opt-in for a BIP352-aware signer. Extends
+0010 (which made the fee a silent-payment-only output). The
 per-chain fee address choice (silent payment or normal: `FeeTerms.btc_address`/`xbtc_address`,
 `FeeDest`, `fee_state`) is implemented and released; the daemon-side chain scanner for silent-payment
 collection is open in a separate PR. The per-chain fee address decision was tracked in issue #45.
