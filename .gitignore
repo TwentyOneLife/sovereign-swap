@@ -1,4 +1,7 @@
 /target
 
+# build artifacts and the verified regtest node cache (scripts/fetch-nodes.sh)
+/build
+
 # local git worktrees for parallel branches
 .worktrees/
