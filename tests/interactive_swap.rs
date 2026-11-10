@@ -22,7 +22,7 @@ use bitcoin::Amount;
 use serde_json::{json, Value};
 
 use common::{binaries, Node};
-use sovereign_swap::engine::{Config, Engine, EngineError};
+use sovereign_swap::engine::{Config, Engine, EngineError, FeeTamper};
 use sovereign_swap::envelope::Identity;
 use sovereign_swap::node::ChainNode;
 use sovereign_swap::policy::Policy;
@@ -1491,6 +1491,228 @@ fn an_honest_maker_never_reveals_to_a_taker_that_skips_the_fee() {
         taker.swaps().next().map(|s| s.phase),
         Some(Phase::Refunded),
         "the fee-dodging taker should have locked and then refunded its own coin"
+    );
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Security (fee verification, design 0010/0013), wrong-address branch: a maker whose lock carries a
+/// fee output of the right amount but paying a DIFFERENT address than the agreed one must be rejected.
+/// The malicious maker funds its fee to a wrong (but valid) xBTC address via `fee_tamper`; the honest
+/// taker verifies the maker's lock, sees the agreed fee address unpaid, and abandons WITHOUT locking
+/// its own BTC. This complements the #147 missing-output tests with the wrong-address branch.
+#[test]
+fn an_honest_taker_abandons_a_maker_whose_fee_pays_the_wrong_address() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let btc_fee: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee: String = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A second, different xBTC address the cheating maker pays its fee to instead of the agreed one.
+    let wrong_xbtc: String = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(wrong_xbtc, xbtc_fee, "the tampered address must differ");
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-feewrong-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-feewrong-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_plain(&mdir, "maker", (11, 101), &relay, &core, &knots);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+    // Malicious maker: fund the agreed fee amount, but to the wrong xBTC address. The honest taker
+    // keeps the default minimum and requires the fee at the agreed address.
+    maker.fee_tamper = Some(FeeTamper::WrongAddress(wrong_xbtc));
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .unwrap();
+
+    // The maker locks xBTC with the fee at the wrong address; the honest taker verifies, finds the
+    // agreed fee address unpaid, and abandons without locking.
+    let mut rounds = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Abandoned) {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "the taker did not reject a wrong-address fee maker: taker {:?}, maker {:?}",
+            taker.swaps().next().map(|s| s.phase),
+            maker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Security (fee verification, design 0010/0013), underpaid branch, maker side: the honest maker must
+/// never reveal the secret to a taker whose lock carries a fee output to the agreed address but below
+/// the required amount. The malicious taker underpays its BTC fee via `fee_tamper`; the honest maker
+/// verifies the taker's lock before claiming, finds the fee short, refuses to reveal, and refunds its
+/// own xBTC at the timelock. A larger swap is used so the underpaid amount stays well above dust while
+/// staying clearly below the required fee.
+#[test]
+fn an_honest_maker_never_reveals_to_a_taker_whose_fee_is_underpaid() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let btc_fee: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee: String = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A large swap: the taker's 3_000_000 sat leg owes a ~9_000 sat fee at 30 bps, so underpaying to
+    // 1_000 sat is unmistakably short yet well above any dust limit.
+    let fee_offer = Offer {
+        maker_amount: Amount::from_sat(5_000_000),
+        taker_amount: Amount::from_sat(3_000_000),
+        min_maker_amount: Amount::from_sat(5_000_000),
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-feeunder-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-feeunder-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_plain(&mdir, "maker", (11, 101), &relay, &core, &knots);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+    // Malicious taker: pay the agreed BTC fee address, but only 1_000 sat (far below the ~9_000 owed).
+    taker.fee_tamper = Some(FeeTamper::Underpay(1_000));
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [7; 16])
+        .unwrap();
+
+    // Drive to the maker's refund. The maker locks xBTC with its honest fee; the taker locks BTC with
+    // an underpaid fee; the maker verifies the taker's lock, finds the fee short, and never reveals. At
+    // no point may the maker reach a claiming/settled phase, which would mean it exposed the secret.
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Refunded) {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        let mp = maker.swaps().next().map(|s| s.phase);
+        assert!(
+            mp != Some(Phase::Claiming) && mp != Some(Phase::Done),
+            "the maker revealed the secret to an underpaying taker: maker {mp:?}"
+        );
+        rounds += 1;
+        assert!(
+            rounds < 120,
+            "the maker did not refund after refusing an underpaying taker: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    // The taker genuinely locked its BTC (with the short fee) and got it back at its own timelock, which
+    // rules out the confound where the maker refunds merely because the taker never funded.
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Refunded),
+        "the underpaying taker should have locked and then refunded its own coin"
     );
 
     let _ = std::fs::remove_dir_all(&mdir);
