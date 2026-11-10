@@ -44,6 +44,15 @@ fn short_id(id: &[u8; 16]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The txid of a base64 funding PSBT's unsigned transaction (design 0019). A segwit txid is fixed by
+/// the unsigned tx, so this matches the signed lock that lands on chain; stored as the watch marker
+/// when a swap parks on a handed-out PSBT.
+fn funding_psbt_txid(psbt: &str) -> Result<Txid, EngineError> {
+    psbt.parse::<bitcoin::Psbt>()
+        .map(|p| p.unsigned_tx.compute_txid())
+        .map_err(|e| EngineError::Node(NodeError::Unexpected(format!("parse funding psbt: {e}"))))
+}
+
 /// The fee output a leg owes, or `None` when none is due. A leg below the minimum trade owes no fee
 /// (design 0013 / `fee.rs`), so `BelowMinimum` maps to `None`, NOT an error (#107): the payer funds
 /// with no fee output and the counterparty verifies as not-required, so a leg in `[min_swap,
@@ -126,6 +135,15 @@ pub struct Record {
     /// older records, hence `serde(default)`.
     #[serde(default)]
     pub pending_lock_psbt: Option<String>,
+    /// E2 (design 0019): the txid of the funding lock we handed the user to sign, kept as a watch that
+    /// outlives `pending_lock_psbt`. The prompt (`pending_lock_psbt`) is cleared the moment the swap
+    /// stops awaiting a signature (adopted, settled, or abandoned), so the UI never asks the user to
+    /// sign a dead or already-funded swap; this marker is kept past an abandon so the engine still
+    /// recognises and refunds the user's lock if they broadcast it late. A segwit txid is fixed by the
+    /// unsigned tx, so it matches the signed lock that lands on chain. Absent in older records, hence
+    /// `serde(default)`.
+    #[serde(default)]
+    pub expected_lock_txid: Option<Txid>,
     /// The voluntary fee output's share and proof, stored with the lock so a restart resends the
     /// same proof to the counterparty (design 0010). `None` when no fee is due. Absent in older
     /// records, hence `serde(default)`.
@@ -579,6 +597,7 @@ impl<T: Transport> Engine<T> {
         self.backend(own_chain).broadcast(&tx)?;
         self.records[i].funding = Some(tx);
         self.records[i].pending_lock_psbt = None;
+        self.records[i].expected_lock_txid = None;
         self.save(&self.records[i])?;
         Ok(())
     }
@@ -931,6 +950,7 @@ impl<T: Transport> Engine<T> {
             refund_to: self.destination(refund_chain)?,
             funding: None,
             pending_lock_psbt: None,
+            expected_lock_txid: None,
             fee: None,
             received_fee: None,
             spend_fee_sat: None,
@@ -1110,10 +1130,13 @@ impl<T: Transport> Engine<T> {
             errors.push(([0; 16], e));
         }
         for i in 0..self.records.len() {
-            if matches!(
-                self.records[i].swap.phase,
-                Phase::Done | Phase::Refunded | Phase::Abandoned
-            ) {
+            // Terminal swaps are skipped, with one exception (design 0019): a swap that abandoned while
+            // a handed-out funding PSBT could still land keeps its `expected_lock_txid` marker and is
+            // still advanced, so a lock the user broadcasts late is adopted and refunded.
+            if matches!(self.records[i].swap.phase, Phase::Done | Phase::Refunded)
+                || (self.records[i].swap.phase == Phase::Abandoned
+                    && self.records[i].expected_lock_txid.is_none())
+            {
                 continue;
             }
             let before = self.records[i].swap.phase;
@@ -1133,8 +1156,51 @@ impl<T: Transport> Engine<T> {
         errors
     }
 
+    /// E2 (design 0019): if the lock we handed the user to sign is now on chain (whoever broadcast it),
+    /// adopt it. Record the funding transaction so the normal claim/refund and reorg-rebroadcast paths
+    /// drive it, and clear both the prompt and the watch marker. Matches on the expected txid, which a
+    /// segwit lock preserves from the unsigned PSBT. Returns whether it adopted.
+    fn adopt_own_lock(&mut self, i: usize, view: &ChainView) -> Result<bool, EngineError> {
+        let Some(marker) = self.records[i].expected_lock_txid else {
+            return Ok(false);
+        };
+        let own_txid = match self.records[i].swap.role {
+            Role::Maker => view.maker_lock.as_ref(),
+            Role::Taker => view.taker_lock.as_ref(),
+        }
+        .map(|lock| lock.outpoint.txid);
+        if own_txid != Some(marker) {
+            return Ok(false);
+        }
+        let own_chain = match self.records[i].swap.role {
+            Role::Maker => self.records[i].swap.offer.maker_chain,
+            Role::Taker => self.records[i].swap.offer.maker_chain.other(),
+        };
+        let tx = self.backend(own_chain).get_tx(marker)?;
+        self.records[i].funding = Some(tx);
+        self.records[i].pending_lock_psbt = None;
+        self.records[i].expected_lock_txid = None;
+        self.save(&self.records[i])?;
+        Ok(true)
+    }
+
     fn advance(&mut self, i: usize) -> Result<(), EngineError> {
         let view = self.view(&self.records[i])?;
+
+        // E2 terminal watch (design 0019): a swap that abandoned while a handed-out PSBT could still
+        // land is not skipped by tick() while its marker is set. If the user's lock has now appeared,
+        // adopt it and drive it to a self.keys refund (decide refuses to reconsider a terminal swap, so
+        // the Refunding transition is made here explicitly); otherwise there is nothing to drive yet,
+        // so keep watching. decide's own deadline logic keeps the refund safe.
+        if self.records[i].swap.phase == Phase::Abandoned {
+            if self.adopt_own_lock(i, &view)? {
+                self.records[i].swap.phase = Phase::Refunding;
+                self.save(&self.records[i])?;
+            } else {
+                return Ok(());
+            }
+        }
+
         // Re-send our fee proof each tick while the swap is live (design 0010); the relay may drop
         // it, and the counterparty needs it to verify our lock. Receiving it twice is harmless.
         if let Some(proof) = self.records[i].fee.clone() {
@@ -1143,19 +1209,30 @@ impl<T: Transport> Engine<T> {
                 proof,
             });
         }
+
+        // E2 adoption while parked (design 0019): the user may have broadcast the lock themselves
+        // during the funding window. If it is on chain, adopt it (this clears the prompt) and let
+        // decide below run it to Done or a refund on the same view.
+        if self.records[i].pending_lock_psbt.is_some() {
+            self.adopt_own_lock(i, &view)?;
+        }
+
         let secret = (self.records[i].swap.role == Role::Maker)
             .then(|| self.keys.secret(self.records[i].swap.key_index));
+        let before = self.records[i].swap.phase;
         let actions = self.records[i].swap.decide(&view, secret);
-        // A swap parked on an unsigned funding PSBT that has now reached a terminal phase (it abandoned
-        // while waiting for the user's signature) must drop the pending PSBT, so the UI stops asking
-        // the user to sign a dead swap and submit_signed_lock's refusal is consistent with the store.
-        if self.records[i].pending_lock_psbt.is_some()
-            && matches!(
-                self.records[i].swap.phase,
-                Phase::Abandoned | Phase::Done | Phase::Refunded
-            )
-        {
-            self.records[i].pending_lock_psbt = None;
+
+        // E2 split the prompt from the watch (design 0019): when a parked swap abandons at the funding
+        // window, clear the prompt so the UI stops asking for a signature and submit_signed_lock's
+        // refusal is consistent, but KEEP `expected_lock_txid`. The terminal watch above then keeps
+        // looking for the user's lock and refunds it if it lands, which is the #134 hazard.
+        if self.records[i].pending_lock_psbt.is_some() {
+            if before != Phase::Abandoned && self.records[i].swap.phase == Phase::Abandoned {
+                self.records[i].pending_lock_psbt = None;
+            } else if matches!(self.records[i].swap.phase, Phase::Done | Phase::Refunded) {
+                self.records[i].pending_lock_psbt = None;
+                self.records[i].expected_lock_txid = None;
+            }
         }
         self.save(&self.records[i])?;
         for action in actions {
@@ -1259,6 +1336,10 @@ impl<T: Transport> Engine<T> {
                         // already passed the replay guard) and wait for submit_signed_lock; do not
                         // broadcast anything now.
                         Err(NodeError::AwaitingSignature { psbt }) => {
+                            // Record the expected lock txid as a watch that outlives the prompt
+                            // (design 0019), so a lock the user broadcasts, even after the swap later
+                            // abandons, is still recognised and refunded.
+                            self.records[i].expected_lock_txid = Some(funding_psbt_txid(&psbt)?);
                             self.records[i].pending_lock_psbt = Some(psbt);
                             self.save(&self.records[i])?;
                             return Ok(());
