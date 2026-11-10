@@ -280,3 +280,159 @@ fn a_websocket_client_still_reaches_the_relay_after_the_landing_branch() {
         "websocket EVENT was not accepted: {replies:?}"
     );
 }
+
+// --- Relay flood hardening (#149): per-connection REQ/subscription controls + amplification bound ---
+
+/// A persistent raw WebSocket client that keeps its connection (and therefore its per-connection rate
+/// limiter and `conn_id`) across several frames, unlike `send_and_read` which reconnects each call.
+fn raw(url: &str) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>> {
+    let (ws, _) = connect(url).unwrap();
+    stream_of(&ws)
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+    ws
+}
+
+/// Reads every frame the relay sends back, until a short idle deadline.
+fn drain(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(WsMessage::Text(t)) => out.push(t.to_string()),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+fn fill_store(url: &str, signer: u8, n: u8) {
+    let secp = Secp256k1::new();
+    let mut c = raw(url);
+    for i in 0..n {
+        let ev = Event::build(&secp, &key(signer), Event::now_for_test(), vec![], &[i]);
+        c.send(WsMessage::Text(
+            format!(r#"["EVENT",{}]"#, ev.to_json()).into(),
+        ))
+        .unwrap();
+    }
+    drain(&mut c);
+}
+
+#[test]
+fn a_req_honors_the_client_limit() {
+    let cfg = RelayConfig {
+        max_events_per_min: 100_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    fill_store(&url, 20, 5);
+    let mut c = raw(&url);
+    c.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}],"limit":2}}]"#).into(),
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    let events = out.iter().filter(|l| l.starts_with(r#"["EVENT""#)).count();
+    assert_eq!(
+        events, 2,
+        "REQ ignored the client limit: {events} events for limit 2"
+    );
+}
+
+#[test]
+fn a_req_is_capped_at_the_server_maximum() {
+    let cfg = RelayConfig {
+        max_events_per_min: 100_000,
+        max_req_events: 2,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    fill_store(&url, 21, 5);
+    let mut c = raw(&url);
+    // No client limit: the server maximum must still bound the response.
+    c.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    let events = out.iter().filter(|l| l.starts_with(r#"["EVENT""#)).count();
+    assert!(
+        events <= 2,
+        "server max not enforced: {events} events streamed"
+    );
+}
+
+#[test]
+fn req_messages_are_rate_limited_per_connection() {
+    let cfg = RelayConfig {
+        max_reqs_per_min: 3,
+        max_events_per_min: 100_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    let mut c = raw(&url);
+    for i in 0..30 {
+        c.send(WsMessage::Text(
+            format!(r#"["REQ","s{i}",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+        ))
+        .unwrap();
+    }
+    let out = drain(&mut c);
+    let eose = out.iter().filter(|l| l.contains(r#""EOSE""#)).count();
+    assert!(eose >= 1, "no REQ was honored at all");
+    assert!(
+        eose <= 8,
+        "REQ flood not throttled: {eose} subscriptions accepted"
+    );
+}
+
+#[test]
+fn subscriptions_are_capped_per_connection() {
+    let cfg = RelayConfig {
+        max_subscriptions: 3,
+        max_reqs_per_min: 100_000,
+        max_events_per_min: 100_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    let mut c = raw(&url);
+    for i in 0..8 {
+        c.send(WsMessage::Text(
+            format!(r#"["REQ","sub{i}",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+        ))
+        .unwrap();
+    }
+    let out = drain(&mut c);
+    let eose = out.iter().filter(|l| l.contains(r#""EOSE""#)).count();
+    assert_eq!(eose, 3, "subscription cap not enforced: {eose} accepted");
+}
+
+#[test]
+fn a_fresh_connection_gets_only_a_small_burst() {
+    // Default per-minute allowance is large, but a cold connection must not be able to spend it all at
+    // once (gap 1: a Tor reconnect otherwise hands out a full fresh bucket every time).
+    let url = relay(RelayConfig::default());
+    let secp = Secp256k1::new();
+    let mut c = raw(&url);
+    for i in 0..40u8 {
+        let ev = Event::build(&secp, &key(30), Event::now_for_test(), vec![], &[i]);
+        c.send(WsMessage::Text(
+            format!(r#"["EVENT",{}]"#, ev.to_json()).into(),
+        ))
+        .unwrap();
+    }
+    let out = drain(&mut c);
+    let accepted = out
+        .iter()
+        .filter(|l| l.contains(r#""OK""#) && l.contains("true"))
+        .count();
+    assert!(accepted >= 1, "cold connection could publish nothing");
+    assert!(
+        accepted <= 15,
+        "cold burst too large: {accepted} accepted at once"
+    );
+}

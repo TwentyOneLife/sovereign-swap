@@ -1,10 +1,11 @@
 //! `sovereign-swap-relay`: a Nostr relay (NIP-01) hardened for carrying swap messages and nothing
 //! else. It stores and forwards opaque events; it never sees identities or plaintext. Its job is to
 //! survive abuse, so the controls are the point: only our event kind, a size cap, a per-connection
-//! rate limit, a bounded store with a time-to-live, and a connection cap. See
+//! rate limit on both publishes and subscriptions, a per-REQ result cap (bounding amplification), a
+//! per-connection subscription cap, a bounded store with a time-to-live, and a connection cap. See
 //! `docs/design/0006-nostr-client-and-relay.md` and `docs/design/0003-adversarial-testing.md` (DoS).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -27,6 +28,15 @@ pub struct RelayConfig {
     pub max_connections: usize,
     /// Events a single connection may publish per minute before it is throttled.
     pub max_events_per_min: u32,
+    /// REQ (subscription) messages a single connection may send per minute. A separate bucket from
+    /// `max_events_per_min` so a publish flood cannot starve subscriptions, and the other way round.
+    pub max_reqs_per_min: u32,
+    /// The most events one REQ may stream back, regardless of (or capping) the client's `limit`. Bounds
+    /// REQ amplification: one small REQ cannot pull the whole store.
+    pub max_req_events: usize,
+    /// The most live subscriptions one connection may hold. The honest client opens one; the cap stops a
+    /// connection growing the subscription table without bound.
+    pub max_subscriptions: usize,
     /// Events older than this (by `created_at`) are not stored or served.
     pub retention_secs: u64,
     pub store_cap: usize,
@@ -42,6 +52,9 @@ impl Default for RelayConfig {
             max_event_bytes: 131_072,
             max_connections: 512,
             max_events_per_min: 240,
+            max_reqs_per_min: 120,
+            max_req_events: 1_000,
+            max_subscriptions: 64,
             retention_secs: 7 * 24 * 3600,
             store_cap: 100_000,
             price_proxy: false,
@@ -51,6 +64,9 @@ impl Default for RelayConfig {
 
 struct Store {
     events: VecDeque<Event>,
+    /// Event ids currently in `events`, kept in step with it, so dedupe is O(1) instead of a scan of the
+    /// whole store under the lock on every accepted event.
+    ids: HashSet<[u8; 32]>,
     cap: usize,
     retention: u64,
 }
@@ -68,22 +84,33 @@ impl Store {
     }
 
     fn insert(&mut self, event: Event) -> bool {
-        if self.events.iter().any(|e| e.id == event.id) {
+        if self.ids.contains(&event.id) {
             return false;
         }
         while self.events.len() >= self.cap {
-            self.events.pop_front();
+            if let Some(old) = self.events.pop_front() {
+                self.ids.remove(&old.id);
+            }
         }
+        self.ids.insert(event.id);
         self.events.push_back(event);
         true
     }
 
-    fn matching(&self, filter: &Filter) -> Vec<Event> {
-        self.events
+    /// Fresh, matching events, newest first truncated to `max` (or the client's `limit` when smaller),
+    /// then returned oldest-first. `max` bounds REQ amplification; `limit` honours the client's request.
+    fn matching(&self, filter: &Filter, max: usize) -> Vec<Event> {
+        let cap = filter.limit.map_or(max, |l| l.min(max));
+        let mut hits: Vec<Event> = self
+            .events
             .iter()
+            .rev()
             .filter(|e| self.fresh(e) && filter.matches(e))
+            .take(cap)
             .cloned()
-            .collect()
+            .collect();
+        hits.reverse();
+        hits
     }
 }
 
@@ -92,6 +119,7 @@ impl Store {
 struct Filter {
     kinds: Option<Vec<u32>>,
     p_tags: Option<Vec<String>>,
+    limit: Option<usize>,
 }
 
 impl Filter {
@@ -106,7 +134,12 @@ impl Filter {
                 .filter_map(|t| t.as_str().map(str::to_owned))
                 .collect()
         });
-        Filter { kinds, p_tags }
+        let limit = v["limit"].as_u64().map(|l| l as usize);
+        Filter {
+            kinds,
+            p_tags,
+            limit,
+        }
     }
 
     fn matches(&self, e: &Event) -> bool {
@@ -183,6 +216,7 @@ impl RelayServer {
     pub fn new(cfg: RelayConfig) -> RelayServer {
         let store = Store {
             events: VecDeque::new(),
+            ids: HashSet::new(),
             cap: cfg.store_cap,
             retention: cfg.retention_secs,
         };
@@ -210,6 +244,8 @@ impl RelayServer {
             "supported_nips": [1, 11],
             "limitation": {
                 "max_message_length": self.cfg.max_event_bytes,
+                "max_subscriptions": self.cfg.max_subscriptions,
+                "max_limit": self.cfg.max_req_events,
                 "restricted_writes": true,
             },
             "swap_relay": {
@@ -287,22 +323,24 @@ impl RelayServer {
     fn accept_loop(self, listener: TcpListener) {
         let server = Arc::new(self);
         for stream in listener.incoming().flatten() {
-            if server.connections.load(Ordering::Relaxed) >= server.cfg.max_connections {
+            // Reserve the slot before spawning so a burst of accepts cannot overshoot the cap (the old
+            // load-then-increment-in-thread order raced). Roll back and drop if we were already full.
+            if server.connections.fetch_add(1, Ordering::SeqCst) >= server.cfg.max_connections {
+                server.connections.fetch_sub(1, Ordering::SeqCst);
                 server
                     .stats
                     .connections_rejected_at_cap
                     .fetch_add(1, Ordering::Relaxed);
-                continue; // drop the connection: we are at the cap
+                continue;
             }
+            server
+                .stats
+                .connections_total
+                .fetch_add(1, Ordering::Relaxed);
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
-                server
-                    .stats
-                    .connections_total
-                    .fetch_add(1, Ordering::Relaxed);
-                server.connections.fetch_add(1, Ordering::Relaxed);
                 server.serve_connection(stream);
-                server.connections.fetch_sub(1, Ordering::Relaxed);
+                server.connections.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -353,7 +391,8 @@ impl RelayServer {
         let (tx, rx): (Outbox, Receiver<String>) = mpsc::channel();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let secp = Secp256k1::verification_only();
-        let mut limiter = RateLimiter::new(self.cfg.max_events_per_min);
+        let mut event_limiter = RateLimiter::new(self.cfg.max_events_per_min);
+        let mut req_limiter = RateLimiter::new(self.cfg.max_reqs_per_min);
 
         loop {
             while let Ok(msg) = rx.try_recv() {
@@ -363,9 +402,15 @@ impl RelayServer {
                 }
             }
             match ws.read() {
-                Ok(WsMessage::Text(text)) => {
-                    self.handle(&text, conn_id, &tx, &mut ws, &secp, &mut limiter)
-                }
+                Ok(WsMessage::Text(text)) => self.handle(
+                    &text,
+                    conn_id,
+                    &tx,
+                    &mut ws,
+                    &secp,
+                    &mut event_limiter,
+                    &mut req_limiter,
+                ),
                 Ok(WsMessage::Close(_)) => {
                     self.drop_subs(conn_id);
                     return;
@@ -387,6 +432,7 @@ impl RelayServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle<S: Read + Write, C: Verification>(
         &self,
         text: &str,
@@ -394,20 +440,43 @@ impl RelayServer {
         tx: &Outbox,
         ws: &mut WebSocket<S>,
         secp: &Secp256k1<C>,
-        limiter: &mut RateLimiter,
+        event_limiter: &mut RateLimiter,
+        req_limiter: &mut RateLimiter,
     ) {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return;
         };
         match v.get(0).and_then(Value::as_str) {
             Some("EVENT") => {
-                let reply = self.accept_event(&v[1], secp, limiter);
+                let reply = self.accept_event(&v[1], secp, event_limiter);
                 let _ = ws.send(WsMessage::Text(reply.into()));
             }
             Some("REQ") => {
+                // REQ has its own rate bucket (a store scan is costlier than accepting an event) and a
+                // per-connection subscription cap. Over-budget REQs are dropped silently: the client
+                // ignores CLOSED/NOTICE, and its single honest REQ is always within budget.
+                if !req_limiter.allow() {
+                    return;
+                }
+                if self
+                    .subs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.conn_id == conn_id)
+                    .count()
+                    >= self.cfg.max_subscriptions
+                {
+                    return;
+                }
                 let sub_id = v.get(1).and_then(Value::as_str).unwrap_or("").to_owned();
                 let filter = v.get(2).map(Filter::parse).unwrap_or_default();
-                for event in self.store.lock().unwrap().matching(&filter) {
+                for event in self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .matching(&filter, self.cfg.max_req_events)
+                {
                     let _ = ws.send(WsMessage::Text(
                         format!(r#"["EVENT","{sub_id}",{}]"#, event.to_json()).into(),
                     ));
@@ -665,11 +734,16 @@ struct RateLimiter {
     last: Instant,
 }
 
+/// A fresh connection starts with this many tokens, not a full per-minute bucket. Because the relay is
+/// Tor-first it has no per-source identity, so a full starting bucket would let an attacker reset its
+/// whole allowance just by reconnecting; a small burst keeps a cold connection cheap.
+const RATE_BURST: f64 = 10.0;
+
 impl RateLimiter {
     fn new(per_min: u32) -> RateLimiter {
         RateLimiter {
             per_min,
-            allowance: per_min as f64,
+            allowance: RATE_BURST.min(per_min as f64),
             last: Instant::now(),
         }
     }

@@ -30,6 +30,10 @@ fn main() -> std::io::Result<()> {
     cfg.max_connections = env_usize("RELAY_MAX_CONNECTIONS", cfg.max_connections);
     cfg.max_events_per_min =
         env_usize("RELAY_MAX_EVENTS_PER_MIN", cfg.max_events_per_min as usize) as u32;
+    cfg.max_reqs_per_min =
+        env_usize("RELAY_MAX_REQS_PER_MIN", cfg.max_reqs_per_min as usize) as u32;
+    cfg.max_req_events = env_usize("RELAY_MAX_REQ_EVENTS", cfg.max_req_events);
+    cfg.max_subscriptions = env_usize("RELAY_MAX_SUBSCRIPTIONS", cfg.max_subscriptions);
     cfg.store_cap = env_usize("RELAY_STORE_CAP", cfg.store_cap);
     cfg.retention_secs = env_usize("RELAY_RETENTION_SECS", cfg.retention_secs as usize) as u64;
     cfg.price_proxy = env_bool("RELAY_PRICE_PROXY", cfg.price_proxy);
