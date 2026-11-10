@@ -79,8 +79,7 @@ fn open_party(
     let btc = ChainNode::open(core.rpc.clone(), name).unwrap();
     let xbtc = ChainNode::open(knots.rpc.clone(), name).unwrap();
     let mut engine = Engine::open(dir, btc, xbtc, tp, config()).unwrap();
-    let electrum =
-        ElectrumBackend::connect("127.0.0.1", fulcrum_port, None, Network::Regtest).unwrap();
+    let electrum = common::connect_electrum("127.0.0.1", fulcrum_port, Network::Regtest);
     engine.set_read_backend(Chain::Btc, Box::new(electrum));
     engine
 }
@@ -116,8 +115,7 @@ fn a_full_swap_settles_with_btc_read_and_broadcast_over_electrum() {
         eprintln!("skipped: set FULCRUM_BIN (scripts/fetch-nodes.sh)");
         return;
     };
-    let probe =
-        ElectrumBackend::connect("127.0.0.1", fulcrum.port, None, Network::Regtest).unwrap();
+    let probe = common::connect_electrum("127.0.0.1", fulcrum.port, Network::Regtest);
     let relay = Relay::new();
 
     let mdir = std::env::temp_dir().join(format!("sovswap-eswap-m-{}", std::process::id()));
@@ -239,8 +237,7 @@ fn open_interactive_taker_electrum(
     .unwrap();
     let xbtc = ChainNode::open(knots.rpc.clone(), "taker").unwrap();
     let mut engine = Engine::open(dir, btc, xbtc, tp, config()).unwrap();
-    let electrum =
-        ElectrumBackend::connect("127.0.0.1", fulcrum_port, None, Network::Regtest).unwrap();
+    let electrum = common::connect_electrum("127.0.0.1", fulcrum_port, Network::Regtest);
     engine.set_read_backend(Chain::Btc, Box::new(electrum));
     engine
 }
@@ -262,8 +259,7 @@ fn an_interactive_lock_is_adopted_with_btc_reads_over_electrum() {
         eprintln!("skipped: set FULCRUM_BIN (scripts/fetch-nodes.sh)");
         return;
     };
-    let probe =
-        ElectrumBackend::connect("127.0.0.1", fulcrum.port, None, Network::Regtest).unwrap();
+    let probe = common::connect_electrum("127.0.0.1", fulcrum.port, Network::Regtest);
     let relay = Relay::new();
 
     core.call("createwallet", json!(["takeruser"]));
