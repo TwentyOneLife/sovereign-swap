@@ -789,11 +789,8 @@ impl Daemon {
         {
             let guard = self.state.lock().unwrap();
             let s = &guard.settings;
-            let addr = match new.sell_chain {
-                Chain::Btc => &s.fee_btc_address,
-                Chain::Xbtc => &s.fee_xbtc_address,
-            };
-            if s.fee_enabled && !addr.trim().is_empty() {
+            let addr = s.current_fee_address(new.sell_chain);
+            if s.fee_enabled && addr.is_some() {
                 let rates = crate::fee::FeeRates {
                     maker_bps: s.fee_maker_bps,
                     taker_bps: s.fee_taker_bps,

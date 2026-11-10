@@ -169,6 +169,15 @@ pub struct Settings {
     /// address because the two chains share Bitcoin's address format (design 0013).
     #[serde(default)]
     pub fee_xbtc_address: String,
+    /// Optional pre-baked rotating set of BTC fee addresses (design 0018). When non-empty, the offer
+    /// uses the set member for the current time window (`fee::rotating_fee_address`, a deterministic
+    /// offline 25 to 40 day schedule), cycling through the set; when empty, `fee_btc_address` is used
+    /// unchanged. Every member must be a normal address the operator watches. Absent in older records.
+    #[serde(default)]
+    pub fee_btc_addresses: Vec<String>,
+    /// The same optional rotating set for the xBTC fee address.
+    #[serde(default)]
+    pub fee_xbtc_addresses: Vec<String>,
     /// Optional operator-owned address where this node's claimed proceeds and its own refunds on the
     /// BTC chain are sent (finding F5, design 0014). Empty (the default) keeps today's behaviour: a
     /// fresh address from the node's own funding wallet, so proceeds sit in the hot wallet. Set it to
@@ -275,6 +284,8 @@ impl Default for Settings {
                 .to_owned(),
             fee_xbtc_address: "bc1pe62v4m0p6njpxn2ej9hx307tm0xlccnxe652vxk9r76g2qync7sqkfly4t"
                 .to_owned(),
+            fee_btc_addresses: Vec::new(),
+            fee_xbtc_addresses: Vec::new(),
             btc_payout_address: String::new(),
             xbtc_payout_address: String::new(),
             btc_explorer_url: String::new(),
@@ -293,6 +304,23 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The fee address to publish for the side locking `chain` right now (design 0018): the current
+    /// member of the pre-baked rotating set if one is configured, otherwise the single configured
+    /// address, otherwise `None` (no fee output for that chain). Rotation is time-based and offline.
+    pub(crate) fn current_fee_address(&self, chain: Chain) -> Option<String> {
+        let (set, single) = match chain {
+            Chain::Btc => (&self.fee_btc_addresses, &self.fee_btc_address),
+            Chain::Xbtc => (&self.fee_xbtc_addresses, &self.fee_xbtc_address),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::fee::rotating_fee_address(set, now)
+            .map(str::to_owned)
+            .or_else(|| (!single.trim().is_empty()).then(|| single.trim().to_owned()))
+    }
+
     /// Authoritative validation (design 0009 layer 2). Returns one message per bad field; empty means
     /// valid. The engine enforces the safety-critical invariants regardless, but we refuse nonsense
     /// here so it never reaches the engine and so the GUI can show the reasons.
@@ -344,20 +372,39 @@ impl Settings {
         // checked where the live signer is known (the engine wiring), not in this pure validation; a
         // non-BIP352 signer refuses to enable fees there with a clear message (design 0010).
         if self.fee_enabled {
-            let addresses = [
+            let singles = [
                 ("fee_btc_address", &self.fee_btc_address),
                 ("fee_xbtc_address", &self.fee_xbtc_address),
             ];
-            if addresses.iter().all(|(_, a)| a.trim().is_empty()) {
+            let sets = [
+                ("fee_btc_addresses", &self.fee_btc_addresses),
+                ("fee_xbtc_addresses", &self.fee_xbtc_addresses),
+            ];
+            let have_any = singles.iter().any(|(_, a)| !a.trim().is_empty())
+                || sets
+                    .iter()
+                    .any(|(_, v)| v.iter().any(|a| !a.trim().is_empty()));
+            if !have_any {
                 e.push(
-                    "fee: a BTC or xBTC fee address is required when the fee is enabled".to_owned(),
+                    "fee: a BTC or xBTC fee address is required when the fee is enabled (a single \
+                     address or a rotating set)"
+                        .to_owned(),
                 );
             }
-            for (name, a) in addresses {
+            for (name, a) in singles {
                 if !a.trim().is_empty() && !looks_like_fee_address(a) {
                     e.push(format!(
                         "{name}: must be a silent payment or a normal address"
                     ));
+                }
+            }
+            for (name, v) in sets {
+                for a in v {
+                    if !a.trim().is_empty() && !looks_like_fee_address(a) {
+                        e.push(format!(
+                            "{name}: '{a}' must be a silent payment or a normal address"
+                        ));
+                    }
                 }
             }
         }
@@ -539,12 +586,11 @@ impl NewOffer {
         // The fee terms travel in the offer (design 0010), filled from the operator's settings when
         // the fee is on; a fee-less offer carries None. The address was shape-checked by
         // Settings::validate; the taker's engine parses it for its network before paying.
-        let non_empty = |a: &str| (!a.trim().is_empty()).then(|| a.trim().to_owned());
         let fee = s.fee_enabled.then(|| FeeTerms {
             maker_bps: s.fee_maker_bps,
             taker_bps: s.fee_taker_bps,
-            btc_address: non_empty(&s.fee_btc_address),
-            xbtc_address: non_empty(&s.fee_xbtc_address),
+            btc_address: s.current_fee_address(Chain::Btc),
+            xbtc_address: s.current_fee_address(Chain::Xbtc),
         });
         SwapOffer {
             id: random16(),
