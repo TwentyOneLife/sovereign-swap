@@ -571,3 +571,269 @@ fn a_full_swap_settles_with_an_interactive_maker_funding_lock() {
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
 }
+
+/// Design 0019, #135 item 3: the user signs the parked PSBT and broadcasts it from their OWN wallet
+/// while still in the funding window, instead of pasting it back. The engine must adopt the on-chain
+/// lock on the next tick (clearing the prompt so the GUI stops asking) and the swap still settles.
+#[test]
+fn a_within_window_user_broadcast_lock_is_adopted_and_settles() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-iadopt-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-iadopt-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    let (swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
+
+    // The user signs it, then broadcasts it themselves instead of submitting it back.
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    assert_eq!(signed["complete"], true, "the user's wallet fully signs it");
+    let fin = core.call("finalizepsbt", json!([signed["psbt"].as_str().unwrap()]));
+    let hex = fin["hex"].as_str().expect("the finalized funding tx hex");
+    core.call("sendrawtransaction", json!([hex]));
+    core.mine(1);
+
+    // One tick adopts the on-chain lock and clears the prompt (otherwise the GUI keeps asking the user
+    // to sign a lock already on chain).
+    tick(&mut taker);
+    assert!(
+        taker.pending_lock_psbt(swap_id).is_none(),
+        "the engine adopts its on-chain lock and clears the prompt, got {:?}",
+        taker.pending_lock_psbt(swap_id)
+    );
+
+    // It also settles end to end.
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "a user-broadcast lock was not adopted and settled: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Design 0019, #134: the user walks away while signing, the engine abandons the parked swap at the
+/// funding window (clearing the prompt, as #133 intends), and the user then broadcasts the lock anyway.
+/// The marker that outlives the abandon must let the engine adopt the on-chain lock and refund it with
+/// self.keys, rather than strand it. The maker is not driven, so no secret is revealed and only the
+/// refund path is possible.
+#[test]
+fn a_walked_away_swap_abandons_then_a_late_broadcast_is_refunded() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-iwalk-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-iwalk-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    let (swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+
+    // The user walks away; the engine ticks on past the funding window and abandons the parked swap.
+    knots.mine(160);
+    let mut r = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Abandoned) {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        r += 1;
+        assert!(
+            r < 30,
+            "the parked swap did not abandon: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+    assert!(
+        taker.pending_lock_psbt(swap_id).is_none(),
+        "the prompt is cleared on abandon so the UI stops asking"
+    );
+
+    // The slow user finally broadcasts the exact lock from their own wallet.
+    let fin = core.call("finalizepsbt", json!([signed_psbt]));
+    let hex = fin["hex"].as_str().expect("the finalized funding tx hex");
+    core.call("sendrawtransaction", json!([hex]));
+    core.mine(1);
+
+    // The watch marker outlived the abandon, so the engine adopts the lock and refunds it.
+    let mut rounds = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Refunded) {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 120,
+            "a late user-broadcast lock was not adopted and refunded: taker {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Design 0019, #134's realistic path: the user pastes the signed PSBT too late, is refused
+/// (`NoLongerFundable`, the prompt cleared), assumes the paste failed, and broadcasts from their own
+/// wallet. The marker kept across the refusal must still let the engine adopt and refund the lock.
+#[test]
+fn a_refused_late_submit_then_user_broadcast_is_refunded() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-ilate2-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-ilate2-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    let (swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+
+    // Submit too late (no tick first): the maker chain runs past the taker's deadline, so the submit
+    // re-decides, refuses, and clears the prompt.
+    knots.mine(160);
+    let err = taker.submit_signed_lock(swap_id, &signed_psbt).unwrap_err();
+    assert!(
+        matches!(err, EngineError::NoLongerFundable),
+        "a late submit is refused, got {err:?}"
+    );
+    assert!(
+        taker.pending_lock_psbt(swap_id).is_none(),
+        "the refusal clears the prompt"
+    );
+
+    // The user, thinking the paste failed, broadcasts the lock from their own wallet anyway.
+    let fin = core.call("finalizepsbt", json!([signed_psbt]));
+    let hex = fin["hex"].as_str().expect("the finalized funding tx hex");
+    core.call("sendrawtransaction", json!([hex]));
+    core.mine(1);
+
+    // The marker kept across the refusal lets the engine adopt and refund the lock.
+    let mut rounds = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Refunded) {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 120,
+            "a lock broadcast after a refused late submit was not adopted and refunded: taker {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
