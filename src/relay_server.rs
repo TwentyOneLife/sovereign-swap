@@ -8,8 +8,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +37,13 @@ pub struct RelayConfig {
     /// The most live subscriptions one connection may hold. The honest client opens one; the cap stops a
     /// connection growing the subscription table without bound.
     pub max_subscriptions: usize,
+    /// Seconds after the handshake a connection may go without sending a REQ before it is dropped. The
+    /// honest client subscribes immediately, so this only reclaims sockets a squatter opened and left
+    /// idle (connection-cap exhaustion).
+    pub req_deadline_secs: u64,
+    /// The most events that may queue for one subscriber before further fan-out to it is dropped. Bounds
+    /// the memory a subscriber that stops reading can pin; a healthy client drains continuously.
+    pub max_outbox_events: usize,
     /// Events older than this (by `created_at`) are not stored or served.
     pub retention_secs: u64,
     pub store_cap: usize,
@@ -55,6 +62,8 @@ impl Default for RelayConfig {
             max_reqs_per_min: 120,
             max_req_events: 1_000,
             max_subscriptions: 64,
+            req_deadline_secs: 30,
+            max_outbox_events: 512,
             retention_secs: 7 * 24 * 3600,
             store_cap: 100_000,
             price_proxy: false,
@@ -163,13 +172,20 @@ impl Filter {
     }
 }
 
-type Outbox = Sender<String>;
+/// A bounded queue of outbound lines to one connection. Bounded (not `mpsc::channel`) so a subscriber
+/// that stops reading cannot pin unbounded memory; `fan_out` uses `try_send` and drops a subscriber
+/// whose queue is full rather than ever blocking under the subs lock.
+type Outbox = SyncSender<String>;
 
 struct Subscription {
     conn_id: u64,
     outbox: Outbox,
     sub_id: String,
     filter: Filter,
+    /// Shared with the connection's serve loop. Set when fan-out drops this subscriber for a full queue,
+    /// so the loop closes the connection: the client must reconnect (from its `since` watermark) rather
+    /// than keep a live socket on which it silently never sees another event.
+    evicted: Arc<AtomicBool>,
 }
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(0);
@@ -388,13 +404,32 @@ impl RelayServer {
         {
             return;
         }
-        let (tx, rx): (Outbox, Receiver<String>) = mpsc::channel();
+        // At least 1, so a misconfigured `max_outbox_events: 0` is not a rendezvous channel that would
+        // drop every subscriber on its first event.
+        let (tx, rx): (Outbox, Receiver<String>) =
+            mpsc::sync_channel(self.cfg.max_outbox_events.max(1));
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let evicted = Arc::new(AtomicBool::new(false));
         let secp = Secp256k1::verification_only();
         let mut event_limiter = RateLimiter::new(self.cfg.max_events_per_min);
         let mut req_limiter = RateLimiter::new(self.cfg.max_reqs_per_min);
+        let mut seen_req = false;
+        let opened = Instant::now();
+        let req_deadline = Duration::from_secs(self.cfg.req_deadline_secs);
 
         loop {
+            // A subscriber whose outbox overflowed is closed here so the client reconnects from its
+            // watermark rather than staying connected but deaf.
+            if evicted.load(Ordering::Relaxed) {
+                self.drop_subs(conn_id);
+                return;
+            }
+            // Reclaim a socket that never subscribed: an honest client sends its REQ immediately, so a
+            // connection still silent past the deadline is a squatter holding a connection slot.
+            if !seen_req && opened.elapsed() > req_deadline {
+                self.drop_subs(conn_id);
+                return;
+            }
             while let Ok(msg) = rx.try_recv() {
                 if ws.send(WsMessage::Text(msg.into())).is_err() {
                     self.drop_subs(conn_id);
@@ -410,6 +445,8 @@ impl RelayServer {
                     &secp,
                     &mut event_limiter,
                     &mut req_limiter,
+                    &mut seen_req,
+                    &evicted,
                 ),
                 Ok(WsMessage::Close(_)) => {
                     self.drop_subs(conn_id);
@@ -442,6 +479,8 @@ impl RelayServer {
         secp: &Secp256k1<C>,
         event_limiter: &mut RateLimiter,
         req_limiter: &mut RateLimiter,
+        seen_req: &mut bool,
+        evicted: &Arc<AtomicBool>,
     ) {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return;
@@ -452,6 +491,9 @@ impl RelayServer {
                 let _ = ws.send(WsMessage::Text(reply.into()));
             }
             Some("REQ") => {
+                // A REQ, even one later throttled, marks the connection as a real subscriber so the
+                // idle-socket deadline no longer applies to it.
+                *seen_req = true;
                 // REQ has its own rate bucket (a store scan is costlier than accepting an event) and a
                 // per-connection subscription cap. Over-budget REQs are dropped silently: the client
                 // ignores CLOSED/NOTICE, and its single honest REQ is always within budget.
@@ -471,12 +513,15 @@ impl RelayServer {
                 }
                 let sub_id = v.get(1).and_then(Value::as_str).unwrap_or("").to_owned();
                 let filter = v.get(2).map(Filter::parse).unwrap_or_default();
-                for event in self
+                // Collect under the lock, then release it BEFORE sending: a `for` over the locked
+                // expression would hold the store guard across every network write, so one non-reading
+                // REQ client (a stalled `ws.send`) would freeze publishing relay-wide.
+                let hits = self
                     .store
                     .lock()
                     .unwrap()
-                    .matching(&filter, self.cfg.max_req_events)
-                {
+                    .matching(&filter, self.cfg.max_req_events);
+                for event in hits {
                     let _ = ws.send(WsMessage::Text(
                         format!(r#"["EVENT","{sub_id}",{}]"#, event.to_json()).into(),
                     ));
@@ -487,6 +532,7 @@ impl RelayServer {
                     outbox: tx.clone(),
                     sub_id,
                     filter,
+                    evicted: evicted.clone(),
                 });
             }
             Some("CLOSE") => {
@@ -555,7 +601,15 @@ impl RelayServer {
                 return true;
             }
             let msg = line.replace("{}", &sub.sub_id);
-            sub.outbox.send(msg).is_ok()
+            // try_send, never a blocking send: we hold the subs lock, so a slow subscriber must not be
+            // able to stall fan-out to everyone else. A full (or gone) queue drops this subscriber and
+            // flags its connection to close, so the client reconnects instead of going silently deaf.
+            if sub.outbox.try_send(msg).is_ok() {
+                true
+            } else {
+                sub.evicted.store(true, Ordering::Relaxed);
+                false
+            }
         });
     }
 
@@ -834,5 +888,37 @@ mod tests {
         for forbidden in ["pubkey", "\"ip\"", "client", "peer"] {
             assert!(!lower.contains(forbidden), "NIP-11 leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn a_subscriber_with_a_full_outbox_is_dropped_not_blocked() {
+        use crate::nostr::Event;
+        let server = RelayServer::new(RelayConfig::default());
+        let secp = Secp256k1::new();
+        let kp = bitcoin::secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let ev = Event::build(&secp, &kp, Event::now_for_test(), vec![], &[1, 2, 3]);
+
+        // A subscriber whose bounded queue (capacity 1) is already full: the next fan-out must not block.
+        let (tx, _rx) = mpsc::sync_channel::<String>(1);
+        tx.try_send("prefill".to_owned()).unwrap();
+        let evicted = Arc::new(AtomicBool::new(false));
+        server.subs.lock().unwrap().push(Subscription {
+            conn_id: 1,
+            outbox: tx,
+            sub_id: "s".to_owned(),
+            filter: Filter::default(),
+            evicted: evicted.clone(),
+        });
+
+        server.fan_out(&ev);
+
+        assert!(
+            server.subs.lock().unwrap().is_empty(),
+            "a subscriber whose outbox is full must be dropped, never block fan-out under the lock"
+        );
+        assert!(
+            evicted.load(Ordering::Relaxed),
+            "a dropped-for-full subscriber must be flagged so its connection is closed"
+        );
     }
 }
