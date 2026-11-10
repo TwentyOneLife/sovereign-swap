@@ -79,6 +79,56 @@ pub fn fee_amount_min(
     Ok(Amount::from_sat(proportional.max(FLOOR_SAT)))
 }
 
+/// Fixed epoch for fee-address rotation: 2026-01-01T00:00:00Z. Rotation windows are measured from here.
+const ROTATION_EPOCH: u64 = 1_767_225_600;
+/// Rotation window bounds (design 0018): a randomized 25 to 40 days per window.
+const ROTATION_MIN_DAYS: u64 = 25;
+const ROTATION_SPAN_DAYS: u64 = 16; // windows are 25..=40 days inclusive
+
+/// The current fee address from a pre-baked rotating set (design 0018, offline rotation), chosen by the
+/// wall-clock time with no network call. The schedule is deterministic: windows of a randomized 25 to
+/// 40 days run from a fixed epoch, and each window advances one step through the set, cycling. The
+/// per-window length is derived from a seed hashed from the set itself, so every install computes the
+/// same current address with no extra configuration. `None` for an empty set (the caller then falls
+/// back to its single configured address). Rotation only blunts passive on-chain clustering; the
+/// addresses are public in offers, so this is hygiene, not privacy (see 0018).
+pub fn rotating_fee_address(addrs: &[String], now_secs: u64) -> Option<&str> {
+    const DAY: u64 = 86_400;
+    if addrs.is_empty() {
+        return None;
+    }
+    // Stable FNV-1a seed from the set, so the window schedule needs no stored state and is identical
+    // on every install that ships the same set.
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    for a in addrs {
+        for b in a.as_bytes() {
+            seed ^= u64::from(*b);
+            seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    // Walk pseudo-random windows from the epoch until the one that contains `now`; its index (mod set
+    // length) is the current address. A swap built before the epoch uses the first address.
+    let mut start = ROTATION_EPOCH;
+    let mut i: u64 = 0;
+    loop {
+        // splitmix64 of (seed + i) gives an unbiased per-window length in [MIN, MIN+SPAN).
+        let mut z = seed.wrapping_add(i).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let window = (ROTATION_MIN_DAYS + z % ROTATION_SPAN_DAYS) * DAY;
+        if now_secs < start.saturating_add(window) {
+            break;
+        }
+        start = start.saturating_add(window);
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break; // unreachable in practice; bounds the walk against a far-future clock
+        }
+    }
+    Some(&addrs[(i % addrs.len() as u64) as usize])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +137,56 @@ mod tests {
         maker_bps: 20,
         taker_bps: 30,
     };
+
+    #[test]
+    fn rotation_empty_set_is_none() {
+        assert_eq!(rotating_fee_address(&[], ROTATION_EPOCH + 1_000_000), None);
+    }
+
+    #[test]
+    fn rotation_single_address_is_constant() {
+        let set = vec!["bc1pone".to_owned()];
+        assert_eq!(rotating_fee_address(&set, ROTATION_EPOCH), Some("bc1pone"));
+        assert_eq!(
+            rotating_fee_address(&set, ROTATION_EPOCH + 9_999 * 86_400),
+            Some("bc1pone")
+        );
+    }
+
+    #[test]
+    fn rotation_is_deterministic_advances_once_per_window_and_cycles() {
+        let set = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let idx = |t: u64| {
+            set.iter()
+                .position(|x| x == rotating_fee_address(&set, t).unwrap())
+                .unwrap()
+        };
+        // Deterministic: the same instant always yields the same address.
+        let t = ROTATION_EPOCH + 10 * 86_400;
+        assert_eq!(rotating_fee_address(&set, t), rotating_fee_address(&set, t));
+        // At the epoch we are in window 0 -> the first address.
+        assert_eq!(idx(ROTATION_EPOCH), 0);
+        // Walk 5 years in daily steps; record each day the address changes.
+        let mut boundaries: Vec<u64> = Vec::new();
+        let mut prev = idx(ROTATION_EPOCH);
+        for d in 1..(5 * 365) {
+            let cur = idx(ROTATION_EPOCH + d * 86_400);
+            if cur != prev {
+                assert_eq!(cur, (prev + 1) % set.len(), "advances exactly one step");
+                boundaries.push(d);
+                prev = cur;
+            }
+        }
+        assert!(boundaries.len() > 10, "several rotations over 5 years");
+        // Every window (from the epoch, then between boundaries) is 25..=40 days.
+        let mut lens = vec![boundaries[0]];
+        for w in boundaries.windows(2) {
+            lens.push(w[1] - w[0]);
+        }
+        for len in lens {
+            assert!((25..=40).contains(&len), "window {len} days out of 25..=40");
+        }
+    }
 
     #[test]
     fn fee_vs_leg_band() {
