@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{Amount, Network, PubkeyHash};
 
-use common::{binaries, Fulcrum, Node};
-use sovereign_swap::electrum::ElectrumBackend;
+use common::{binaries, connect_electrum, Fulcrum, Node};
 use sovereign_swap::htlc::Contract;
 use sovereign_swap::node::ChainBackend;
 
@@ -39,7 +38,7 @@ fn electrum_backend_reads_a_funded_lock_from_a_live_fulcrum() {
     let amount = Amount::from_sat(1_000_000);
     let lock = node.fund(&contract, amount); // funds the contract address + mines 1
 
-    let be = ElectrumBackend::connect("127.0.0.1", fulcrum.port, None, Network::Regtest).unwrap();
+    let be = connect_electrum("127.0.0.1", fulcrum.port, Network::Regtest);
 
     // Let Fulcrum index up to the node's tip (it polls bitcoind every polltime = 1s).
     let tip = node.height() as u32;
