@@ -5,7 +5,9 @@
 mod common;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
+use bitcoin::secp256k1::{Keypair, Secp256k1};
 use bitcoin::Amount;
 use serde_json::json;
 
@@ -142,4 +144,57 @@ fn a_full_swap_routes_over_the_relay() {
             taker.phase()
         );
     }
+}
+
+/// Periodic offer re-announcement (design 0020 decision 2): on its timer `tick` re-broadcasts every
+/// live own offer, so an offer a relay evicted from its bounded store returns and a peer that
+/// subscribes after the eviction can still discover it. A withdrawn offer is not re-announced.
+#[test]
+fn a_live_offer_is_reannounced_on_the_timer_but_a_withdrawn_one_is_not() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let mut maker = Party::new("reann-maker", 11, 101, &relay, &core, &knots);
+
+    // Count the maker's broadcasts by polling the relay as a key that is not the maker's own (the
+    // relay never returns a subscriber its own events). Offers and withdrawals are both broadcasts.
+    let secp = Secp256k1::new();
+    let other = Keypair::from_seckey_slice(&secp, &[9u8; 32])
+        .unwrap()
+        .x_only_public_key()
+        .0;
+    let count = || relay.query(0, &other).0.len();
+
+    maker.engine.publish(offer()).unwrap();
+    assert_eq!(count(), 1, "publish broadcasts the offer once");
+
+    // Before the period elapses, a tick must not re-announce.
+    maker
+        .engine
+        .set_reannounce_interval(Duration::from_secs(3600));
+    maker.tick();
+    assert_eq!(count(), 1, "no re-announce before the period elapses");
+
+    // Once the period has elapsed (zero), a tick re-announces the live offer.
+    maker.engine.set_reannounce_interval(Duration::ZERO);
+    maker.tick();
+    assert_eq!(count(), 2, "a live offer is re-announced after the period");
+
+    // Withdrawing removes it from own_offers (and broadcasts one Withdraw), so later ticks never
+    // re-announce it again.
+    maker.engine.withdraw(offer().id).unwrap();
+    let after_withdraw = count();
+    maker.tick();
+    maker.tick();
+    assert_eq!(
+        count(),
+        after_withdraw,
+        "a withdrawn offer is never re-announced"
+    );
 }
