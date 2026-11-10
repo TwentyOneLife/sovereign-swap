@@ -92,13 +92,21 @@ Adoption then happens in two places:
   transition is explicit here), clears the marker, and drives the `self.keys` refund. This closes
   #134's real path.
 
-### Bound: when to give up the watch
+### Bound: when to give up the watch (implemented 2026-11-10)
 
-Drop `expected_lock_txid` when the expected lock is not on chain and a PSBT input has been spent by
-another transaction (the precise "can never confirm" signal), checked with `gettxout` on the funding
-node's `rpc` (which `ChainNode` already holds, so no new backend trait), with a block-height cap as a
-backstop. After that the swap is a plain `Abandoned`; the deterministic per-swap keys keep a manual
-rescue possible even then.
+Implemented as a block-height horizon: the swap stamps the own-chain height at park
+(`watch_from_height`), and the terminal watch gives up (drops `expected_lock_txid`) once the own chain
+is `ADOPT_WATCH_CAP_BLOCKS` (default 1008, ~1 week of BTC blocks; test-settable) past it. This bounds
+the walk-away DoS: a counterparty that bids and walks away leaves a marker watched for at most the
+horizon, not forever.
+
+The horizon, not the originally-planned input-spent check, is the operative bound here, for two
+reasons found while implementing: (1) the input-spent "can never confirm" signal never fires for the
+walk-away case, because a user who simply vanishes leaves the funding inputs unspent; (2) the thin
+client reads over Electrum (design 0016), which has no `gettxout`, so an input-spent check needs a new
+`ChainBackend` method, whereas the height is already available on both backends. The input-spent drop
+(give up sooner when the user provably re-spent the inputs elsewhere) stays a later refinement. After
+give-up the swap is a plain `Abandoned`; the deterministic per-swap keys keep a manual rescue possible.
 
 ### Deferred (not in this change)
 

@@ -1198,3 +1198,90 @@ fn a_taker_refuses_an_offer_whose_fee_is_unacceptable() {
 
     let _ = std::fs::remove_dir_all(&tdir);
 }
+
+/// Design 0019 bound (DoS): the terminal watch on a handed-out, abandoned lock is not kept forever.
+/// Past the own-chain horizon the engine drops the marker, so a counterparty that bids and walks away
+/// cannot leave a marker watched indefinitely. With a low cap, after the chain passes the horizon a
+/// lock the user broadcasts late is NOT adopted and the swap stays Abandoned (manual rescue only,
+/// since the per-swap keys are deterministic).
+#[test]
+fn the_adopt_watch_gives_up_past_the_horizon() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser"]));
+    let user = core.rpc.wallet("takeruser");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-ihorizon-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-ihorizon-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+    taker.set_adopt_watch_cap_blocks(5); // a short horizon for the test
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    let (_swap_id, parked) = drive_until_parked(&mut maker, &mut taker, &core, &knots);
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+
+    // The user walks away. Push past the taker's lock deadline so it abandons, then drive its own
+    // (BTC) chain well past the 5-block watch horizon with no lock broadcast.
+    knots.mine(160);
+    for _ in 0..20 {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+    }
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Abandoned),
+        "the swap abandoned and the watch passed its horizon before any broadcast"
+    );
+
+    // The user finally broadcasts, but too late: the watch has already given up, so the lock is not
+    // adopted and the swap stays Abandoned.
+    let fin = core.call("finalizepsbt", json!([signed_psbt]));
+    let hex = fin["hex"].as_str().expect("the finalized funding tx hex");
+    core.call("sendrawtransaction", json!([hex]));
+    core.mine(1);
+    for _ in 0..30 {
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        assert_eq!(
+            taker.swaps().next().map(|s| s.phase),
+            Some(Phase::Abandoned),
+            "past the horizon a late lock is not adopted; the swap stays abandoned"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}

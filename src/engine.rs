@@ -75,6 +75,13 @@ fn fee_amount_or_none(
 /// pre-M1 legacy offer with no `Withdraw` - cannot linger in discovery forever.
 const SEEN_OFFER_TTL_SECS: u64 = 7 * 24 * 3600;
 
+/// How many own-chain blocks the engine keeps watching a handed-out, then abandoned, Interactive lock
+/// for the user to broadcast before it gives up (design 0019 bound). ~1 week of BTC blocks: long
+/// enough for a realistically late broadcast, bounded so a counterparty that bids and walks away cannot
+/// leave a marker watched forever. The precise "inputs spent, can never confirm" drop is a later
+/// refinement; this horizon is what bounds the walk-away case (where the inputs stay unspent).
+const ADOPT_WATCH_CAP_BLOCKS: u32 = 1008;
+
 /// Drop discovered offers not re-seen within `SEEN_OFFER_TTL_SECS` (and their timestamps). Any offer
 /// with no timestamp yet - a legacy entry loaded from state written before `seen_at` existed - is
 /// stamped with `now` so it ages from load rather than lingering forever. Pure, so it is unit-tested
@@ -144,6 +151,12 @@ pub struct Record {
     /// `serde(default)`.
     #[serde(default)]
     pub expected_lock_txid: Option<Txid>,
+    /// The own-chain height when the swap parked on the handed-out PSBT (design 0019). It bounds the
+    /// terminal watch: once the chain is `adopt_watch_cap_blocks` past this, the engine stops watching
+    /// a handed-out lock that never appeared, so a counterparty that bids and walks away cannot leave
+    /// an unboundedly-watched marker. Cleared with `expected_lock_txid`. Absent in older records.
+    #[serde(default)]
+    pub watch_from_height: Option<u32>,
     /// The voluntary fee output's share and proof, stored with the lock so a restart resends the
     /// same proof to the counterparty (design 0010). `None` when no fee is due. Absent in older
     /// records, hence `serde(default)`.
@@ -256,6 +269,9 @@ pub struct Engine<T: Transport> {
     /// address. Set by the daemon from `fee_<chain>_address` + the rotating set.
     fee_known_btc: Vec<String>,
     fee_known_xbtc: Vec<String>,
+    /// How many own-chain blocks the engine keeps watching a handed-out, abandoned lock for before it
+    /// gives up (design 0019 bound). Defaults to [`ADOPT_WATCH_CAP_BLOCKS`]; a test may lower it.
+    adopt_watch_cap_blocks: u32,
     state: State,
     records: Vec<Record>,
     /// Tests only: drop this many broadcasts instead of sending them.
@@ -302,6 +318,7 @@ impl<T: Transport> Engine<T> {
             fee_take_max_bps: 0,
             fee_known_btc: Vec::new(),
             fee_known_xbtc: Vec::new(),
+            adopt_watch_cap_blocks: ADOPT_WATCH_CAP_BLOCKS,
             state,
             records,
             drop_broadcasts: 0,
@@ -365,6 +382,11 @@ impl<T: Transport> Engine<T> {
         self.fee_take_max_bps = max_bps;
         self.fee_known_btc = known_btc;
         self.fee_known_xbtc = known_xbtc;
+    }
+
+    /// Lowers the handed-out-lock watch horizon (design 0019 bound) from its block default, for tests.
+    pub fn set_adopt_watch_cap_blocks(&mut self, blocks: u32) {
+        self.adopt_watch_cap_blocks = blocks;
     }
 
     /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
@@ -995,6 +1017,7 @@ impl<T: Transport> Engine<T> {
             funding: None,
             pending_lock_psbt: None,
             expected_lock_txid: None,
+            watch_from_height: None,
             fee: None,
             received_fee: None,
             spend_fee_sat: None,
@@ -1224,6 +1247,7 @@ impl<T: Transport> Engine<T> {
         self.records[i].funding = Some(tx);
         self.records[i].pending_lock_psbt = None;
         self.records[i].expected_lock_txid = None;
+        self.records[i].watch_from_height = None;
         self.save(&self.records[i])?;
         Ok(true)
     }
@@ -1237,10 +1261,43 @@ impl<T: Transport> Engine<T> {
         // the Refunding transition is made here explicitly); otherwise there is nothing to drive yet,
         // so keep watching. decide's own deadline logic keeps the refund safe.
         if self.records[i].swap.phase == Phase::Abandoned {
-            if self.adopt_own_lock(i, &view)? {
+            // Adopt ANY lock on our contract refund-only (design 0019). The expected lock OR a
+            // look-alike (a different txid, e.g. the user re-funded in their wallet) is still our HTLC,
+            // refundable only by self.keys; the swap already abandoned, so decide drives it to a refund.
+            // We must not let the watch horizon drop the marker while our contract is funded, or that
+            // coin is stranded (the #134 hazard, with a timer).
+            let own_lock_txid = match self.records[i].swap.role {
+                Role::Maker => view.maker_lock.as_ref(),
+                Role::Taker => view.taker_lock.as_ref(),
+            }
+            .map(|lock| lock.outpoint.txid);
+            if let Some(txid) = own_lock_txid {
+                let own_chain = match self.records[i].swap.role {
+                    Role::Maker => self.records[i].swap.offer.maker_chain,
+                    Role::Taker => self.records[i].swap.offer.maker_chain.other(),
+                };
+                let tx = self.backend(own_chain).get_tx(txid)?;
+                self.records[i].funding = Some(tx);
+                self.records[i].expected_lock_txid = None;
+                self.records[i].watch_from_height = None;
                 self.records[i].swap.phase = Phase::Refunding;
                 self.save(&self.records[i])?;
+                // fall through to decide -> self.keys refund
             } else {
+                // Our contract is unfunded. Keep watching, but bounded (design 0019): once the own chain
+                // is past the horizon the user never broadcast, so drop the marker and stop watching, so
+                // a counterparty that bids and walks away cannot leave a marker watched forever.
+                let own_height = match self.records[i].swap.role {
+                    Role::Maker => view.maker_chain_height,
+                    Role::Taker => view.taker_chain_height,
+                };
+                if let Some(from) = self.records[i].watch_from_height {
+                    if own_height > from.saturating_add(self.adopt_watch_cap_blocks) {
+                        self.records[i].expected_lock_txid = None;
+                        self.records[i].watch_from_height = None;
+                        self.save(&self.records[i])?;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -1276,11 +1333,25 @@ impl<T: Transport> Engine<T> {
             } else if matches!(self.records[i].swap.phase, Phase::Done | Phase::Refunded) {
                 self.records[i].pending_lock_psbt = None;
                 self.records[i].expected_lock_txid = None;
+                self.records[i].watch_from_height = None;
             }
         }
         self.save(&self.records[i])?;
         for action in actions {
             self.act(i, action)?;
+        }
+        // Stamp the watch horizon (design 0019) once a swap has parked (act set `pending_lock_psbt`),
+        // from the view height, so the bounded terminal watch counts from a synced height consistent
+        // with the give-up comparison (not a possibly-lagging backend read at park time).
+        if self.records[i].pending_lock_psbt.is_some()
+            && self.records[i].watch_from_height.is_none()
+        {
+            let own_height = match self.records[i].swap.role {
+                Role::Maker => view.maker_chain_height,
+                Role::Taker => view.taker_chain_height,
+            };
+            self.records[i].watch_from_height = Some(own_height);
+            self.save(&self.records[i])?;
         }
         Ok(())
     }
@@ -1382,7 +1453,8 @@ impl<T: Transport> Engine<T> {
                         Err(NodeError::AwaitingSignature { psbt }) => {
                             // Record the expected lock txid as a watch that outlives the prompt
                             // (design 0019), so a lock the user broadcasts, even after the swap later
-                            // abandons, is still recognised and refunded.
+                            // abandons, is still recognised and refunded. The watch horizon is stamped
+                            // in advance() from the view height (consistent with the give-up check).
                             self.records[i].expected_lock_txid = Some(funding_psbt_txid(&psbt)?);
                             self.records[i].pending_lock_psbt = Some(psbt);
                             self.save(&self.records[i])?;
