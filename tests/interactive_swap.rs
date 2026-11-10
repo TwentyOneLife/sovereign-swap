@@ -1285,3 +1285,214 @@ fn the_adopt_watch_gives_up_past_the_horizon() {
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
 }
+
+/// Security (fee verification, design 0010): a counterparty whose lock does not carry the agreed fee
+/// must be rejected before we commit coin. A "malicious" maker is simulated with a high `min_trade_sat`
+/// so its own engine deems its leg below the minimum trade and omits the fee output; the honest taker
+/// (default minimum) requires it, verifies the maker's lock, sees the fee missing, and abandons WITHOUT
+/// locking its own BTC - so it never pays into a swap whose agreed fee the maker dodged.
+#[test]
+fn an_honest_taker_abandons_a_maker_that_skips_the_fee() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let btc_fee: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee: String = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-feedodge-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-feedodge-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_plain(&mdir, "maker", (11, 101), &relay, &core, &knots);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+    // Malicious maker: a high minimum trade makes its engine treat its 500k xBTC leg as below-minimum,
+    // so it locks WITHOUT the agreed fee output. The taker keeps the default minimum and requires it.
+    maker.set_min_trade_sat(1_000_000);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .unwrap();
+
+    // The maker locks xBTC with no fee; the honest taker verifies, finds the agreed fee missing, and
+    // abandons without locking.
+    let mut rounds = 0;
+    while taker.swaps().next().map(|s| s.phase) != Some(Phase::Abandoned) {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "the taker did not reject a fee-dodging maker: taker {:?}, maker {:?}",
+            taker.swaps().next().map(|s| s.phase),
+            maker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Security (fee verification, design 0010), maker side: the honest maker must NEVER reveal the secret
+/// to a counterparty that locked without the agreed fee. A "malicious" taker is simulated with a high
+/// `min_trade_sat` so its engine deems its BTC leg below-minimum and locks with no fee output; the honest
+/// maker (default minimum) requires that fee, verifies the taker's lock before the claim, finds it
+/// missing, and refuses to reveal - it refunds its own xBTC at the timelock instead. The griefed maker
+/// loses nothing (its coin returns); the critical property is that the secret is never exposed to a
+/// fee-dodger, so neither side can claim.
+#[test]
+fn an_honest_maker_never_reveals_to_a_taker_that_skips_the_fee() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let btc_fee: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee: String = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-mkfeedodge-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-mkfeedodge-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_plain(&mdir, "maker", (11, 101), &relay, &core, &knots);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+    // Malicious taker: a high minimum trade makes its engine treat its BTC leg as below-minimum, so it
+    // locks WITHOUT the agreed fee. The honest maker keeps the default minimum and requires it.
+    taker.set_min_trade_sat(1_000_000);
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [7; 16])
+        .unwrap();
+
+    // Drive to the maker's refund. The maker locks xBTC with its fee; the taker locks BTC without one;
+    // the maker verifies the taker's lock, finds the fee missing, and never reveals. At no point may the
+    // maker reach a claiming/settled phase - that would mean it exposed the secret to a fee-dodger.
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Refunded) {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        let mp = maker.swaps().next().map(|s| s.phase);
+        assert!(
+            mp != Some(Phase::Claiming) && mp != Some(Phase::Done),
+            "the maker revealed the secret to a fee-dodging taker: maker {mp:?}"
+        );
+        rounds += 1;
+        assert!(
+            rounds < 120,
+            "the maker did not refund after refusing a fee-dodging taker: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    // The taker genuinely locked its BTC (feelessly) and got it back at its own timelock - this rules out
+    // the confound where the maker refunds merely because the taker never funded. A refund is only
+    // reachable from a funded lock, so reaching it proves the taker did lock.
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Refunded),
+        "the fee-dodging taker should have locked and then refunded its own coin"
+    );
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
