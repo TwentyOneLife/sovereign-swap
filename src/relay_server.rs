@@ -44,9 +44,19 @@ pub struct RelayConfig {
     /// The most events that may queue for one subscriber before further fan-out to it is dropped. Bounds
     /// the memory a subscriber that stops reading can pin; a healthy client drains continuously.
     pub max_outbox_events: usize,
-    /// Events older than this (by `created_at`) are not stored or served.
+    /// Broadcast offers (events with no `p` tag): events older than this are not stored or served.
     pub retention_secs: u64,
+    /// Broadcast offers: maximum event count.
     pub store_cap: usize,
+    /// Broadcast offers: maximum total bytes (memory bound).
+    pub max_store_bytes: usize,
+    /// Directed messages (events with a `p` recipient tag) are held in a separate store with its own
+    /// count, byte and retention budgets, so a flood of directed events cannot evict offers. Directed
+    /// messages are also delivered to live subscribers by fan-out; the store copy only serves a
+    /// recipient who reconnects within the swap window, so a shorter retention is enough.
+    pub directed_store_cap: usize,
+    pub directed_store_bytes: usize,
+    pub directed_retention_secs: u64,
     /// Run the optional price proxy (#106): fetch the nonkyc BTCB2/BTC ticker over clearnet and serve
     /// it in the NIP-11 document for clients to read over Tor. Off by default; the operator opts in.
     pub price_proxy: bool,
@@ -66,9 +76,26 @@ impl Default for RelayConfig {
             max_outbox_events: 512,
             retention_secs: 7 * 24 * 3600,
             store_cap: 100_000,
+            max_store_bytes: 64 * 1024 * 1024,
+            directed_store_cap: 20_000,
+            directed_store_bytes: 32 * 1024 * 1024,
+            directed_retention_secs: 24 * 3600,
             price_proxy: false,
         }
     }
+}
+
+/// The on-the-wire size (bytes) an event occupies, used for the byte budget. The relay already bounds a
+/// single event by `max_event_bytes` against this same JSON length, so the two budgets are in step.
+fn event_size(e: &Event) -> usize {
+    e.to_json().len()
+}
+
+/// An event is directed (addressed to one recipient) if it carries a `p` tag; otherwise it is a
+/// broadcast offer. The two classes are stored separately with separate budgets, so a flood of one
+/// class cannot evict the other.
+fn is_directed(e: &Event) -> bool {
+    e.tags.iter().any(|t| t.len() >= 2 && t[0] == "p")
 }
 
 struct Store {
@@ -76,11 +103,27 @@ struct Store {
     /// Event ids currently in `events`, kept in step with it, so dedupe is O(1) instead of a scan of the
     /// whole store under the lock on every accepted event.
     ids: HashSet<[u8; 32]>,
+    /// Running sum of `event_size` over `events`, so the byte budget is enforced without a rescan.
+    bytes: usize,
     cap: usize,
+    /// Total bytes this store may hold. Bounds memory regardless of event count: a store full of
+    /// maximum-size events would otherwise pin cap * max_event_bytes of RAM.
+    max_bytes: usize,
     retention: u64,
 }
 
 impl Store {
+    fn new(cap: usize, max_bytes: usize, retention: u64) -> Store {
+        Store {
+            events: VecDeque::new(),
+            ids: HashSet::new(),
+            bytes: 0,
+            cap,
+            max_bytes,
+            retention,
+        }
+    }
+
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -96,12 +139,22 @@ impl Store {
         if self.ids.contains(&event.id) {
             return false;
         }
-        while self.events.len() >= self.cap {
+        let sz = event_size(&event);
+        // Evict oldest-first until BOTH the count cap and the byte budget admit the new event. The
+        // non-empty guard stops an event larger than the whole budget from looping forever (it is still
+        // bounded by `max_event_bytes`, which should be <= `max_bytes`).
+        while self.events.len() >= self.cap
+            || (self.bytes + sz > self.max_bytes && !self.events.is_empty())
+        {
             if let Some(old) = self.events.pop_front() {
                 self.ids.remove(&old.id);
+                self.bytes -= event_size(&old);
+            } else {
+                break;
             }
         }
         self.ids.insert(event.id);
+        self.bytes += sz;
         self.events.push_back(event);
         true
     }
@@ -219,7 +272,10 @@ impl Stats {
 
 pub struct RelayServer {
     cfg: RelayConfig,
-    store: Arc<Mutex<Store>>,
+    /// Broadcast offers (no `p` tag).
+    offers: Arc<Mutex<Store>>,
+    /// Directed messages (`p`-tagged). Separate budgets so a directed flood cannot evict offers.
+    directed: Arc<Mutex<Store>>,
     subs: Arc<Mutex<Vec<Subscription>>>,
     connections: Arc<AtomicUsize>,
     stats: Arc<Stats>,
@@ -230,15 +286,16 @@ pub struct RelayServer {
 
 impl RelayServer {
     pub fn new(cfg: RelayConfig) -> RelayServer {
-        let store = Store {
-            events: VecDeque::new(),
-            ids: HashSet::new(),
-            cap: cfg.store_cap,
-            retention: cfg.retention_secs,
-        };
+        let offers = Store::new(cfg.store_cap, cfg.max_store_bytes, cfg.retention_secs);
+        let directed = Store::new(
+            cfg.directed_store_cap,
+            cfg.directed_store_bytes,
+            cfg.directed_retention_secs,
+        );
         RelayServer {
             cfg,
-            store: Arc::new(Mutex::new(store)),
+            offers: Arc::new(Mutex::new(offers)),
+            directed: Arc::new(Mutex::new(directed)),
             subs: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(AtomicUsize::new(0)),
             stats: Arc::new(Stats::new()),
@@ -267,6 +324,11 @@ impl RelayServer {
             "swap_relay": {
                 "allowed_kinds": self.cfg.allowed_kinds,
                 "retention_secs": self.cfg.retention_secs,
+                "offers_store_cap": self.cfg.store_cap,
+                "offers_store_bytes": self.cfg.max_store_bytes,
+                "directed_store_cap": self.cfg.directed_store_cap,
+                "directed_store_bytes": self.cfg.directed_store_bytes,
+                "directed_retention_secs": self.cfg.directed_retention_secs,
                 "max_connections": self.cfg.max_connections,
                 "uptime_secs": Store::now().saturating_sub(s.started_at),
                 "connections_now": self.connections.load(Ordering::Relaxed),
@@ -513,14 +575,19 @@ impl RelayServer {
                 }
                 let sub_id = v.get(1).and_then(Value::as_str).unwrap_or("").to_owned();
                 let filter = v.get(2).map(Filter::parse).unwrap_or_default();
-                // Collect under the lock, then release it BEFORE sending: a `for` over the locked
-                // expression would hold the store guard across every network write, so one non-reading
-                // REQ client (a stalled `ws.send`) would freeze publishing relay-wide.
-                let hits = self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .matching(&filter, self.cfg.max_req_events);
+                // Collect under each lock, release BEFORE sending: a `for` over the locked expression
+                // would hold the store guard across every network write, so one non-reading REQ client
+                // (a stalled `ws.send`) would freeze publishing relay-wide. Query both class stores and
+                // merge: each store is capped at `max_req_events` (so clones stay bounded at 2x that),
+                // then we keep the newest `effective` across both to honour the client's `limit`.
+                let max = self.cfg.max_req_events;
+                let mut hits = self.offers.lock().unwrap().matching(&filter, max);
+                hits.extend(self.directed.lock().unwrap().matching(&filter, max));
+                hits.sort_by_key(|e| e.created_at);
+                let effective = filter.limit.map_or(max, |l| l.min(max));
+                if hits.len() > effective {
+                    hits = hits.split_off(hits.len() - effective);
+                }
                 for event in hits {
                     let _ = ws.send(WsMessage::Text(
                         format!(r#"["EVENT","{sub_id}",{}]"#, event.to_json()).into(),
@@ -581,11 +648,17 @@ impl RelayServer {
             bump(&s.rejected_bad_sig);
             return ok(&id, false, "invalid: bad id or signature");
         }
-        if !self.store.lock().unwrap().fresh(&event) {
+        // Route by class: offers and directed messages have separate stores and budgets.
+        let store = if is_directed(&event) {
+            &self.directed
+        } else {
+            &self.offers
+        };
+        if !store.lock().unwrap().fresh(&event) {
             bump(&s.rejected_stale);
             return ok(&id, false, "invalid: outside retention window");
         }
-        if !self.store.lock().unwrap().insert(event.clone()) {
+        if !store.lock().unwrap().insert(event.clone()) {
             bump(&s.events_duplicate);
             return ok(&id, true, "duplicate");
         }

@@ -4,6 +4,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::secp256k1::{Keypair, Secp256k1};
 use tungstenite::{connect, Message as WsMessage};
 
@@ -581,5 +582,87 @@ fn a_subscriber_whose_outbox_overflows_is_disconnected() {
     assert!(
         wait_closed(&mut sub, Duration::from_secs(6)),
         "an overflowed subscriber was left connected but deaf instead of being disconnected"
+    );
+}
+
+#[test]
+fn the_store_evicts_by_byte_budget() {
+    // A small offer byte budget with a high count cap: a few large events must be evicted by BYTES,
+    // long before the count cap would fire. (#149 gap 1a: bound memory, not just event count.)
+    let cfg = RelayConfig {
+        max_events_per_min: 100_000,
+        max_store_bytes: 250_000,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    fill_big(&url, 50, 10, 50_000); // ten ~100 KB-JSON offers; the 250 KB budget holds only a couple
+
+    let mut c = raw(&url);
+    c.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    let events = out.iter().filter(|l| l.starts_with(r#"["EVENT""#)).count();
+    assert!(events >= 1, "the store dropped everything");
+    assert!(
+        events < 10,
+        "byte budget not enforced: all {events} large events were retained"
+    );
+}
+
+#[test]
+fn a_directed_flood_does_not_evict_offers() {
+    // The directed store is tiny; a directed flood churns only itself and must not evict the offer,
+    // which lives in its own store. (#149 gap 1b: partition offers from directed messages.)
+    // Small offer cap too, so that IF partitioning were broken (directed routed into the offer store)
+    // the directed flood would overflow it and evict the offer. With partitioning, the offer store only
+    // ever holds the one offer.
+    let cfg = RelayConfig {
+        max_events_per_min: 100_000,
+        store_cap: 5,
+        directed_store_cap: 3,
+        ..RelayConfig::default()
+    };
+    let url = relay(cfg);
+    let secp = Secp256k1::new();
+
+    let offer = Event::build(&secp, &key(60), Event::now_for_test(), vec![], &[1, 2, 3]);
+    let offer_id = offer.id.to_hex_string(Case::Lower);
+    let mut o = raw(&url);
+    o.send(WsMessage::Text(
+        format!(r#"["EVENT",{}]"#, offer.to_json()).into(),
+    ))
+    .unwrap();
+    drain(&mut o);
+
+    // Flood directed (p-tagged) events far past the directed cap.
+    let route = key(61).x_only_public_key().0;
+    let mut d = raw(&url);
+    for i in 0..30u8 {
+        let ev = Event::build(
+            &secp,
+            &key(62),
+            Event::now_for_test(),
+            vec![p_tag(&route)],
+            &[i],
+        );
+        d.send(WsMessage::Text(
+            format!(r#"["EVENT",{}]"#, ev.to_json()).into(),
+        ))
+        .unwrap();
+    }
+    drain(&mut d);
+
+    // The offer must still be served.
+    let mut c = raw(&url);
+    c.send(WsMessage::Text(
+        format!(r#"["REQ","s",{{"kinds":[{KIND_SWAP}]}}]"#).into(),
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert!(
+        out.iter().any(|l| l.contains(&offer_id)),
+        "a directed-message flood evicted the offer from the separate offer store"
     );
 }
