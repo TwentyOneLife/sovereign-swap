@@ -245,6 +245,17 @@ pub struct Engine<T: Transport> {
     /// the daemon sets it from the operator's configured `max_swap_sat`. Enforced locally at bid time
     /// (and at offer creation in the daemon), never in counterparty verification.
     max_swap_sat: u64,
+    /// Take-side fee policy (design 0018 / security). `0` is off (the default, so the core and tests
+    /// are unaffected); the daemon sets it from the operator's config. When set, a taken offer whose
+    /// `taker_bps` exceeds this cap is refused, protecting the taker from a malicious maker on the
+    /// public relay charging a large "fee". Local refusal, never counterparty verification.
+    fee_take_max_bps: u16,
+    /// The fee addresses the operator accepts a taken offer to pay (its own configured set, per chain).
+    /// Empty means no address restriction. When non-empty, a taken offer whose fee address for the
+    /// chain we lock is not in the set is refused, so the taker never pays a "fee" to an attacker's
+    /// address. Set by the daemon from `fee_<chain>_address` + the rotating set.
+    fee_known_btc: Vec<String>,
+    fee_known_xbtc: Vec<String>,
     state: State,
     records: Vec<Record>,
     /// Tests only: drop this many broadcasts instead of sending them.
@@ -288,6 +299,9 @@ impl<T: Transport> Engine<T> {
             min_swap_sat: crate::swap::MIN_SWAP_AMOUNT.to_sat(),
             min_trade_sat: crate::fee::MIN_TRADE_SAT,
             max_swap_sat: u64::MAX,
+            fee_take_max_bps: 0,
+            fee_known_btc: Vec::new(),
+            fee_known_xbtc: Vec::new(),
             state,
             records,
             drop_broadcasts: 0,
@@ -335,6 +349,22 @@ impl<T: Transport> Engine<T> {
     /// right after [`Engine::open`] from the operator's configured `max_swap_sat`.
     pub fn set_max_swap_sat(&mut self, max_swap_sat: u64) {
         self.max_swap_sat = max_swap_sat;
+    }
+
+    /// Sets the take-side fee policy (security): a cap on a taken offer's `taker_bps`, and the fee
+    /// addresses the operator accepts for each chain (its own configured set). The daemon calls this
+    /// right after [`Engine::open`] from the operator's config, so the taker refuses an offer that
+    /// would charge a large fee, or a fee to an address it does not recognise, on the public relay.
+    /// `max_bps = 0` and empty sets leave the policy off.
+    pub fn set_fee_take_policy(
+        &mut self,
+        max_bps: u16,
+        known_btc: Vec<String>,
+        known_xbtc: Vec<String>,
+    ) {
+        self.fee_take_max_bps = max_bps;
+        self.fee_known_btc = known_btc;
+        self.fee_known_xbtc = known_xbtc;
     }
 
     /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
@@ -692,7 +722,7 @@ impl<T: Transport> Engine<T> {
         // never disagree over the offer.
         if let Some(terms) = &offer.fee {
             let taker_chain = offer.maker_chain.other();
-            if terms.address(taker_chain).is_some() {
+            if let Some(addr) = terms.address(taker_chain) {
                 let rates = FeeRates {
                     maker_bps: terms.maker_bps,
                     taker_bps: terms.taker_bps,
@@ -703,6 +733,20 @@ impl<T: Transport> Engine<T> {
                     if fee::fee_exceeds_band(fee, taker_part) {
                         return Err(EngineError::Bid(BidError::FeeTooHigh));
                     }
+                }
+                // Take-side fee policy (security). The offer's fee rate and address are chosen by the
+                // maker, who on the public relay may be hostile: cap the taker fee and require the fee
+                // address for the chain we lock to be one the operator recognises, so we never pay a
+                // large "fee" to an attacker's address. Off by default; the daemon sets it from config.
+                if self.fee_take_max_bps > 0 && terms.taker_bps > self.fee_take_max_bps {
+                    return Err(EngineError::Bid(BidError::FeeTooHigh));
+                }
+                let known = match taker_chain {
+                    Chain::Btc => &self.fee_known_btc,
+                    Chain::Xbtc => &self.fee_known_xbtc,
+                };
+                if !known.is_empty() && !known.iter().any(|k| k == addr) {
+                    return Err(EngineError::Bid(BidError::FeeAddressNotAccepted));
                 }
             }
         }
