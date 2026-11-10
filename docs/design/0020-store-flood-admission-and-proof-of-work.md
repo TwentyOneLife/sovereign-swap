@@ -1,6 +1,8 @@
 # 0020 Store-flood admission and proof of work (abuse deterrence, 0007 item 2)
 
-Status: proposal, 2026-11-10. Not accepted; the owner decisions are listed at the end. Addresses gap 2
+Status: proposal, 2026-11-10. Phase 1 (decision 1) shipped in #153; the periodic re-announce
+(decision 2) shipped separately; phase 2 proof of work (decisions 3 and 4) is still open. The owner
+decisions are listed at the end. Addresses gap 2
 of the #149 relay-flood audit, the one gap the per-connection controls in #150 and #151 cannot close.
 Builds on [0006](0006-nostr-client-and-relay.md) (Nostr transport) and
 [0007](0007-abuse-deterrence-no-fund-freezing.md) item 2 (proof of work). Leaves 0007 as written.
@@ -24,11 +26,14 @@ already in place soften it:
 - **Live subscribers are served by fan-out, not the store.** A taker already connected and subscribed
   receives a new offer as it is published, regardless of the store. Eviction only hurts a taker who
   subscribes *after* the offer was pushed out and before the maker re-announces.
-- **Re-announcement.** Makers re-announce their live offers when a relay reconnects
-  (`engine.rs` `reconcile_offers` and the reconnect path). NOTE (verify before relying on it): the
-  current code re-announces on reconnect, not on a periodic timer, so an evicted offer returns only at
-  the maker's next reconnect, which can be far off. A cheap periodic re-announce (phase 1 below) would
-  make eviction self-healing and is the single highest-value change here.
+- **Re-announcement.** VERIFIED (2026-11-10): nothing re-announced a live offer before this design.
+  A reconnect only re-subscribes (`src/ws.rs`), it does not re-publish; `engine.rs` `reconcile_offers`
+  runs once at open and only drops taken offers. So an evicted offer never returned on its own, and a
+  taker who subscribed after the eviction never discovered it. This is now fixed: `Engine::tick`
+  re-announces our own live offers on a timer (`REANNOUNCE_INTERVAL`, 5 min), making eviction
+  self-healing. Each re-send is a fresh event, so a relay's id-dedupe does not drop it and a
+  reconnecting peer's `since` watermark does not hide it; peer handling of a repeated offer is already
+  idempotent, so there is no wire change. This was the single highest-value change here (decision 2).
 
 So this is an availability and discovery problem, not a custody one. That argues for cheap relay-side
 mitigations first and for treating proof of work as a limited, later deterrent rather than a fix.
@@ -146,9 +151,15 @@ re-announcement, and the 0007 backstop that no flood ever costs a coin.
 ## Owner decisions
 
 1. Approve phase 1 (byte-bounded store + class partition + shorter directed retention) as a near-term,
-   no-wire-change change? (Recommended: yes.)
+   no-wire-change change? (Recommended: yes.) DECIDED yes; shipped in #153.
 2. Add a periodic offer re-announce so an evicted offer self-heals? (Recommended: yes; confirm the
-   current re-announce is reconnect-only first.)
+   current re-announce is reconnect-only first.) DECIDED yes. On the check: there was no re-announce
+   at all (not reconnect, not periodic); implemented as a 5-minute periodic re-announce in `Engine::tick`.
+   Note the two behaviour changes it brings: a forgotten own offer now keeps advertising until it is
+   withdrawn (before, it quietly stopped being discoverable once relay retention passed), and during a
+   long relay outage periodic re-announces queue on the client's unbounded send channel and flush as one
+   burst on reconnect (self-correcting, since the relay rate-limits and the next period heals any drop).
+   A per-offer max-age and connection-aware gating were considered and left as optional follow-ups.
 3. Pursue phase 2 PoW at all, given the SHA-256 ASIC asymmetry, or stop at phase 1 plus fidelity bonds
    later? (Recommended: defer PoW; revisit only on evidence of real offer-class flooding.)
 4. If PoW is pursued: fixed-per-version difficulty (no client OK-handling change) or teach the client to
