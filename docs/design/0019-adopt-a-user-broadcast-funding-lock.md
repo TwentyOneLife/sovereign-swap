@@ -1,8 +1,9 @@
 # 0019 Adopt a user-broadcast funding lock (Interactive)
 
-Status: design, 2026-11-10. Builds on [0017](0017-user-held-signing-psbt-handoff.md) (Interactive
-funding) and the late-submit guard in PR #133. Resolves issue #134 and the self-broadcast item of #135
-(item 3). Not yet implemented; the current behaviour is to be pinned by red tests first (see below).
+Status: implemented 2026-11-10 (red tests then fix, engine `advance()`). Builds on
+[0017](0017-user-held-signing-psbt-handoff.md) (Interactive funding) and the late-submit guard in PR
+#133. Resolves issue #134 and the self-broadcast item of #135 (item 3). The red tests corrected the
+severity hypothesis below: see "Current behaviour (pinned by the red tests)".
 
 ## Problem
 
@@ -26,20 +27,28 @@ does not change it), and `submit_signed_lock` already matches on same-txid, so t
 engine the exact expected lock txid. The own-side `LockView.outpoint` carries the txid actually seen on
 chain.
 
-## Current behaviour: pin it with red tests before any fix
+## Current behaviour (pinned by the red tests)
 
-Three outcomes are possible for a within-window self-broadcast and the difference sets the severity:
+The red tests (`a_within_window_user_broadcast_lock_is_adopted_and_settles`,
+`a_post_window_user_broadcast_lock_is_adopted_and_refunded`) corrected the feared "taker loses the
+coin" hypothesis. What actually happens on the pre-fix code:
 
-1. GUI stalls only, swap still completes.
-2. Swap stalls and then abandons harmlessly.
-3. The taker loses the coin: `own_funded` stays false, `decide_taker` returns a no-op `Fund` until its
-   deadline, the swap abandons and `advance()` drops the PSBT, while the maker sees the real lock,
-   claims it and reveals the secret, and the abandoned taker never claims back.
+- **Within the funding window:** the swap settles to `Done`. The maker claims the on-chain lock and
+  reveals the secret, and the taker claims the maker's lock with it. The only defect is cosmetic: the
+  parked PSBT lingers until the terminal phase, so the GUI keeps asking the user to sign a lock that is
+  already on chain. Not a loss.
+- **A lock on chain before the swap goes terminal:** already refunded or claimed. `decide` reaches the
+  claim/refund paths off the on-chain `taker_lock`/`maker_lock` in the view, not off `record.funding`,
+  so the on-chain lock is driven regardless of the `own_funded` bookkeeping.
+- **The one genuine loss path is the abandon-then-forget order:** if the engine ticks the parked swap
+  past the funding window with no lock yet, `decide` abandons it and `advance()` drops the PSBT; since
+  `tick()` skips terminal swaps, a lock the user broadcasts *after that* is never observed and is
+  stranded in an HTLC only `self.keys` can refund. This is the #134 hazard, reproduced by the
+  post-window test.
 
-Outcome 3 is a real loss path, so the first task is red tests that reproduce today's behaviour:
-`drive_until_parked`, sign with the simulated user signer, `sendrawtransaction` out of band instead of
-submitting, tick, and assert what happens, for both the within-window and post-abandon cases.
-Interactive is OFF on the live nodes, so this is inert, but the result is recorded.
+So the fix is narrower than first written: not "wire `own_funded` to the observation" (claim/refund
+already work), but (1) clear the parked PSBT when the own lock is observed, and (2) stop terminalising
+and forgetting a parked, handed-out swap.
 
 ## Decision: adopt the lock (resolves #134 alternative (a))
 
@@ -48,55 +57,47 @@ refund. It adds no user step, reuses the observation the engine already makes, a
 
 ### Mechanism
 
-In `advance()` (which is `&mut`, unlike `view`), when the swap has no `record.funding` yet and the
-own-side `lock_view` shows a confirmed lock:
+In `advance()` (which is `&mut`, unlike `view`), while `pending_lock_psbt` is set, two changes:
 
-- **Adopt.** Set `record.funding = get_tx(own_lock.outpoint.txid)`. `get_tx` returns the full signed
-  transaction including witnesses, so the existing reorg path ("the same funding transaction goes out
-  again") rebroadcasts unchanged; there is no need to re-park on a reorg. Clear `pending_lock_psbt`.
-  Then re-take the view so `own_funded` is true, and let `decide` run.
-- **Within the funding window:** the swap proceeds exactly as a normally funded swap. This removes the
-  outcome-3 loss path.
-- **After the window (the swap would otherwise abandon):** transition straight to `Phase::Refunding`
-  and only then run `decide`. It must be refund-only: reviving into a normal phase could let
-  `decide_maker` reveal the secret or either side claim with margins the deadline logic already judged
-  unsafe (the one-side-gets-both race). The refund is the `self.keys` refund at the HTLC timelock. Part
-  of the fix is a check that the `Refunding` arms of `decide_maker`/`decide_taker` never claim and never
-  reveal.
+- **Adopt.** If the own-side `lock_view` (`taker_lock` for a taker, `maker_lock` for a maker) shows a
+  lock, set `record.funding = get_tx(own_lock.outpoint.txid)` and clear `pending_lock_psbt`. `get_tx`
+  returns the full signed transaction including witnesses (read from the watch wallet that
+  `watch_contract` populated), so the existing reorg path ("the same funding transaction goes out
+  again") rebroadcasts unchanged, and the GUI stops asking for a signature. The same `view` is then
+  passed to `decide`: the lock is present in it, so `decide` takes the on-chain-lock path regardless of
+  `own_funded`.
+- **Keep watching.** If no lock was adopted and `decide` moved the swap to `Abandoned`, revert the
+  phase to its value at entry and keep `pending_lock_psbt`, returning without acting. This keeps the
+  swap non-terminal so `tick()` keeps advancing it; when the user's lock later appears it is adopted on
+  that tick.
 
-### Txid match
+**No forced `Phase::Refunding` is needed.** `decide` already handles claim vs refund by the same
+deadline logic a normally funded swap uses: `decide_maker` only reveals the secret while `time_left`
+holds (the #74 margin), and `decide_taker` only claims with a learned secret, so post-window adoption
+cannot trigger the one-side-gets-both race. The earlier "refund-only" plan was unnecessary.
 
-- Expected txid seen on chain: adopt as above.
-- Our contract funded by a different txid (a look-alike, for example one missing the fee output): it is
-  still our HTLC and still only refundable by `self.keys`, so adopt it refund-only rather than strand
-  it, regardless of window.
+### Deferred (not in this change)
 
-### Stop condition (bound)
+- **Stop condition.** The current code keeps watching for as long as the PSBT is parked; a swap the
+  user never acts on therefore stays non-terminal rather than abandoning. The precise "can never
+  confirm" signal (any PSBT input spent by another transaction) would let it give up and drop the PSBT,
+  but it needs a backend outpoint-spent query that does not exist yet. Watching longer is the safe
+  default (it never strands); the per-swap keys are deterministic from `key_index`, so a manual rescue
+  stays possible regardless. Tracked as a follow-up.
+- **Look-alike txid** (our contract funded by a transaction other than the expected one, for example
+  missing the fee output): adopted the same way, since it is still our HTLC; a stricter refund-only
+  treatment is a possible refinement.
+- **Fee bookkeeping.** Deriving `record.fee` from the adopted transaction (which also closes the #135
+  `submit_signed_lock` fee under-report) is a separate #135 item, not this change.
 
-The funding window and the refund timelock do not bound when the user can broadcast; the PSBT can
-confirm any time its inputs are unspent. The precise "can never confirm" signal is any PSBT input spent
-by another transaction. Use that as the stop condition: when an input is spent elsewhere, truly abandon
-and drop `pending_lock_psbt`. Keep a long horizon only as a backstop cap. Because the per-swap keys are
-deterministic from `key_index`, a manual rescue stays possible even after the engine gives up.
+## Tests
 
-### Fee bookkeeping
-
-Under [0018](0018-interactive-funding-and-the-fee-output.md) the default fee address is Normal, so the
-fee output sits on chain in the adopted transaction and can be matched against the offer's fee address.
-Derive `record.fee` from the adopted tx rather than marking it unknown. The same derivation closes the
-separate #135 gap where `submit_signed_lock` never sets `record.fee`, so one change covers both.
-
-## Tests (Sprint 1)
-
-- Red first: current behaviour for within-window and post-abandon self-broadcast (pin outcome 1, 2 or
-  3).
-- Within-window self-broadcast: adopt, pending cleared, swap drives to Done.
-- Post-abandon self-broadcast: adopt refund-only, `self.keys` refund at the timelock, never a claim or
-  reveal.
-- Look-alike txid (missing fee output): adopt refund-only.
-- Input spent elsewhere: abandon and drop the PSBT.
-- Reorg of an adopted lock: the existing rebroadcast path re-sends the adopted transaction.
-- Fee derived from an adopted Normal-fee tx matches the offer address.
+- `a_within_window_user_broadcast_lock_is_adopted_and_settles`: one tick after the lock confirms clears
+  the parked PSBT (prompt adoption), and the swap still settles to `Done`.
+- `a_post_window_user_broadcast_lock_is_adopted_and_refunded`: the engine keeps watching a handed-out
+  PSBT past the window, and when the user broadcasts late the lock is adopted and refunded by
+  `self.keys` (the maker is not driven, so no secret is revealed and only the refund path is possible).
+- The four existing interactive tests and the full suite stay green.
 
 ## Cross-references
 
