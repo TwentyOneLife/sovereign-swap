@@ -29,7 +29,7 @@ use sovereign_swap::policy::Policy;
 use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::signer::InteractiveSigner;
-use sovereign_swap::swap::{Chain, FeeTerms, Offer, Phase};
+use sovereign_swap::swap::{BidError, Chain, FeeTerms, Offer, Phase};
 
 type Tp = RelayTransport<InProcessConn>;
 
@@ -1122,5 +1122,79 @@ fn an_interactive_taker_refund_lands_at_the_user_payout_address() {
     );
 
     let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Security (take-side fee policy): the offer's fee rate and address are chosen by the maker, who on
+/// the public relay may be hostile. With the policy set (as the daemon sets it from the operator's
+/// config), a taker must refuse an offer whose fee for the chain it locks exceeds the cap, or pays an
+/// address the operator does not recognise, so it never pays a large "fee" to an attacker's address.
+#[test]
+fn a_taker_refuses_an_offer_whose_fee_is_unacceptable() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let tdir = std::env::temp_dir().join(format!("sovswap-feepolicy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut taker = open_plain(&tdir, "taker", (22, 202), &relay, &core, &knots);
+
+    // The operator accepts only its own BTC fee address, capped at 100 bps (1%).
+    let known: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attacker: String = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    taker.set_fee_take_policy(100, vec![known.clone()], vec![]);
+
+    // offer() has the maker locking xBTC, so the taker locks BTC and pays btc_address.
+    let fee = |taker_bps: u16, addr: &str| Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps,
+            btc_address: Some(addr.to_owned()),
+            xbtc_address: None,
+        }),
+        ..offer()
+    };
+
+    // A fee to an address the operator does not recognise is refused.
+    let bad_addr = fee(30, &attacker);
+    assert!(
+        matches!(
+            taker.bid(&bad_addr, bad_addr.maker_amount, [1; 16]),
+            Err(EngineError::Bid(BidError::FeeAddressNotAccepted))
+        ),
+        "a fee to an unknown address must be refused"
+    );
+
+    // A fee rate above the cap is refused, even to a known address.
+    let high_bps = fee(200, &known);
+    assert!(
+        matches!(
+            taker.bid(&high_bps, high_bps.maker_amount, [2; 16]),
+            Err(EngineError::Bid(BidError::FeeTooHigh))
+        ),
+        "a taker fee above the cap must be refused"
+    );
+
+    // The accepted path (a known address within the cap passes the fee guard and the bid proceeds) is
+    // covered by the swap e2e tests, which take real discovered offers; routing a Bid for a
+    // hand-constructed offer has no maker to encrypt to, so we stop at the two refusals here.
+
     let _ = std::fs::remove_dir_all(&tdir);
 }

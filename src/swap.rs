@@ -151,6 +151,11 @@ pub enum BidError {
     /// The swap's real-value (BTC) leg exceeds the local beta cap (#103). Local refusal, never part
     /// of counterparty verification.
     AboveMax,
+    /// The offer's fee address for the chain we would lock is not one the operator accepts (not in the
+    /// configured fee-address set). Local refusal: it stops a malicious maker on the public relay from
+    /// charging the taker a "fee" to the attacker's own address. Never part of counterparty
+    /// verification.
+    FeeAddressNotAccepted,
 }
 
 impl Offer {

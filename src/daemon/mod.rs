@@ -258,6 +258,21 @@ impl Daemon {
         engine.set_min_swap_sat(settings.min_swap_sat);
         engine.set_min_trade_sat(settings.min_trade_sat);
         engine.set_max_swap_sat(settings.max_swap_sat);
+        // Take-side fee policy (security): refuse a taken offer whose taker fee exceeds our own cap, or
+        // whose fee address for the chain we lock is not one we recognise. The offer's fee is set by
+        // the maker, hostile on the public relay, so this stops a taker paying a large "fee" to an
+        // attacker's address. The known set is our own per-chain addresses (single + rotating set).
+        let known_fee = |single: &str, set: &[String]| -> Vec<String> {
+            std::iter::once(single.trim().to_owned())
+                .chain(set.iter().map(|a| a.trim().to_owned()))
+                .filter(|a| !a.is_empty())
+                .collect()
+        };
+        engine.set_fee_take_policy(
+            crate::daemon::types::MAX_FEE_BPS,
+            known_fee(&settings.fee_btc_address, &settings.fee_btc_addresses),
+            known_fee(&settings.fee_xbtc_address, &settings.fee_xbtc_addresses),
+        );
         // E1 (design 0016): when a chain has an Electrum endpoint configured, point its chain-data
         // reads and broadcasts at that server instead of the funding node's RPC. Empty leaves the
         // engine reading from the node, exactly as before. Funding and signing still use the node.
