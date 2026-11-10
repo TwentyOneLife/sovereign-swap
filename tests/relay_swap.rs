@@ -144,6 +144,14 @@ fn a_full_swap_routes_over_the_relay() {
             taker.phase()
         );
     }
+
+    // The maker's offer was taken, so it must have left own_offers (consumed on the accepted bid).
+    // This is the invariant the periodic re-announce relies on: a taken offer is never re-advertised,
+    // so re-announcement can never cause a double-fill.
+    assert!(
+        maker.engine.own_offers().is_empty(),
+        "a taken offer must leave own_offers so it is never re-announced"
+    );
 }
 
 /// Periodic offer re-announcement (design 0020 decision 2): on its timer `tick` re-broadcasts every
