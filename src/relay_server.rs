@@ -1,6 +1,9 @@
 //! `sovereign-swap-relay`: a Nostr relay (NIP-01) hardened for carrying swap messages and nothing
-//! else. It stores and forwards opaque events; it never sees identities or plaintext. Its job is to
-//! survive abuse, so the controls are the point: only our event kind, a size cap, a per-connection
+//! else. It stores and forwards events. Directed (sealed) messages stay opaque: it never sees their
+//! plaintext or the parties' identities. Broadcasts (offers and their withdrawals) are signed, not
+//! encrypted, so they are public by nature; the relay reads a broadcast's payload only to retire a
+//! withdrawn offer early (design 0021), never to learn anything secret. Its job is to survive abuse,
+//! so the controls are the point: only our event kind, a size cap, a per-connection
 //! rate limit on both publishes and subscriptions, a per-REQ result cap (bounding amplification), a
 //! per-connection subscription cap, a bounded store with a time-to-live, and a connection cap. See
 //! `docs/design/0006-nostr-client-and-relay.md` and `docs/design/0003-adversarial-testing.md` (DoS).
@@ -14,12 +17,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::hex::{Case, DisplayHex};
-use bitcoin::secp256k1::{Secp256k1, Verification};
+use bitcoin::secp256k1::{Secp256k1, Verification, XOnlyPublicKey};
 use serde_json::Value;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_with_config, Error as WsProtoError, Message as WsMessage, WebSocket};
 
+use crate::envelope::{verify_broadcast, PublicIdentity, PUBLIC_IDENTITY_LEN};
 use crate::nostr::{Event, KIND_SWAP};
+use crate::swap::Message;
 
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -60,6 +65,11 @@ pub struct RelayConfig {
     /// Run the optional price proxy (#106): fetch the nonkyc BTCB2/BTC ticker over clearnet and serve
     /// it in the NIP-11 document for clients to read over Tor. Off by default; the operator opts in.
     pub price_proxy: bool,
+    /// The most retired-offer tombstones kept at once (design 0021). Bounds the memory a stream of
+    /// withdrawals can pin; oldest tombstones are evicted first. Sized to the offers store cap, since a
+    /// tombstone exists to guard a stored offer. A tombstone is recorded only when a withdrawal really
+    /// evicted an offer, so reaching this bound takes genuine offer-store traffic, not forged noise.
+    pub max_tombstones: usize,
 }
 
 impl Default for RelayConfig {
@@ -81,6 +91,7 @@ impl Default for RelayConfig {
             directed_store_bytes: 32 * 1024 * 1024,
             directed_retention_secs: 24 * 3600,
             price_proxy: false,
+            max_tombstones: 100_000,
         }
     }
 }
@@ -99,7 +110,11 @@ fn is_directed(e: &Event) -> bool {
 }
 
 struct Store {
-    events: VecDeque<Event>,
+    /// Each stored event, paired with its offer id when the event is a readable `Offer` broadcast
+    /// (`None` for directed messages and unparseable broadcasts). The id is cached at insert so a
+    /// withdrawal can evict matching offers by a cheap compare, never re-reading the envelope or
+    /// running a signature verify under the store lock (design 0021).
+    events: VecDeque<(Event, Option<[u8; 16]>)>,
     /// Event ids currently in `events`, kept in step with it, so dedupe is O(1) instead of a scan of the
     /// whole store under the lock on every accepted event.
     ids: HashSet<[u8; 32]>,
@@ -135,7 +150,7 @@ impl Store {
         e.created_at + self.retention >= Store::now()
     }
 
-    fn insert(&mut self, event: Event) -> bool {
+    fn insert(&mut self, event: Event, offer_id: Option<[u8; 16]>) -> bool {
         if self.ids.contains(&event.id) {
             return false;
         }
@@ -146,7 +161,7 @@ impl Store {
         while self.events.len() >= self.cap
             || (self.bytes + sz > self.max_bytes && !self.events.is_empty())
         {
-            if let Some(old) = self.events.pop_front() {
+            if let Some((old, _)) = self.events.pop_front() {
                 self.ids.remove(&old.id);
                 self.bytes -= event_size(&old);
             } else {
@@ -155,8 +170,26 @@ impl Store {
         }
         self.ids.insert(event.id);
         self.bytes += sz;
-        self.events.push_back(event);
+        self.events.push_back((event, offer_id));
         true
+    }
+
+    /// Remove every stored `Offer` with `offer_id` published under `author`'s routing key, keeping
+    /// `ids` and `bytes` in step; returns how many were removed. Cheap by design: it compares the
+    /// cached offer id and the event's routing key, never re-reading or re-verifying the envelope.
+    fn evict_offer(&mut self, offer_id: [u8; 16], author: &XOnlyPublicKey) -> usize {
+        let before = self.events.len();
+        let mut kept = VecDeque::with_capacity(before);
+        for (event, oid) in std::mem::take(&mut self.events) {
+            if oid == Some(offer_id) && event.pubkey == *author {
+                self.ids.remove(&event.id);
+                self.bytes -= event_size(&event);
+            } else {
+                kept.push_back((event, oid));
+            }
+        }
+        self.events = kept;
+        before - self.events.len()
     }
 
     /// Fresh, matching events, newest first truncated to `max` (or the client's `limit` when smaller),
@@ -167,13 +200,105 @@ impl Store {
             .events
             .iter()
             .rev()
-            .filter(|e| self.fresh(e) && filter.matches(e))
+            .filter(|(e, _)| self.fresh(e) && filter.matches(e))
             .take(cap)
-            .cloned()
+            .map(|(e, _)| e.clone())
             .collect();
         hits.reverse();
         hits
     }
+}
+
+/// A bounded set of retired `(offer_id, author routing key)` pairs (design 0021). A withdrawn offer is
+/// remembered here so a later replay of the same offer is refused. Bounded like the stores: a count cap
+/// and a retention equal to the offer retention (a tombstone older than the offer it guards is
+/// pointless, since the offer would have aged out). Oldest-first eviction. The author key is part of
+/// the key so one author can never tombstone another's offer id. Timestamps are relay-local, never the
+/// author's clock.
+/// A retired offer, keyed so one author can never tombstone another's offer id: the 16-byte offer id
+/// and the author's serialized x-only routing key.
+type TombKey = ([u8; 16], [u8; 32]);
+
+struct Tombstones {
+    /// Oldest first, so both expiry and the count cap evict from the front. Each entry is a key and the
+    /// relay-local time it was recorded.
+    entries: VecDeque<(TombKey, u64)>,
+    live: HashSet<TombKey>,
+    cap: usize,
+    retention: u64,
+}
+
+impl Tombstones {
+    fn new(cap: usize, retention: u64) -> Tombstones {
+        Tombstones {
+            entries: VecDeque::new(),
+            live: HashSet::new(),
+            cap,
+            retention,
+        }
+    }
+
+    fn key(offer_id: [u8; 16], author: &XOnlyPublicKey) -> TombKey {
+        (offer_id, author.serialize())
+    }
+
+    /// Drop tombstones older than the retention from the front: once the offer one guards would itself
+    /// have aged out of the store, the tombstone is pointless.
+    fn prune(&mut self, now: u64) {
+        while let Some(&(k, at)) = self.entries.front() {
+            if at + self.retention < now {
+                self.entries.pop_front();
+                self.live.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn insert(&mut self, offer_id: [u8; 16], author: &XOnlyPublicKey, now: u64) {
+        self.prune(now);
+        let k = Self::key(offer_id, author);
+        if self.live.contains(&k) {
+            return;
+        }
+        while self.entries.len() >= self.cap {
+            match self.entries.pop_front() {
+                Some((old, _)) => {
+                    self.live.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.live.insert(k);
+        self.entries.push_back((k, now));
+    }
+
+    /// Whether `(offer_id, author)` is tombstoned. Read-only, so it does not prune: an expired but not
+    /// yet pruned tombstone keeps refusing the offer until the next insert prunes it, which only means a
+    /// withdrawn offer stays refused a little longer, never the reverse.
+    fn contains(&self, offer_id: [u8; 16], author: &XOnlyPublicKey) -> bool {
+        self.live.contains(&Self::key(offer_id, author))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Read a broadcast event's payload. Broadcasts are signed, not encrypted (see `envelope.rs`), so the
+/// relay can authenticate and read them with no key; this mirrors the client's decode in `routing.rs`.
+/// Returns `None` for a sealed (directed) message, a malformed frame, a failed broadcast signature, or
+/// a payload that is not a `Message`. The caller only parses broadcasts (events with no `p` tag).
+fn broadcast_payload(event: &Event) -> Option<Message> {
+    let frame = event.envelope().ok()?;
+    if frame.len() < PUBLIC_IDENTITY_LEN {
+        return None;
+    }
+    let (hint, env) = frame.split_at(PUBLIC_IDENTITY_LEN);
+    let sender = PublicIdentity::from_bytes(hint).ok()?;
+    let payload = verify_broadcast(&sender, env).ok()?;
+    serde_json::from_slice::<Message>(&payload).ok()
 }
 
 /// The subset of a NIP-01 REQ filter this relay honours: kinds and the `#p` recipient tag.
@@ -259,6 +384,8 @@ struct Stats {
     rejected_kind: AtomicU64,
     rejected_bad_sig: AtomicU64,
     rejected_stale: AtomicU64,
+    /// Offers refused because their maker already withdrew them (design 0021 tombstone).
+    rejected_withdrawn: AtomicU64,
 }
 
 impl Stats {
@@ -276,6 +403,8 @@ pub struct RelayServer {
     offers: Arc<Mutex<Store>>,
     /// Directed messages (`p`-tagged). Separate budgets so a directed flood cannot evict offers.
     directed: Arc<Mutex<Store>>,
+    /// Retired offers (design 0021): a withdrawn offer is remembered here so a replay is refused.
+    tombstones: Arc<Mutex<Tombstones>>,
     subs: Arc<Mutex<Vec<Subscription>>>,
     connections: Arc<AtomicUsize>,
     stats: Arc<Stats>,
@@ -292,10 +421,13 @@ impl RelayServer {
             cfg.directed_store_bytes,
             cfg.directed_retention_secs,
         );
+        // A tombstone guards a stored offer, so it shares the offers' retention window.
+        let tombstones = Tombstones::new(cfg.max_tombstones, cfg.retention_secs);
         RelayServer {
             cfg,
             offers: Arc::new(Mutex::new(offers)),
             directed: Arc::new(Mutex::new(directed)),
+            tombstones: Arc::new(Mutex::new(tombstones)),
             subs: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(AtomicUsize::new(0)),
             stats: Arc::new(Stats::new()),
@@ -343,6 +475,7 @@ impl RelayServer {
                     "kind_not_allowed": n(&s.rejected_kind),
                     "bad_signature": n(&s.rejected_bad_sig),
                     "outside_retention": n(&s.rejected_stale),
+                    "withdrawn": n(&s.rejected_withdrawn),
                 },
             },
         });
@@ -649,7 +782,8 @@ impl RelayServer {
             return ok(&id, false, "invalid: bad id or signature");
         }
         // Route by class: offers and directed messages have separate stores and budgets.
-        let store = if is_directed(&event) {
+        let directed = is_directed(&event);
+        let store = if directed {
             &self.directed
         } else {
             &self.offers
@@ -658,13 +792,57 @@ impl RelayServer {
             bump(&s.rejected_stale);
             return ok(&id, false, "invalid: outside retention window");
         }
-        if !store.lock().unwrap().insert(event.clone()) {
+        // Design 0021: a broadcast is signed, not encrypted, so the relay can read it (after the
+        // freshness check, so a stale event has no side effect). An `Offer` whose maker already
+        // withdrew it is refused; a `Withdraw` retires its author's offer early. Everything else,
+        // including a broadcast that does not parse, is stored and served exactly as before. The
+        // cached offer id rides into the store so a later withdrawal evicts by a cheap compare.
+        let mut offer_id = None;
+        if !directed {
+            match broadcast_payload(&event) {
+                Some(Message::Offer(offer)) => {
+                    if self
+                        .tombstones
+                        .lock()
+                        .unwrap()
+                        .contains(offer.id, &event.pubkey)
+                    {
+                        bump(&s.rejected_withdrawn);
+                        return ok(&id, false, "blocked: offer withdrawn");
+                    }
+                    offer_id = Some(offer.id);
+                }
+                Some(Message::Withdraw { offer_id: target }) => {
+                    self.retire_offer(target, &event.pubkey);
+                }
+                _ => {}
+            }
+        }
+        if !store.lock().unwrap().insert(event.clone(), offer_id) {
             bump(&s.events_duplicate);
             return ok(&id, true, "duplicate");
         }
         bump(&s.events_accepted);
         self.fan_out(&event);
         ok(&id, true, "")
+    }
+
+    /// Design 0021: retire `author`'s offer early on an authentic withdrawal. Evict every stored
+    /// `Offer` with this id published under the same routing key (the author check, mirroring the
+    /// client's own rule in `routing.rs`, stops a third party retiring someone else's offer), and,
+    /// only if something was actually evicted, remember the pair so a later replay of that offer is
+    /// refused. Recording a tombstone only on a real eviction means a flood of forged withdrawals
+    /// cannot push out genuine tombstones: a flooder must first pay the already-bounded offers-store
+    /// budget (design 0020). The offers lock is taken and released before the tombstones lock, never
+    /// both at once. The withdrawal event itself is still stored and fanned out by the caller.
+    fn retire_offer(&self, offer_id: [u8; 16], author: &XOnlyPublicKey) {
+        let evicted = self.offers.lock().unwrap().evict_offer(offer_id, author);
+        if evicted > 0 {
+            self.tombstones
+                .lock()
+                .unwrap()
+                .insert(offer_id, author, Store::now());
+        }
     }
 
     fn fan_out(&self, event: &Event) {
@@ -893,6 +1071,45 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::secp256k1::Keypair;
+
+    /// An x-only key to stand in for an offer author's routing key in the tombstone unit tests.
+    fn author(seed: u8) -> XOnlyPublicKey {
+        Keypair::from_seckey_slice(&Secp256k1::new(), &[seed; 32])
+            .unwrap()
+            .x_only_public_key()
+            .0
+    }
+
+    #[test]
+    fn a_tombstone_expires_after_its_retention() {
+        let a = author(5);
+        let mut tomb = Tombstones::new(10, 100);
+        tomb.insert([1; 16], &a, 1_000);
+        assert!(tomb.contains([1; 16], &a));
+        assert_eq!(tomb.len(), 1);
+
+        // An insert past the retention prunes the stale tombstone (relay-local time, not the author's).
+        tomb.insert([2; 16], &a, 1_000 + 100 + 1);
+        assert!(
+            !tomb.contains([1; 16], &a),
+            "a tombstone older than the retention must be pruned"
+        );
+        assert!(tomb.contains([2; 16], &a));
+        assert_eq!(tomb.len(), 1);
+    }
+
+    #[test]
+    fn a_tombstone_is_keyed_by_author_so_one_author_cannot_block_anothers_id() {
+        let (a, b) = (author(5), author(6));
+        let mut tomb = Tombstones::new(10, 100);
+        tomb.insert([1; 16], &a, 1_000);
+        assert!(tomb.contains([1; 16], &a));
+        assert!(
+            !tomb.contains([1; 16], &b),
+            "a tombstone for one author must not match the same id under another author"
+        );
+    }
 
     fn with_price(proxy: bool, as_of: u64) -> RelayServer {
         let server = RelayServer::new(RelayConfig {

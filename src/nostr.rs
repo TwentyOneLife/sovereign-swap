@@ -1,8 +1,10 @@
 //! Nostr events (NIP-01) that carry our envelopes, see `docs/design/0006-nostr-client-and-relay.md`.
 //!
 //! The event's `pubkey` is a throwaway per-swap routing key, not a party's identity; the real
-//! identity and all confidentiality live inside the envelope in `content`. So a relay sees only
-//! routing keys and opaque bytes.
+//! identity and all confidentiality live inside the envelope in `content`. A relay sees only routing
+//! keys, and for a directed message only opaque ciphertext. A broadcast (an offer or its withdrawal)
+//! is signed, not encrypted, so it is public by nature; a relay can read it, which is what lets it
+//! retire a withdrawn offer (design 0021).
 
 use bitcoin::hex::{Case, DisplayHex, FromHex};
 use bitcoin::secp256k1::{
