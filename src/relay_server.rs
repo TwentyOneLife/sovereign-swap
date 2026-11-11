@@ -22,7 +22,7 @@ use serde_json::Value;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{accept_with_config, Error as WsProtoError, Message as WsMessage, WebSocket};
 
-use crate::envelope::{verify_broadcast, PublicIdentity, PUBLIC_IDENTITY_LEN};
+use crate::envelope::{read_broadcast_payload, PUBLIC_IDENTITY_LEN};
 use crate::nostr::{Event, KIND_SWAP};
 use crate::swap::Message;
 
@@ -293,18 +293,22 @@ impl Tombstones {
 }
 
 /// Read a broadcast event's payload. Broadcasts are signed, not encrypted (see `envelope.rs`), so the
-/// relay can authenticate and read them with no key; this mirrors the client's decode in `routing.rs`.
-/// Returns `None` for a sealed (directed) message, a malformed frame, a failed broadcast signature, or
-/// a payload that is not a `Message`. The caller only parses broadcasts (events with no `p` tag).
+/// relay can read them with no key. It does NOT re-verify the envelope's own signatures: the author is
+/// already authenticated by the outer nostr event signature (`event.pubkey`, checked in `accept_event`
+/// before this is called), and the tombstone/eviction logic keys on exactly that author, so a forged
+/// or malformed inner signature can only ever affect the forger's own offers. Decoding instead of
+/// verifying skips a ~4.6 KB ML-DSA verify per broadcast, the dominant relay-host CPU cost, and is a
+/// defence against a signed-event flood forcing verifies. Clients still verify end to end (`routing.rs`).
+/// Returns `None` for a sealed (directed) message, a malformed frame, or a payload that is not a
+/// `Message`. The caller only parses broadcasts (events with no `p` tag).
 fn broadcast_payload(event: &Event) -> Option<Message> {
     let frame = event.envelope().ok()?;
     if frame.len() < PUBLIC_IDENTITY_LEN {
         return None;
     }
-    let (hint, env) = frame.split_at(PUBLIC_IDENTITY_LEN);
-    let sender = PublicIdentity::from_bytes(hint).ok()?;
-    let payload = verify_broadcast(&sender, env).ok()?;
-    serde_json::from_slice::<Message>(&payload).ok()
+    let (_hint, env) = frame.split_at(PUBLIC_IDENTITY_LEN);
+    let payload = read_broadcast_payload(env)?;
+    serde_json::from_slice::<Message>(payload).ok()
 }
 
 /// The subset of a NIP-01 REQ filter this relay honours: kinds and the `#p` recipient tag.
