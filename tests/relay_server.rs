@@ -666,3 +666,29 @@ fn a_directed_flood_does_not_evict_offers() {
         "a directed-message flood evicted the offer from the separate offer store"
     );
 }
+
+#[test]
+fn a_rejected_publish_is_recorded_not_silently_dropped() {
+    // #151: a publish the relay refuses (NIP-01 OK:false) must be observable on the client, not
+    // silently swallowed. A stale event (created_at well past the retention window) is refused.
+    let url = relay(RelayConfig::default());
+    let conn = WsConn::connect(&url, None);
+    let secp = Secp256k1::new();
+    let old = Event::now_for_test().saturating_sub(30 * 24 * 3600);
+    let stale = Event::build(&secp, &key(1), old, vec![], &[1, 2, 3]);
+    conn.publish(stale);
+
+    // The worker sends the event and reads the relay's OK:false asynchronously; poll briefly.
+    let mut rejections = Vec::new();
+    for _ in 0..40 {
+        rejections = conn.take_rejections();
+        if !rejections.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rejections.iter().any(|r| r.contains("retention")),
+        "a rejected publish must be recorded, got {rejections:?}"
+    );
+}
