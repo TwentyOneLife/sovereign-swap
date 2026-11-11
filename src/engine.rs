@@ -62,6 +62,12 @@ fn funding_psbt_txid(psbt: &str) -> Result<Txid, EngineError> {
         .map_err(|e| EngineError::Node(NodeError::Unexpected(format!("parse funding psbt: {e}"))))
 }
 
+/// Whether a fee address is a silent payment (`sp1`/`tsp1`/`sprt1`), which needs a BIP352-aware signer
+/// to build (design 0018). A normal address parses as `Err` here and is fundable by any signer.
+fn is_silent_payment(addr: &str) -> bool {
+    silentpayments::SilentPaymentAddress::parse(addr).is_ok()
+}
+
 /// The fee output a leg owes, or `None` when none is due. A leg below the minimum trade owes no fee
 /// (design 0013 / `fee.rs`), so `BelowMinimum` maps to `None`, NOT an error (#107): the payer funds
 /// with no fee output and the counterparty verifies as not-required, so a leg in `[min_swap,
@@ -227,6 +233,11 @@ pub enum EngineError {
     /// as it is (rebuilding it with fresh inputs would strand the signature) and the submission is
     /// refused retryably, to try again shortly.
     NotYetFundable,
+    /// Refused to publish an offer whose voluntary fee for the chain the maker would lock is a silent
+    /// payment (`sp1...`), while the maker's funding signer for that chain cannot build one (interactive
+    /// funding, or a non-BIP352-aware cold signer; design 0018). Publishing it would advertise a swap
+    /// the maker structurally cannot fund.
+    FeeNotFundable,
 }
 
 impl From<NodeError> for EngineError {
@@ -768,6 +779,17 @@ impl<T: Transport> Engine<T> {
             .policy
             .depths(&offer, offer.maker_amount, offer.taker_amount)
             .map_err(EngineError::Policy)?;
+        // 0018: the maker locks `maker_chain` and pays any fee there. If that fee address is a silent
+        // payment but this chain's funding signer cannot build one (interactive, or a non-BIP352 cold
+        // signer), the maker could never fund the offer, so refuse to advertise it.
+        if let Some(terms) = &offer.fee {
+            if let Some(addr) = terms.address(offer.maker_chain) {
+                if is_silent_payment(addr) && !self.nodes[&offer.maker_chain].supports_silent_fee()
+                {
+                    return Err(EngineError::FeeNotFundable);
+                }
+            }
+        }
         self.state.own_offers.push(offer.clone());
         self.save_state()?;
         self.transport.send(&Message::Offer(offer));
@@ -803,6 +825,13 @@ impl<T: Transport> Engine<T> {
         if let Some(terms) = &offer.fee {
             let taker_chain = offer.maker_chain.other();
             if let Some(addr) = terms.address(taker_chain) {
+                // 0018: the taker locks `taker_chain` and pays the fee there. If that fee address is a
+                // silent payment our funding signer for that chain cannot build (interactive, or a
+                // non-BIP352 cold signer), taking the offer would let us commit while unable to fund the
+                // fee, stranding the maker's already-locked coin to a refund. Refuse up front.
+                if is_silent_payment(addr) && !self.nodes[&taker_chain].supports_silent_fee() {
+                    return Err(EngineError::Bid(BidError::FeeNotFundable));
+                }
                 let rates = FeeRates {
                     maker_bps: terms.maker_bps,
                     taker_bps: terms.taker_bps,
