@@ -1,6 +1,28 @@
 # 0012 Wiring the cold funding signer into the daemon and package (M2b)
 
-Status: stage 1 (daemon side) implemented; package actions (stage 2) still to do. The signer seam
+Status: implemented (2026-11-11). Stage 1 (daemon) and stage 2 (StartOS package actions + store
+wiring) are both built; `funding_mode` resolves per chain in `Daemon::connect` to hot (`ChainNode::open`),
+cold (`open_cold` + `RemoteSigner`), or interactive (`open_cold` + `InteractiveSigner`, design 0017),
+with the config surface in `sovereign-swap-client-startos` (`startos/actions/config.ts` funding fields,
+`startos/fileModels/settings.json.ts` shape). Tested in `tests/cold_signer.rs` (regtest cold lock end
+to end through a mock signer; refusal when the funding wallet holds keys; refusal when the signer is
+unreachable) and `tests/remote_signer.rs` (the RemoteSigner protocol: sign, refuse, timeout, TLS).
+
+Three things remain, each a deliberate boundary rather than unfinished wiring, and together the
+blocking points for running COLD mode specifically (see "Remaining boundaries" at the end):
+
+- a reference signer product (`sovereign-swap-signer`) is not built; cold mode needs the operator to
+  run any service that speaks the `RemoteSigner` protocol below. Building that signer is out of scope
+  here (see "Out of scope"), a separate milestone;
+- a hot-to-cold migration path: a funding wallet that already ran hot (so holds keys) is refused in
+  cold mode; switching an existing hot install to cold needs a documented key-rotation/new-wallet step;
+- a rescan/birthday for a pre-funded cold account: the watch-only import uses `timestamp: "now"`, so an
+  account funded BEFORE it is configured needs a rescan; the operator guidance is to fund the cold
+  account AFTER switching.
+
+INTERACTIVE mode (the user signs each funding lock in their own wallet, design 0017) is the
+non-custodial path that is fully usable today with NO external signer and needs none of the three
+above; it is the recommended way to fund real value now. The signer seam
 exists in the library (0008); this note designs how the daemon and the StartOS package select and
 reach an external signer, so a user's balance keys never sit on the engine host.
 
@@ -10,9 +32,11 @@ the signer over the existing node transport and finalises nothing itself; watch-
 provisioning (`ChainNode::open_cold`) that imports the account descriptors and refuses a wallet that
 holds keys; and `funding_mode` resolution in `Daemon::connect` that probes the signer and refuses to
 start rather than ever silently funding hot. The `RemoteSigner` wire protocol is documented in
-`src/signer.rs`. Still to do: the StartOS package action fields and store wiring (stage 2), a
-hot-to-cold migration path (an existing keyed funding wallet under the same name is refused), and a
-rescan/birthday for a pre-funded account (import uses `timestamp: "now"`).
+`src/signer.rs`. Stage 2 then landed the StartOS package action fields and store wiring (per chain:
+`funding_mode`, and for cold the signer endpoint, auth, Root CA and the account descriptors). What
+remains are the two deliberate boundaries called out in the status above: a hot-to-cold migration
+path (an existing keyed funding wallet under the same name is refused) and a rescan/birthday for a
+pre-funded account (import uses `timestamp: "now"`), plus the separate reference-signer milestone.
 
 ## The gap
 
@@ -141,3 +165,28 @@ action, stored in the package store, never served to the web layer, never logged
 Building a signer product. M2b targets the generic `RemoteSigner` interface and documents the
 contract a signer must meet; which device or service a user runs behind it is their choice, and a
 reference signer can be a later, separate milestone.
+
+## Remaining boundaries (the blocking points for cold mode)
+
+The wiring is complete; what gates running COLD mode for real value is deliberate scope, not missing
+code. None of these block INTERACTIVE mode, which is non-custodial and usable today.
+
+1. **No reference signer ships.** Cold mode points the daemon at an endpoint that speaks the
+   `RemoteSigner` protocol; no such service is built here (see Out of scope). Until a
+   `sovereign-swap-signer` (or any conforming signer) exists, cold mode has nothing to point at. The
+   config help text in the client package names `sovereign-swap-signer` as the intended reference;
+   that package does not yet exist, so either it is built as its own milestone or the help text should
+   stop implying it is available. Blocking point: an owner decision to build (or not) the reference
+   signer; it is a separate product with its own policy engine (ceilings, allow-list, rate limit) and
+   must validate independently, never blind-sign.
+2. **Hot-to-cold migration.** An install that already ran hot holds keys in its funding wallet and is
+   refused in cold mode by design. Switching needs a documented procedure (new watch-only wallet from
+   the cold account descriptors, sweep the old hot balance to the cold account). Blocking point: write
+   and test that procedure; no engine change is required.
+3. **Pre-funded rescan.** The watch-only import uses `timestamp: "now"`, so coins sent to the cold
+   account before it is configured are invisible until a rescan. Operator guidance is to fund after
+   switching; a birthday/rescan input would lift the restriction. Blocking point: a small config/import
+   enhancement, only if funding-before-configuring must be supported.
+
+Recommendation: for real value now, use interactive funding (design 0017), which needs none of the
+above. Treat the reference signer as a separate, owner-gated milestone.
