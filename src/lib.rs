@@ -6,6 +6,7 @@ pub mod electrum;
 pub mod engine;
 pub mod envelope;
 pub mod fee;
+pub mod feescan;
 pub mod htlc;
 pub mod keys;
 pub mod node;

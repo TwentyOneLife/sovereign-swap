@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use crate::electrum::ElectrumBackend;
 use crate::engine::Engine;
 use crate::envelope::Identity;
+use crate::feescan;
 use crate::node::{ChainBackend, ChainNode};
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
@@ -97,6 +98,11 @@ pub struct Daemon {
     /// present, the page and its assets (which carry the API token) are served only to a browser that
     /// passes HTTP Basic auth, so knowing the onion is no longer enough to reach the swaps.
     basic_auth: Option<(String, String)>,
+    /// The per-chain fee-scanner state (design 0013), updated by the scanner threads and read by
+    /// GET /status. Present (default, empty) even when no scanner runs, so /status always has the
+    /// fields. Scan-only: these are counts and sats, never a key.
+    scan_btc: Arc<Mutex<feescan::State>>,
+    scan_xbtc: Arc<Mutex<feescan::State>>,
 }
 
 impl Daemon {
@@ -132,6 +138,8 @@ impl Daemon {
             events: Arc::new(Mutex::new(Vec::new())),
             reference: Reference::default(),
             basic_auth,
+            scan_btc: Arc::new(Mutex::new(feescan::State::default())),
+            scan_xbtc: Arc::new(Mutex::new(feescan::State::default())),
         };
         // If the saved settings are already complete, bring the engine up. A failure here is not fatal
         // (the GUI learns it from GET /status), but it is logged: a silently swallowed reason is very
@@ -139,6 +147,9 @@ impl Daemon {
         if let Err(e) = daemon.start_engine() {
             eprintln!("engine not started on open: {e}");
         }
+        // Start the per-chain fee scanners for any chain configured with an SP fee address and a scan
+        // key (design 0013). Independent of the engine: a scanner needs only the node, not a relay.
+        daemon.start_scanners();
         Ok(daemon)
     }
 
@@ -315,6 +326,63 @@ impl Daemon {
 
     fn engine_running(&self) -> bool {
         self.engine.lock().unwrap().is_some()
+    }
+
+    /// Spawns one fee-scanner thread per chain configured with a silent payment fee address and a
+    /// matching scan key (design 0013, stage 2). A chain with no scan key, or a normal fee address,
+    /// is simply not scanned. A misconfigured scan key is logged (value-free) and skipped rather than
+    /// starting a scanner that would find nothing. Each thread owns its own RPC client and persists
+    /// its progress in the data dir, so it survives a restart without rescanning from the birthday.
+    fn start_scanners(&self) {
+        let settings = self.state.lock().unwrap().settings.clone();
+        let tor_socks =
+            resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
+        let chains = [
+            (
+                "btc",
+                &settings.btc_node,
+                &settings.btc_rpc_user,
+                &settings.btc_rpc_pass,
+                &settings.btc_rpc_ca,
+                &settings.fee_btc_address,
+                settings.fee_btc_scan_key.as_str(),
+                settings.fee_btc_birthday_height,
+                Arc::clone(&self.scan_btc),
+                "feescan-btc.json",
+            ),
+            (
+                "xbtc",
+                &settings.xbtc_node,
+                &settings.xbtc_rpc_user,
+                &settings.xbtc_rpc_pass,
+                &settings.xbtc_rpc_ca,
+                &settings.fee_xbtc_address,
+                settings.fee_xbtc_scan_key.as_str(),
+                settings.fee_xbtc_birthday_height,
+                Arc::clone(&self.scan_xbtc),
+                "feescan-xbtc.json",
+            ),
+        ];
+        for (label, addr, user, pass, ca, fee_addr, scan_key, birthday, shared, file) in chains {
+            let cfg = match feescan::ScanConfig::new(fee_addr, scan_key, birthday) {
+                Ok(None) => continue, // not configured to scan this chain
+                Ok(Some(cfg)) => cfg,
+                Err(e) => {
+                    eprintln!("fee-scanner {label}: not started: {e}");
+                    continue;
+                }
+            };
+            match connect_client(addr, user, pass, ca, &tor_socks) {
+                Ok(client) => {
+                    let state_file = self.data_dir.join(file);
+                    eprintln!("fee-scanner {label}: started (birthday {})", cfg.birthday);
+                    std::thread::spawn(move || {
+                        feescan::run(label, client, cfg, state_file, shared)
+                    });
+                }
+                Err(e) => eprintln!("fee-scanner {label}: not started: {e}"),
+            }
+        }
     }
 
     pub fn token(&self) -> &str {
@@ -613,6 +681,10 @@ impl Daemon {
         } else {
             json!(0)
         };
+        // Fee scanner totals, per chain (design 0013, scan-only): how many fee outputs the operator
+        // has collected and their total sats. Zero and present even when no scanner runs.
+        let btc_scan = self.scan_btc.lock().unwrap().clone();
+        let xbtc_scan = self.scan_xbtc.lock().unwrap().clone();
         json!({
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
@@ -622,6 +694,11 @@ impl Daemon {
             // Per-chain explorer bases for the web UI to link txids (#67); empty = render as plain text.
             "btc_explorer_url": settings.btc_explorer_url,
             "xbtc_explorer_url": settings.xbtc_explorer_url,
+            // Fee scanner totals, per chain (design 0013, scan-only): outputs collected and total sats.
+            "fees_found_btc": btc_scan.count(),
+            "fees_sat_btc": btc_scan.sats(),
+            "fees_found_xbtc": xbtc_scan.count(),
+            "fees_sat_xbtc": xbtc_scan.sats(),
         })
     }
 
@@ -854,7 +931,8 @@ fn resolve_tor_socks(env: Option<String>, setting: &str) -> String {
 /// Builds an RPC client for a node or a cold signer endpoint, applying the design-0011 transport
 /// rules: an `.onion` is dialed through `tor_socks`, an `https` LAN address is verified against its
 /// Root CA, plain `http` is direct. A node and a signer share this one builder (design 0012), so a
-/// signer endpoint reaches the engine the same way a node does, with no new network code.
+/// signer endpoint reaches the engine the same way a node does, with no new network code. The fee
+/// scanner (design 0013) reaches a node through it too.
 fn connect_client(
     addr: &str,
     user: &str,
