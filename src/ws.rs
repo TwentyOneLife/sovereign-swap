@@ -24,6 +24,7 @@ use crate::routing::RelayConn;
 /// memory. Our events are a few KiB; a relay's max event is 128 KiB.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_BUFFERED_EVENTS: usize = 10_000;
+const MAX_BUFFERED_REJECTIONS: usize = 1_000;
 /// How many stored events a (re)subscription accepts, so a reconnect does not pull the relay's whole
 /// retention window again; how often to ping so a half-open socket is noticed and reconnected rather
 /// than silently swallowing published offers; and the cap on reconnect backoff.
@@ -34,6 +35,9 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct WsConn {
     outgoing: Sender<String>,
     incoming: Arc<Mutex<VecDeque<Event>>>,
+    /// Relay `OK:false` replies to our publishes (NIP-01), so a rejected publish is observable rather
+    /// than silently dropped (#151). Bounded; drained by `take_rejections`.
+    rejections: Arc<Mutex<VecDeque<String>>>,
     shutdown: Arc<AtomicBool>,
     _worker: std::thread::JoinHandle<()>,
 }
@@ -67,6 +71,8 @@ impl WsConn {
             .ok();
         let incoming: Arc<Mutex<VecDeque<Event>>> = Arc::default();
         let buffer = Arc::clone(&incoming);
+        let rejections: Arc<Mutex<VecDeque<String>>> = Arc::default();
+        let worker_rejections = Arc::clone(&rejections);
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
@@ -78,6 +84,7 @@ impl WsConn {
                 socks.as_deref(),
                 rx,
                 buffer,
+                worker_rejections,
                 &worker_shutdown,
                 initial,
             );
@@ -85,9 +92,17 @@ impl WsConn {
         WsConn {
             outgoing: tx,
             incoming,
+            rejections,
             shutdown,
             _worker: worker,
         }
+    }
+
+    /// The relay rejections (NIP-01 `OK:false`) seen since the last call, drained. A rejected publish
+    /// is recorded here instead of being silently swallowed (#151), so a caller can surface it or act
+    /// on it (for example re-grind to a relay's proof-of-work floor, design 0020).
+    pub fn take_rejections(&self) -> Vec<String> {
+        self.rejections.lock().unwrap().drain(..).collect()
     }
 }
 
@@ -167,6 +182,7 @@ fn run(
     socks: Option<&str>,
     rx: Receiver<String>,
     buffer: Arc<Mutex<VecDeque<Event>>>,
+    rejections: Arc<Mutex<VecDeque<String>>>,
     shutdown: &AtomicBool,
     initial: Option<tungstenite::WebSocket<TcpStream>>,
 ) {
@@ -180,7 +196,7 @@ fn run(
                 None => return, // shutting down
             },
         };
-        serve(&mut socket, &rx, &buffer, shutdown, &mut since);
+        serve(&mut socket, &rx, &buffer, &rejections, shutdown, &mut since);
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
@@ -195,6 +211,7 @@ fn serve(
     socket: &mut tungstenite::WebSocket<TcpStream>,
     rx: &Receiver<String>,
     buffer: &Arc<Mutex<VecDeque<Event>>>,
+    rejections: &Arc<Mutex<VecDeque<String>>>,
     shutdown: &AtomicBool,
     since: &mut Option<u64>,
 ) {
@@ -229,6 +246,15 @@ fn serve(
                         buf.pop_front();
                     }
                     buf.push_back(event);
+                } else if let Some((id, false, msg)) = parse_ok(&text) {
+                    // The relay refused this publish (NIP-01 OK:false). Record it so it is not silently
+                    // dropped (#151) and log it; the owner thread keeps serving.
+                    eprintln!("relay rejected event {id}: {msg}");
+                    let mut rej = rejections.lock().unwrap();
+                    if rej.len() >= MAX_BUFFERED_REJECTIONS {
+                        rej.pop_front();
+                    }
+                    rej.push_back(format!("{id}: {msg}"));
                 }
             }
             Ok(WsMessage::Close(_)) => return,
@@ -244,6 +270,20 @@ fn serve(
             Err(_) => return,
         }
     }
+}
+
+/// Parses a relay `["OK", <event-id>, <accepted>, <message>]` reply (NIP-01); `None` for any other
+/// line. Used to notice a rejected publish instead of ignoring it.
+fn parse_ok(text: &str) -> Option<(String, bool, String)> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let arr = v.as_array()?;
+    if arr.first()?.as_str()? != "OK" {
+        return None;
+    }
+    let id = arr.get(1)?.as_str()?.to_owned();
+    let accepted = arr.get(2)?.as_bool()?;
+    let msg = arr.get(3).and_then(|m| m.as_str()).unwrap_or("").to_owned();
+    Some((id, accepted, msg))
 }
 
 /// Reads a relay's `["EVENT","s",{...}]` line into an Event; ignores EOSE, OK, NOTICE, CLOSED.
@@ -268,7 +308,7 @@ impl RelayConn for WsConn {
         drained
             .into_iter()
             .filter(|e| e.pubkey != *subscriber)
-            .filter(|e| e.recipient().map_or(true, |to| to == *subscriber))
+            .filter(|e| e.recipient().is_none_or(|to| to == *subscriber))
             .collect()
     }
 }
