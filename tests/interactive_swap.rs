@@ -18,7 +18,8 @@ mod common;
 
 use std::path::Path;
 
-use bitcoin::Amount;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Amount, Network};
 use serde_json::{json, Value};
 
 use common::{binaries, Node};
@@ -29,6 +30,7 @@ use sovereign_swap::policy::Policy;
 use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::signer::InteractiveSigner;
+use sovereign_swap::silentpayments::SilentPaymentAddress;
 use sovereign_swap::swap::{BidError, Chain, FeeTerms, Offer, Phase};
 
 type Tp = RelayTransport<InProcessConn>;
@@ -1739,4 +1741,102 @@ fn an_honest_maker_never_reveals_to_a_taker_whose_fee_is_underpaid() {
 
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// A regtest `sprt1...` silent-payment address, for the 0018 fundability guard tests.
+fn sp1_regtest(scan: u8, spend: u8) -> String {
+    let secp = Secp256k1::new();
+    SilentPaymentAddress {
+        scan: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[scan; 32]).unwrap()),
+        spend: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[spend; 32]).unwrap()),
+        network: Network::Regtest,
+    }
+    .encode()
+}
+
+/// Design 0018: an interactive taker cannot build a silent-payment (sp1) fee output on the chain it
+/// locks (the engine holds no input keys), so taking such an offer would strand the maker's
+/// already-locked coin to a refund. `bid` must refuse up front with BidError::FeeNotFundable.
+#[test]
+fn an_interactive_taker_refuses_an_sp1_fee_it_cannot_fund() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser-sp1"]));
+    let user = core.rpc.wallet("takeruser-sp1");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let tdir = std::env::temp_dir().join(format!("sovswap-sp1t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tdir);
+    // open_taker funds BTC interactively; offer() has maker_chain = Xbtc, so the taker locks BTC and
+    // would owe the BTC fee.
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(sp1_regtest(0x21, 0x22)),
+            xbtc_address: None,
+        }),
+        ..offer()
+    };
+    let err = taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .expect_err("an interactive taker must refuse an sp1 fee it cannot build");
+    assert!(
+        matches!(err, EngineError::Bid(BidError::FeeNotFundable)),
+        "expected Bid(FeeNotFundable), got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Design 0018: a maker that funds its chain interactively cannot build a silent-payment fee output
+/// on that chain, so `publish` must refuse an offer whose fee for the maker's chain is sp1 rather than
+/// advertise a swap it cannot fund (EngineError::FeeNotFundable).
+#[test]
+fn a_maker_refuses_to_publish_an_sp1_fee_it_cannot_fund_interactively() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["makeruser-sp1"]));
+    let user = core.rpc.wallet("makeruser-sp1");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-sp1m-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    // open_maker_interactive funds BTC interactively; offer_btc() has maker_chain = Btc.
+    let mut maker = open_maker_interactive(&mdir, &relay, &core, &knots, &receive, &change);
+
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(sp1_regtest(0x23, 0x24)),
+            xbtc_address: None,
+        }),
+        ..offer_btc()
+    };
+    let err = maker.publish(fee_offer).expect_err(
+        "a maker funding interactively must refuse to publish an sp1 fee it cannot build",
+    );
+    assert!(
+        matches!(err, EngineError::FeeNotFundable),
+        "expected FeeNotFundable, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&mdir);
 }

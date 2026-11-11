@@ -156,6 +156,11 @@ pub enum BidError {
     /// charging the taker a "fee" to the attacker's own address. Never part of counterparty
     /// verification.
     FeeAddressNotAccepted,
+    /// The offer's fee for the chain we would lock is a silent payment (`sp1...`), but our funding
+    /// signer for that chain cannot build one (interactive funding, or a non-BIP352-aware cold signer;
+    /// design 0018). Taking it would let us commit while unable to fund the fee, stranding the maker's
+    /// already-locked coin to a timelock refund, so we refuse up front. Local refusal.
+    FeeNotFundable,
 }
 
 impl Offer {
