@@ -5,3 +5,8 @@
 
 # local git worktrees for parallel branches
 .worktrees/
+
+# VitePress docs site (Node)
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
