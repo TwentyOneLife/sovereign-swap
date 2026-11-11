@@ -91,6 +91,16 @@ impl FeeDest {
 pub trait FundingSigner: Send + Sync {
     fn sign(&self, unsigned_psbt: &str) -> Result<String, NodeError>;
 
+    /// Whether this signer can build a silent-payment (BIP352) fee output. The engine checks this
+    /// before committing to an offer whose fee for the chain it funds is a silent payment, so it never
+    /// takes on a swap it structurally cannot fund (design 0018). A silent-payment output is derived
+    /// from the spent inputs' private keys, which an interactive signer (the engine holds no input
+    /// keys) and a non-BIP352-aware cold signer do not have for this purpose, so the default is false;
+    /// only a BIP352-aware signer overrides it to true.
+    fn supports_silent_fee(&self) -> bool {
+        false
+    }
+
     /// Sign a funding PSBT that carries a placeholder fee output at `fee_vout`, replacing that
     /// output's script with the fresh silent payment output for `recipient` (design 0010). Returns
     /// the signed PSBT and the [`FeePayment`] (the output, the ECDH share and the BIP374 proof). The
@@ -128,6 +138,11 @@ impl FundingSigner for WalletSigner {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| NodeError::Unexpected("no psbt in sign result".into()))
+    }
+
+    fn supports_silent_fee(&self) -> bool {
+        // The hot node wallet holds the input keys, so it can derive a BIP352 fee output.
+        true
     }
 
     /// Hot (regtest) BIP352 signing: derive each input's key from the wallet's own descriptors,
@@ -488,6 +503,13 @@ impl ChainNode {
     pub fn with_signer(mut self, signer: Box<dyn FundingSigner>) -> ChainNode {
         self.signer = signer;
         self
+    }
+
+    /// Whether this chain's funding signer can build a silent-payment (BIP352) fee output (design
+    /// 0018). The engine consults it before committing to an offer whose fee for this chain is a
+    /// silent payment.
+    pub fn supports_silent_fee(&self) -> bool {
+        self.signer.supports_silent_fee()
     }
 
     pub fn new_destination(&self) -> Result<ScriptBuf, NodeError> {

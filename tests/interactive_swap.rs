@@ -17,19 +17,24 @@
 mod common;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use bitcoin::Amount;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Amount, Network, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
 use common::{binaries, Node};
 use sovereign_swap::engine::{Config, Engine, EngineError, FeeTamper};
 use sovereign_swap::envelope::Identity;
-use sovereign_swap::node::ChainNode;
+use sovereign_swap::htlc::Contract;
+use sovereign_swap::node::{ChainBackend, ChainNode, NodeError};
 use sovereign_swap::policy::Policy;
 use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
 use sovereign_swap::signer::InteractiveSigner;
-use sovereign_swap::swap::{BidError, Chain, FeeTerms, Offer, Phase};
+use sovereign_swap::silentpayments::SilentPaymentAddress;
+use sovereign_swap::swap::{BidError, Chain, FeeTerms, LockView, Offer, Phase};
 
 type Tp = RelayTransport<InProcessConn>;
 
@@ -1739,4 +1744,309 @@ fn an_honest_maker_never_reveals_to_a_taker_whose_fee_is_underpaid() {
 
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// A read backend that can be made to fail `get_tx` on demand (#142). Every other read delegates to a
+/// real `ChainNode`, so the swap still progresses; only `get_tx` fails while `pending` is set, which
+/// makes the counterparty fee read `Pending` (engine `fee_state`). It is the deterministic seam for
+/// the `NotYetFundable` branch: once a swap has parked, a plain node always reads the fee as verified
+/// (parking requires it), so no real-node test can re-enter that branch without this.
+struct PendableBackend {
+    inner: ChainNode,
+    pending: Arc<AtomicBool>,
+}
+
+impl ChainBackend for PendableBackend {
+    fn network(&self) -> Network {
+        self.inner.network()
+    }
+    fn height(&self) -> Result<u32, NodeError> {
+        self.inner.height()
+    }
+    fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
+        if self.pending.load(Ordering::SeqCst) {
+            return Err(NodeError::Unexpected(
+                "pendable: tx not readable yet".into(),
+            ));
+        }
+        self.inner.get_tx(txid)
+    }
+    fn watch_contract(&self, contract: &Contract) -> Result<(), NodeError> {
+        self.inner.watch_contract(contract)
+    }
+    fn lock_view(
+        &self,
+        contract: &Contract,
+        amount: Amount,
+        ours: &[ScriptBuf],
+    ) -> Result<Option<LockView>, NodeError> {
+        self.inner.lock_view(contract, amount, ours)
+    }
+    fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError> {
+        self.inner.broadcast(tx)
+    }
+    fn estimate_fee_sat_vb(&self, conf_target: u16) -> Option<u64> {
+        self.inner.estimate_fee_sat_vb(conf_target)
+    }
+}
+
+/// #142: `submit_signed_lock` must refuse *retryably* (`NotYetFundable`), not terminally, when a parked
+/// swap re-decides to not-fund while still live, keeping the parked PSBT byte-for-byte so the user's
+/// signature is never stranded by a rebuild, and must then fund normally once the condition clears.
+///
+/// The deterministic trigger is a read backend whose `get_tx` fails on demand: with a fee-bearing
+/// offer the taker's view of the maker's fee goes `Pending` (engine `fee_state`), so funding is no
+/// longer decided though the phase is still `Locking`. Parking itself requires the fee verified, so a
+/// plain node cannot re-enter this branch once parked, hence the injectable backend (the approach
+/// captured on #142). Its sibling `NoLongerFundable` is already covered by the late-submit test.
+#[test]
+fn a_parked_submit_is_refused_retryably_while_the_fee_is_unreadable_then_funds_when_it_clears() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser142"]));
+    let user = core.rpc.wallet("takeruser142");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let btc_fee = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-i142-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-i142-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    // The taker reads the maker's (xBTC) chain through a backend we can flip to fail `get_tx`. It
+    // delegates to a real ChainNode on the same wallet name, so watch_contract and lock_view keep
+    // working (load is idempotent); only the fee read can be made to stall.
+    let pending = Arc::new(AtomicBool::new(false));
+    let fake = PendableBackend {
+        inner: ChainNode::open(knots.rpc.clone(), "taker").unwrap(),
+        pending: pending.clone(),
+    };
+    taker.set_read_backend(Chain::Xbtc, Box::new(fake));
+
+    // Fund both legs.
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("takerfund")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    // Drive to parked with `get_tx` working: the fee verifies and the taker parks its signed PSBT.
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .unwrap();
+    let mut rounds = 0;
+    let (swap_id, parked) = loop {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        if let Some(id) = taker.swaps().next().map(|s| s.id) {
+            if let Some(psbt) = taker.pending_lock_psbt(id) {
+                break (id, psbt);
+            }
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "taker never parked: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
+    assert_eq!(signed["complete"], true, "the user's wallet fully signs it");
+    let signed_psbt = signed["psbt"].as_str().unwrap().to_owned();
+
+    // The maker's fee output becomes unreadable: the parked submit must refuse RETRYABLY.
+    pending.store(true, Ordering::SeqCst);
+    let err = taker.submit_signed_lock(swap_id, &signed_psbt).unwrap_err();
+    assert!(
+        matches!(err, EngineError::NotYetFundable),
+        "a parked submit whose fee is not yet readable must be NotYetFundable, got {err:?}"
+    );
+
+    // The swap stays live (not terminal), and the parked PSBT is preserved byte-for-byte so the user's
+    // signature is never stranded by a rebuild.
+    assert_eq!(
+        taker.swaps().next().map(|s| s.phase),
+        Some(Phase::Locking),
+        "a retryable refusal must leave the swap live"
+    );
+    assert_eq!(
+        taker.pending_lock_psbt(swap_id).as_deref(),
+        Some(parked.as_str()),
+        "the parked PSBT must survive a retryable refusal unchanged"
+    );
+
+    // Once the fee is readable again, the very same submit funds normally and the swap settles.
+    pending.store(false, Ordering::SeqCst);
+    taker
+        .submit_signed_lock(swap_id, &signed_psbt)
+        .expect("funds once the fee is readable again");
+
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 80,
+            "the swap did not settle after recovery: maker {:?}, taker {:?}",
+            maker.swaps().next().map(|s| s.phase),
+            taker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// A regtest `sprt1...` silent-payment address, for the 0018 fundability guard tests.
+fn sp1_regtest(scan: u8, spend: u8) -> String {
+    let secp = Secp256k1::new();
+    SilentPaymentAddress {
+        scan: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[scan; 32]).unwrap()),
+        spend: PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[spend; 32]).unwrap()),
+        network: Network::Regtest,
+    }
+    .encode()
+}
+
+/// Design 0018: an interactive taker cannot build a silent-payment (sp1) fee output on the chain it
+/// locks (the engine holds no input keys), so taking such an offer would strand the maker's
+/// already-locked coin to a refund. `bid` must refuse up front with BidError::FeeNotFundable.
+#[test]
+fn an_interactive_taker_refuses_an_sp1_fee_it_cannot_fund() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["takeruser-sp1"]));
+    let user = core.rpc.wallet("takeruser-sp1");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let tdir = std::env::temp_dir().join(format!("sovswap-sp1t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tdir);
+    // open_taker funds BTC interactively; offer() has maker_chain = Xbtc, so the taker locks BTC and
+    // would owe the BTC fee.
+    let mut taker = open_taker(&tdir, &relay, &core, &knots, &receive, &change);
+
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(sp1_regtest(0x21, 0x22)),
+            xbtc_address: None,
+        }),
+        ..offer()
+    };
+    let err = taker
+        .bid(&fee_offer, fee_offer.maker_amount, [9; 16])
+        .expect_err("an interactive taker must refuse an sp1 fee it cannot build");
+    assert!(
+        matches!(err, EngineError::Bid(BidError::FeeNotFundable)),
+        "expected Bid(FeeNotFundable), got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tdir);
+}
+
+/// Design 0018: a maker that funds its chain interactively cannot build a silent-payment fee output
+/// on that chain, so `publish` must refuse an offer whose fee for the maker's chain is sp1 rather than
+/// advertise a swap it cannot fund (EngineError::FeeNotFundable).
+#[test]
+fn a_maker_refuses_to_publish_an_sp1_fee_it_cannot_fund_interactively() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    core.call("createwallet", json!(["makeruser-sp1"]));
+    let user = core.rpc.wallet("makeruser-sp1");
+    let (receive, change) = wpkh_descriptors(&user.call("listdescriptors", json!([])).unwrap());
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-sp1m-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    // open_maker_interactive funds BTC interactively; offer_btc() has maker_chain = Btc.
+    let mut maker = open_maker_interactive(&mdir, &relay, &core, &knots, &receive, &change);
+
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(sp1_regtest(0x23, 0x24)),
+            xbtc_address: None,
+        }),
+        ..offer_btc()
+    };
+    let err = maker.publish(fee_offer).expect_err(
+        "a maker funding interactively must refuse to publish an sp1 fee it cannot build",
+    );
+    assert!(
+        matches!(err, EngineError::FeeNotFundable),
+        "expected FeeNotFundable, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&mdir);
 }
