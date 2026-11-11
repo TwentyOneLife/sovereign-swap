@@ -1,8 +1,37 @@
 # 0022 Silent-payment (sp1) fee and donation collection (#110)
 
-Status: proposal, 2026-11-10. Addresses #110 and the finding in runbook `bb2c478` ("fees use plain
-taproot, not sp1"). Builds on [0010](0010-fee-output-and-silent-payments.md) (fee output and silent
-payments) and [0013](0013-fee-collection-and-address-choice.md) (fee collection and address choice).
+Status: proposal, 2026-11-10; corrected 2026-11-11 (see "Correction" below). Addresses #110 and the
+finding in runbook `bb2c478` ("fees use plain taproot, not sp1"). Builds on
+[0010](0010-fee-output-and-silent-payments.md) (fee output and silent payments) and
+[0013](0013-fee-collection-and-address-choice.md) (fee collection and address choice), and is bounded
+by the later, merged [0018](0018-interactive-funding-and-the-fee-output.md) (normal taproot is the
+universal fee default; sp1 is opt-in).
+
+## Correction (2026-11-11): the PAYING side needs a BIP352-aware signer
+
+This note (drafted before 0018 and #166 landed) said configuring an sp1 fee address "just works today".
+That is true only for a **hot, BIP352-aware signer** (the regtest `WalletSigner`). It is NOT true for
+the production paths:
+
+- The production **cold** signer (`RemoteSigner`, `src/signer.rs`) is not BIP352-aware; `node.rs`
+  `sign_with_silent_fee` refuses by default, so a cold-funded lock cannot build an sp1 fee output.
+- **Interactive** funding (0017, the non-custodial path) structurally cannot build one: the engine
+  holds no input private keys, and a silent-payment output is derived from them.
+
+Design 0018 therefore makes normal taproot the universal fee default and sp1 an opt-in for a hot or
+BIP352-aware signer only, and the fundability guard (#166) now REFUSES, at publish and at bid, an sp1
+fee for a chain the party funds interactively or with a non-BIP352 cold signer, so it can never strand
+a swap. Consequences for #110:
+
+- **Beta stays on taproot** (owner decision). sp1 paying is simply unavailable on the interactive path,
+  and unavailable on the cold path until a BIP352-aware cold signer exists.
+- #110 is therefore **not purely ops/key**. Two tracks: (a) the PAYING side for cold-mode operators
+  needs a BIP352-aware cold signer (a signer feature, the `sovereign-swap-signer` milestone); (b) the
+  project's own RECEIVING side is the ops/key task below (its scan half shipped scan-only in the fee
+  scanner, #168; the sweep and the offline key material remain).
+
+The rest of this note (the receiving-side plan) stands; read "just works today" as "works with a
+BIP352-aware signer".
 
 ## The important correction this note records
 
@@ -19,7 +48,8 @@ key-management change. Evidence:
   drives a full swap whose BOTH fee addresses are `SilentPaymentAddress`es, to `Phase::Done`.
 
 So the protocol already carries an sp1 fee output plus its DLEQ proof, and both sides already fund and
-verify it. Configuring an `sp1...` fee address "just works" today.
+verify it. Configuring an `sp1...` fee address "just works" **with a hot or otherwise BIP352-aware
+signer** (see the Correction above: the production cold and interactive paths cannot build one).
 
 ## What is actually unfinished (the real #110)
 
