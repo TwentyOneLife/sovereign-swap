@@ -30,27 +30,7 @@ step in this documentation names the chain it is on.
 
 ## The pieces, at a glance
 
-```
-            ┌─────────────────────────────────────────────┐
-            │                 Your node                     │
-            │                                               │
-   you ───► │  Web GUI ─► Engine ─► BTC node   (Bitcoin)    │ ──► BTC chain
-            │              │     └─► xBTC node  (Blake2b)    │ ──► xBTC chain
-            │              │                                │
-            │              └─► Client (Nostr, Tor-first)    │
-            └───────────────────────┬───────────────────────┘
-                                     │  sealed, signed messages
-                                     ▼
-                         ┌───────────────────────┐
-                         │   Nostr relay(s)       │   carries offers and
-                         │   (untrusted,          │   swap steps; holds no
-                         │    Tor .onion)         │   funds and no keys
-                         └───────────┬───────────┘
-                                     │
-                                     ▼
-                              a counterparty's
-                              node, somewhere
-```
+<img class="diagram" src="/diagrams/overview-1.svg" alt="The pieces, at a glance (diagram)" loading="lazy" />
 
 **Reading the diagram:** your node runs the **engine** (the state machine that drives a swap), talks to
 a **BTC node** and an **xBTC node** (yours, so you trust the chain data), and a **client** that carries

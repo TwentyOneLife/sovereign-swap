@@ -6,24 +6,7 @@ and the rules that keep a swap from ever stranding a coin.
 
 ## The phases
 
-```
-                 ┌──────────┐
-                 │ Offered  │  maker posted an offer / taker is bidding
-                 └────┬─────┘
-                      ▼
-                 ┌──────────┐  a lock is being funded on chain
-                 │ Locking  │
-                 └────┬─────┘
-            ┌─────────┼───────────────┐
-            ▼         ▼               ▼
-      ┌──────────┐ ┌──────────┐  ┌───────────┐
-      │ Claiming │ │Refunding │  │ Abandoned │  (never funded, safe to drop)
-      └────┬─────┘ └────┬─────┘  └───────────┘
-           ▼            ▼
-      ┌──────────┐ ┌──────────┐
-      │   Done   │ │ Refunded │
-      └──────────┘ └──────────┘
-```
+<img class="diagram" src="/diagrams/lifecycle-1.svg" alt="The phases (diagram)" loading="lazy" />
 
 - **Offered** - the offer is live or a bid is in flight. No coin is committed.
 - **Locking** - a lock is being funded. The engine will only move forward once it sees the required
@@ -67,11 +50,6 @@ So an operator can always wind a swap down to a safe state through the API, neve
 
 ## What a stall looks like
 
-```
-   maker funds, taker never funds   ─►  Locking ─► (40 blocks) ─► Refunding ─► Refunded
-   both fund, maker never claims    ─►  taker:  (20 blocks) ─► Refunded
-                                        maker:  (40 blocks) ─► Refunded
-   relay drops a message            ─►  swap cannot progress ─► refund at timelock
-```
+<img class="diagram" src="/diagrams/lifecycle-2.svg" alt="What a stall looks like (diagram)" loading="lazy" />
 
 In every case the coins come home. That is the property the whole design protects.

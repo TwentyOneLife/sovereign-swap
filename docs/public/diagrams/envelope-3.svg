@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 645 142" width="645" role="img" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<style>:root{--bg:#f6f6f7;--fg:#2c2c34;--brd:#e2e2e3}@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#d7d7db;--brd:#2e2e32}}rect.p{fill:var(--bg);stroke:var(--brd)}text{fill:var(--fg)}rect.a{fill:#F7931A}</style>
+<rect class="p" x="0.5" y="0.5" width="644" height="141" rx="8"/>
+<rect class="a" x="0" y="0" width="645" height="3" rx="1.5"/>
+<text x="16" y="32.5" font-size="15" xml:space="preserve"> Nostr event (kind 4859)</text>
+<text x="16" y="54.5" font-size="15" xml:space="preserve">   └── content = hex( frame )</text>
+<text x="16" y="76.5" font-size="15" xml:space="preserve">         frame = [ sender public-identity hint ] ++ [ envelope ]</text>
+<text x="16" y="98.5" font-size="15" xml:space="preserve">                        (a hint only; the envelope&#x27;s own signatures are</text>
+<text x="16" y="120.5" font-size="15" xml:space="preserve">                         verified against it, so a wrong hint just fails)</text>
+</svg>

@@ -11,16 +11,7 @@ filter. Sovereign Swap uses it purely as store-and-forward plumbing for the
 [post-quantum envelope](/guide/envelope). Each protocol message becomes one Nostr event of a dedicated
 kind (**4859**), whose content is the sealed/signed envelope in hex.
 
-```
-   your client ──EVENT──►┐                    ┌──REQ (subscribe)── a peer's client
-                         ▼                    ▼
-                    ┌─────────────────────────────┐
-                    │   Nostr relay (kind 4859)    │
-                    │   store + forward only       │
-                    └─────────────────────────────┘
-                         ▲                    │
-                         └────────EVENT───────┘  (fan-out to subscribers)
-```
+<img class="diagram" src="/diagrams/transport-and-privacy-1.svg" alt="Why Nostr (diagram)" loading="lazy" />
 
 - **Offers** are broadcast events (no recipient); any subscriber can see and verify them.
 - **Bids, accepts, swap steps, fee proofs** are directed events tagged to one recipient and sealed to it;
@@ -30,10 +21,7 @@ kind (**4859**), whose content is the sealed/signed envelope in hex.
 
 ## Tor first
 
-```
-   client ──SOCKS5──► Tor ──► relay .onion:7777
-   client ──SOCKS5──► Tor ──► your node RPC (.onion)   [optional, design 0011]
-```
+<img class="diagram" src="/diagrams/transport-and-privacy-2.svg" alt="Tor first (diagram)" loading="lazy" />
 
 By default the client dials relays (and can dial nodes) as **`.onion`** services through a Tor SOCKS5
 proxy. Because the envelope already encrypts and authenticates end to end, no TLS is layered on the Tor

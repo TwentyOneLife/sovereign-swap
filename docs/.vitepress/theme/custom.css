@@ -24,3 +24,11 @@
   --vp-c-brand-2: #F7931A;
   --vp-c-brand-3: #e07c00;
 }
+
+/* ASCII diagrams rendered as scale-to-fit SVG (crisp, theme-aware, no truncation). */
+.vp-doc img.diagram {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 1.25rem auto;
+}
