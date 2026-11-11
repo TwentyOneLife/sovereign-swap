@@ -50,7 +50,7 @@ The notes below are listed in order. Each links to the full text.
 - [0013 - Fee collection and address choice](/design/0013-fee-collection-and-address-choice) - silent
   payment or normal address, with daemon-side scanning.
 - [0022 - Silent-payment fee and donation collection](/design/0022-sp1-fee-collection) - adopting sp1
-  for the project's own collection. *(Lands with PR #159.)*
+  for the project's own collection.
 
 ## Security and abuse deterrence
 
@@ -61,7 +61,7 @@ The notes below are listed in order. Each links to the full text.
 - [0020 - Store-flood admission and proof of work](/design/0020-store-flood-admission-and-proof-of-work) -
   hardening the relay store against flooding.
 - [0021 - Relay-side tombstone for retired offers](/design/0021-relay-tombstone) - retiring a withdrawn
-  offer on the relay. *(Lands with PR #158.)*
+  offer on the relay.
 
 ## Resilience (future)
 
