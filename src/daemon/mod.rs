@@ -19,7 +19,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::hex::{Case, DisplayHex, FromHex};
 use bitcoin::Amount;
@@ -72,7 +72,7 @@ const APP_JS: &str = include_str!("../gui/app.js");
 /// reader takes fully untrusted client input, so a panic here is a remote DoS; the fuzzer hunts them.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_read_request(data: &[u8]) {
-    let _ = wire::read_request(&mut std::io::Cursor::new(data));
+    let _ = wire::read_request(&mut std::io::Cursor::new(data), None);
 }
 
 struct DaemonState {
@@ -453,6 +453,14 @@ impl Daemon {
     /// from spawning unbounded threads and exhausting memory. The relay server has the same guard.
     const MAX_CONNECTIONS: usize = 128;
 
+    /// Absolute wall-clock bound on reading one request (headers + body). A real client, even over Tor,
+    /// delivers a small request in well under this; the purpose is to cut a slowloris that dribbles
+    /// bytes to hold a connection slot forever (the `MAX_CONNECTIONS` cap alone does not help, since a
+    /// per-read socket timeout is reset by every trickled byte). Over the onion every connection shares
+    /// the Tor proxy source, so per-client limiting is impossible; a short, firm read deadline is the
+    /// defence. Generous enough not to cut a slow Tor circuit delivering a 64 KB body.
+    const REQUEST_READ_DEADLINE_SECS: u64 = 5;
+
     fn accept_loop(self, listener: TcpListener) {
         let me = Arc::new(self);
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -475,8 +483,13 @@ impl Daemon {
     }
 
     fn serve_connection(&self, mut stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let req = match read_request(&mut stream) {
+        // A short per-read timeout so a stalled read wakes often enough to re-check the absolute
+        // deadline below; the deadline, not this, is what bounds a slow-drip (slowloris) connection.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let req = match read_request(
+            &mut stream,
+            Some(Instant::now() + Duration::from_secs(Self::REQUEST_READ_DEADLINE_SECS)),
+        ) {
             Ok(req) => req,
             Err(code) => {
                 return self.write_json(&mut stream, code, &json!({"error": "bad request"}))
