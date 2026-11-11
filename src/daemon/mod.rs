@@ -13,6 +13,7 @@
 //! - the request is size-capped and the body must parse as the expected JSON, or it is refused;
 //! - there is no "move funds" or "freeze" route: the API starts and watches swaps, never seizes value.
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -97,6 +98,12 @@ pub struct Daemon {
     /// present, the page and its assets (which carry the API token) are served only to a browser that
     /// passes HTTP Basic auth, so knowing the onion is no longer enough to reach the swaps.
     basic_auth: Option<(String, String)>,
+    /// An exclusive OS lock on the data dir, held for the daemon's whole life (design 0004). Two
+    /// daemons on one seed and state would reuse per-swap key indices and secrets and double-broadcast,
+    /// losing funds; this makes a second daemon on the same data dir refuse to start. Never read after
+    /// `open`; it exists only to hold the lock until the file is dropped (daemon shutdown or exit).
+    #[allow(dead_code)]
+    _state_lock: File,
 }
 
 impl Daemon {
@@ -104,6 +111,32 @@ impl Daemon {
     /// token (`token`, mode 600).
     pub fn open(data_dir: &Path) -> std::io::Result<Daemon> {
         std::fs::create_dir_all(data_dir)?;
+        // Single-writer guard (design 0004): take an exclusive, non-blocking lock on a lockfile in the
+        // data dir and hold it for the daemon's life. A second daemon on the same seed and state would
+        // reuse key indices and secrets and double-broadcast, which can lose funds, so refuse to start
+        // rather than run two writers. The lock is advisory and released when the file is dropped or the
+        // process exits (so a crash does not leave it stuck).
+        let lock_path = data_dir.join("daemon.lock");
+        let state_lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match state_lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "another sovereign-swap daemon already holds the state lock at {}; \
+                         two daemons on one seed would double-broadcast and risk losing funds \
+                         (design 0004). Refusing to start.",
+                        lock_path.display()
+                    ),
+                ));
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
         let settings: Settings = match std::fs::read(data_dir.join("settings.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => Settings::default(),
@@ -132,6 +165,7 @@ impl Daemon {
             events: Arc::new(Mutex::new(Vec::new())),
             reference: Reference::default(),
             basic_auth,
+            _state_lock: state_lock,
         };
         // If the saved settings are already complete, bring the engine up. A failure here is not fatal
         // (the GUI learns it from GET /status), but it is logged: a silently swallowed reason is very
