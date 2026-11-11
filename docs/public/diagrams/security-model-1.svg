@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 570 164" width="570" role="img" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<style>:root{--bg:#f6f6f7;--fg:#2c2c34;--brd:#e2e2e3}@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#d7d7db;--brd:#2e2e32}}rect.p{fill:var(--bg);stroke:var(--brd)}text{fill:var(--fg)}rect.a{fill:#F7931A}</style>
+<rect class="p" x="0.5" y="0.5" width="569" height="163" rx="8"/>
+<rect class="a" x="0" y="0" width="570" height="3" rx="1.5"/>
+<text x="16" y="32.5" font-size="15" xml:space="preserve">   TRUSTED (you run it)              UNTRUSTED (assumed hostile)</text>
+<text x="16" y="54.5" font-size="15" xml:space="preserve">   ───────────────────              ──────────────────────────</text>
+<text x="16" y="76.5" font-size="15" xml:space="preserve">   your BTC node                    the counterparty</text>
+<text x="16" y="98.5" font-size="15" xml:space="preserve">   your xBTC node                   the relay(s)</text>
+<text x="16" y="120.5" font-size="15" xml:space="preserve">   your keys / signer               the network</text>
+<text x="16" y="142.5" font-size="15" xml:space="preserve">   the code you verified            every message you receive</text>
+</svg>

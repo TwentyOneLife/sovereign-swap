@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 687 714" width="687" role="img" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<style>:root{--bg:#f6f6f7;--fg:#2c2c34;--brd:#e2e2e3}@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#d7d7db;--brd:#2e2e32}}rect.p{fill:var(--bg);stroke:var(--brd)}text{fill:var(--fg)}rect.a{fill:#F7931A}</style>
+<rect class="p" x="0.5" y="0.5" width="686" height="713" rx="8"/>
+<rect class="a" x="0" y="0" width="687" height="3" rx="1.5"/>
+<text x="16" y="32.5" font-size="15" xml:space="preserve">   ┌───────────────────────────── your node ─────────────────────────────┐</text>
+<text x="16" y="54.5" font-size="15" xml:space="preserve">   │                                                                      │</text>
+<text x="16" y="76.5" font-size="15" xml:space="preserve">   │   Web GUI ───────────► Daemon (HTTP API, token-gated)                │</text>
+<text x="16" y="98.5" font-size="15" xml:space="preserve">   │   (browser)                 │                                        │</text>
+<text x="16" y="120.5" font-size="15" xml:space="preserve">   │                             ▼                                        │</text>
+<text x="16" y="142.5" font-size="15" xml:space="preserve">   │                         ┌────────┐   drives each swap&#x27;s state        │</text>
+<text x="16" y="164.5" font-size="15" xml:space="preserve">   │                         │ Engine │   machine; reads both chains,     │</text>
+<text x="16" y="186.5" font-size="15" xml:space="preserve">   │                         └───┬────┘   decides, acts                   │</text>
+<text x="16" y="208.5" font-size="15" xml:space="preserve">   │             funding + signing │        │ chain reads                 │</text>
+<text x="16" y="230.5" font-size="15" xml:space="preserve">   │        ┌──────────────────────┘        └────────────┐               │</text>
+<text x="16" y="252.5" font-size="15" xml:space="preserve">   │        ▼                                             ▼               │</text>
+<text x="16" y="274.5" font-size="15" xml:space="preserve">   │  ┌───────────┐   ┌───────────────┐          ┌──────────────────┐     │</text>
+<text x="16" y="296.5" font-size="15" xml:space="preserve">   │  │ BTC node  │   │ xBTC node     │          │ read backend     │     │</text>
+<text x="16" y="318.5" font-size="15" xml:space="preserve">   │  │ (Core/    │   │ (Knots        │          │ node RPC, or an  │     │</text>
+<text x="16" y="340.5" font-size="15" xml:space="preserve">   │  │  Knots)   │   │  Blake2b)     │          │ Electrum server  │     │</text>
+<text x="16" y="362.5" font-size="15" xml:space="preserve">   │  └───────────┘   └───────────────┘          └──────────────────┘     │</text>
+<text x="16" y="384.5" font-size="15" xml:space="preserve">   │        ▲                                                             │</text>
+<text x="16" y="406.5" font-size="15" xml:space="preserve">   │        │ cold signing (optional, design 0012)                       │</text>
+<text x="16" y="428.5" font-size="15" xml:space="preserve">   │  ┌───────────────┐                                                   │</text>
+<text x="16" y="450.5" font-size="15" xml:space="preserve">   │  │ cold signer   │   signs funding PSBTs off the hot node           │</text>
+<text x="16" y="472.5" font-size="15" xml:space="preserve">   │  └───────────────┘                                                   │</text>
+<text x="16" y="494.5" font-size="15" xml:space="preserve">   │                                                                      │</text>
+<text x="16" y="516.5" font-size="15" xml:space="preserve">   │   Client (Nostr transport) ──── sealed/signed messages ────┐        │</text>
+<text x="16" y="538.5" font-size="15" xml:space="preserve">   └────────────────────────────────────────────────────────────┼────────┘</text>
+<text x="16" y="560.5" font-size="15" xml:space="preserve">                                                                  ▼</text>
+<text x="16" y="582.5" font-size="15" xml:space="preserve">                                                 ┌──────────────────────────┐</text>
+<text x="16" y="604.5" font-size="15" xml:space="preserve">                                                 │  Nostr relay(s)           │</text>
+<text x="16" y="626.5" font-size="15" xml:space="preserve">                                                 │  untrusted, Tor .onion    │</text>
+<text x="16" y="648.5" font-size="15" xml:space="preserve">                                                 │  (own daemon binary;      │</text>
+<text x="16" y="670.5" font-size="15" xml:space="preserve">                                                 │   holds no funds/keys)    │</text>
+<text x="16" y="692.5" font-size="15" xml:space="preserve">                                                 └──────────────────────────┘</text>
+</svg>

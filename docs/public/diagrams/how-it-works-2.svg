@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 721 186" width="721" role="img" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<style>:root{--bg:#f6f6f7;--fg:#2c2c34;--brd:#e2e2e3}@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#d7d7db;--brd:#2e2e32}}rect.p{fill:var(--bg);stroke:var(--brd)}text{fill:var(--fg)}rect.a{fill:#F7931A}</style>
+<rect class="p" x="0.5" y="0.5" width="720" height="185" rx="8"/>
+<rect class="a" x="0" y="0" width="721" height="3" rx="1.5"/>
+<text x="16" y="32.5" font-size="15" xml:space="preserve">                  if the swap stalls at any point, the timelocks resolve it</text>
+<text x="16" y="54.5" font-size="15" xml:space="preserve">                  ───────────────────────────────────────────────────────</text>
+<text x="16" y="76.5" font-size="15" xml:space="preserve">   maker funds, taker never funds   ─►  maker refunds HTLC #1 after 40 blocks</text>
+<text x="16" y="98.5" font-size="15" xml:space="preserve">   both fund, maker never claims    ─►  taker refunds HTLC #2 after 20 blocks,</text>
+<text x="16" y="120.5" font-size="15" xml:space="preserve">                                        then maker refunds HTLC #1 after 40</text>
+<text x="16" y="142.5" font-size="15" xml:space="preserve">   maker claims (reveals s), taker  ─►  taker claims HTLC #1 with s (has until 40)</text>
+<text x="16" y="164.5" font-size="15" xml:space="preserve">     tries to skip paying                 there is no &quot;skip&quot;: claiming IS paying</text>
+</svg>

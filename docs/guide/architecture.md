@@ -5,39 +5,7 @@ and the only trusted parts are the ones you run yourself.
 
 ## Components
 
-```
-   ┌───────────────────────────── your node ─────────────────────────────┐
-   │                                                                      │
-   │   Web GUI ───────────► Daemon (HTTP API, token-gated)                │
-   │   (browser)                 │                                        │
-   │                             ▼                                        │
-   │                         ┌────────┐   drives each swap's state        │
-   │                         │ Engine │   machine; reads both chains,     │
-   │                         └───┬────┘   decides, acts                   │
-   │             funding + signing │        │ chain reads                 │
-   │        ┌──────────────────────┘        └────────────┐               │
-   │        ▼                                             ▼               │
-   │  ┌───────────┐   ┌───────────────┐          ┌──────────────────┐     │
-   │  │ BTC node  │   │ xBTC node     │          │ read backend     │     │
-   │  │ (Core/    │   │ (Knots        │          │ node RPC, or an  │     │
-   │  │  Knots)   │   │  Blake2b)     │          │ Electrum server  │     │
-   │  └───────────┘   └───────────────┘          └──────────────────┘     │
-   │        ▲                                                             │
-   │        │ cold signing (optional, design 0012)                       │
-   │  ┌───────────────┐                                                   │
-   │  │ cold signer   │   signs funding PSBTs off the hot node           │
-   │  └───────────────┘                                                   │
-   │                                                                      │
-   │   Client (Nostr transport) ──── sealed/signed messages ────┐        │
-   └────────────────────────────────────────────────────────────┼────────┘
-                                                                  ▼
-                                                 ┌──────────────────────────┐
-                                                 │  Nostr relay(s)           │
-                                                 │  untrusted, Tor .onion    │
-                                                 │  (own daemon binary;      │
-                                                 │   holds no funds/keys)    │
-                                                 └──────────────────────────┘
-```
+<img class="diagram" src="/diagrams/architecture-1.svg" alt="Components (diagram)" loading="lazy" />
 
 **Reading the diagram:**
 

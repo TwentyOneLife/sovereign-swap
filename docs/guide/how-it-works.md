@@ -26,24 +26,7 @@ revealed `s`.
 
 ## The sequence
 
-```
- Maker (sells xBTC)                      Taker (sells BTC)                 On chain
- ──────────────────                      ─────────────────                ────────
- pick secret s, H = SHA256(s)
- publish Offer  ─────────────────────────────────────────────► (over Nostr)
-                          ◄───────────────── Bid (swap id, taker key hashes)
- Accept (H, maker key hashes) ────────────────────────────────►
- fund HTLC #1 on xBTC ─────────────────────────────────────────────────► xBTC: locked
-      (claim: taker+s / refund: maker after 40)
-                          taker reads and verifies HTLC #1
-                          fund HTLC #2 on BTC ─────────────────────────► BTC: locked
-                               (claim: maker+s / refund: taker after 20)
- maker reads and verifies HTLC #2
- claim BTC with s ─────────────────────────────────────────────────────► BTC: s now public
-                          taker reads s from the BTC claim
-                          claim xBTC with s ───────────────────────────► xBTC: taker paid
- ✅ maker now holds BTC, taker now holds xBTC
-```
+<img class="diagram" src="/diagrams/how-it-works-1.svg" alt="The sequence (diagram)" loading="lazy" />
 
 **Reading the diagram, step by step:**
 
@@ -63,15 +46,7 @@ Both sides end with the coin they wanted. The secret tied the two claims togethe
 
 ## Why no one can cheat
 
-```
-                  if the swap stalls at any point, the timelocks resolve it
-                  ───────────────────────────────────────────────────────
-   maker funds, taker never funds   ─►  maker refunds HTLC #1 after 40 blocks
-   both fund, maker never claims    ─►  taker refunds HTLC #2 after 20 blocks,
-                                        then maker refunds HTLC #1 after 40
-   maker claims (reveals s), taker  ─►  taker claims HTLC #1 with s (has until 40)
-     tries to skip paying                 there is no "skip": claiming IS paying
-```
+<img class="diagram" src="/diagrams/how-it-works-2.svg" alt="Why no one can cheat (diagram)" loading="lazy" />
 
 - **The maker cannot take the taker's BTC without paying.** To claim HTLC #2 the maker must reveal `s`
   on chain, which immediately lets the taker claim HTLC #1.

@@ -39,13 +39,7 @@ hybrid.
 
 ## Two kinds of message
 
-```
- BROADCAST  (an offer, a withdrawal)        DIRECTED  (a bid, accept, swap step, fee proof)
- ───────────────────────────────────        ─────────────────────────────────────────────
- signed, NOT encrypted                       signed, THEN encrypted to one recipient
- (public by nature: anyone may read          (only the named recipient can read it; the
-  an offer and verify who signed it)          relay and everyone else see only ciphertext)
-```
+<img class="diagram" src="/diagrams/envelope-1.svg" alt="Two kinds of message (diagram)" loading="lazy" />
 
 - **Broadcasts** are offers and their withdrawals. They are meant to be public, so they are signed with
   the hybrid signature but left in the clear. Anyone, including a relay, can read an offer and check its
@@ -56,28 +50,7 @@ hybrid.
 
 ## How a directed message is sealed
 
-```
-   plaintext Message (JSON)
-          │
-          ▼
-   ┌──────────────────┐   hybrid signature over the payload
-   │  sign            │   = Schnorr (secp256k1)  +  ML-DSA-87
-   └────────┬─────────┘   (valid only if BOTH verify)
-            ▼
-   signed payload
-            │
-            ▼
-   ┌──────────────────┐   shared secret from TWO key agreements:
-   │  derive key      │     X25519   (classical)
-   │  (HKDF)          │   + ML-KEM-1024 (post-quantum)
-   └────────┬─────────┘   combined with HKDF into one AES-256 key
-            ▼
-   ┌──────────────────┐
-   │  encrypt         │   AES-256-GCM (authenticated encryption)
-   └────────┬─────────┘
-            ▼
-   sealed envelope  ──►  carried as the Nostr event content (hex)
-```
+<img class="diagram" src="/diagrams/envelope-2.svg" alt="How a directed message is sealed (diagram)" loading="lazy" />
 
 **Reading the diagram:** the message is first **signed** with both signature schemes, then a session key
 is derived by combining an **X25519** and an **ML-KEM-1024** shared secret through **HKDF**, and the
@@ -89,13 +62,7 @@ A broadcast skips the encryption box: it is just the hybrid-signed payload in th
 
 ## Where the envelope sits in a Nostr event
 
-```
- Nostr event (kind 4859)
-   └── content = hex( frame )
-         frame = [ sender public-identity hint ] ++ [ envelope ]
-                        (a hint only; the envelope's own signatures are
-                         verified against it, so a wrong hint just fails)
-```
+<img class="diagram" src="/diagrams/envelope-3.svg" alt="Where the envelope sits in a Nostr event (diagram)" loading="lazy" />
 
 The envelope is the unit this page describes; the surrounding Nostr event, relay, and Tor transport are
 covered in [transport and privacy](/guide/transport-and-privacy). The envelope protects the message

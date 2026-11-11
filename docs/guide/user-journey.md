@@ -5,13 +5,7 @@ each step is in [how it works](/guide/how-it-works); here we stay at the level o
 
 ## Making an offer (the maker)
 
-```
-  1. Open the web GUI on your node.
-  2. New offer:  sell  [amount] [chain]   for   [amount] [other chain]
-                 e.g.  sell  0.01 xBTC     for   0.01 BTC
-  3. Publish.  ──►  the offer is broadcast over Nostr to your relays.
-  4. Wait for a taker to bid; accept is automatic once the bid checks out.
-```
+<img class="diagram" src="/diagrams/user-journey-1.svg" alt="Making an offer (the maker) (diagram)" loading="lazy" />
 
 Your offer carries the amounts, the per-leg timelocks, and the [fee](/guide/fees) terms. It is public:
 anyone on a shared relay can see it and verify you signed it. You can **withdraw** it any time before it
@@ -19,20 +13,11 @@ is taken.
 
 ## Taking an offer (the taker)
 
-```
-  1. Browse the market in the GUI (offers discovered over your relays).
-  2. Pick an offer, enter how much of it to take (full or partial if allowed).
-  3. Take.  ──►  a bid is sent to the maker; the swap begins.
-```
+<img class="diagram" src="/diagrams/user-journey-2.svg" alt="Taking an offer (the taker) (diagram)" loading="lazy" />
 
 ## What happens next (both sides)
 
-```
-   maker        funds its lock on chain      ──►  you see "Locking" then the lock confirm
-   taker        verifies it, funds its lock  ──►  both locks now on chain
-   maker        claims, revealing the secret ──►  "Claiming"
-   taker        claims with the secret       ──►  both "Done"
-```
+<img class="diagram" src="/diagrams/user-journey-3.svg" alt="What happens next (both sides) (diagram)" loading="lazy" />
 
 The engine does the on-chain steps for you according to your **funding mode**:
 

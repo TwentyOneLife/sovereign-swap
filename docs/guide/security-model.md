@@ -5,14 +5,7 @@ No counterparty, relay, or network attacker can do better than stall a swap, and
 
 ## What you trust, and what you do not
 
-```
-   TRUSTED (you run it)              UNTRUSTED (assumed hostile)
-   ───────────────────              ──────────────────────────
-   your BTC node                    the counterparty
-   your xBTC node                   the relay(s)
-   your keys / signer               the network
-   the code you verified            every message you receive
-```
+<img class="diagram" src="/diagrams/security-model-1.svg" alt="What you trust, and what you do not (diagram)" loading="lazy" />
 
 The software reads chain state only from **your own nodes**, moves coins only under **your own
 signatures**, and treats every incoming message as hostile until its signatures and, for a lock, its
@@ -23,13 +16,7 @@ on-chain reality are verified.
 There is **no mechanism to freeze, hold, or seize funds**, deliberately ([design 0007](/design/)). A
 swap has exactly these end states:
 
-```
-   ┌── both sides claim ──────────────► completed (each has the other's coin)
-   │
-   ├── maker refunds HTLC #1 ─────────► maker whole (taker never funded, or stalled)
-   │
-   └── taker refunds HTLC #2 ─────────► taker whole (maker never revealed)
-```
+<img class="diagram" src="/diagrams/security-model-2.svg" alt="Non-custodial by construction (diagram)" loading="lazy" />
 
 Every interruption, abandonment, or attack funnels into one of the refund paths. This is enforced by the
 chains' own timelocks, not by this software, so it holds even if the software, the relay, or the

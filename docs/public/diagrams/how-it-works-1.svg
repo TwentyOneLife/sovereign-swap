@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 788 384" width="788" role="img" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<style>:root{--bg:#f6f6f7;--fg:#2c2c34;--brd:#e2e2e3}@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#d7d7db;--brd:#2e2e32}}rect.p{fill:var(--bg);stroke:var(--brd)}text{fill:var(--fg)}rect.a{fill:#F7931A}</style>
+<rect class="p" x="0.5" y="0.5" width="787" height="383" rx="8"/>
+<rect class="a" x="0" y="0" width="788" height="3" rx="1.5"/>
+<text x="16" y="32.5" font-size="15" xml:space="preserve"> Maker (sells xBTC)                      Taker (sells BTC)                 On chain</text>
+<text x="16" y="54.5" font-size="15" xml:space="preserve"> ──────────────────                      ─────────────────                ────────</text>
+<text x="16" y="76.5" font-size="15" xml:space="preserve"> pick secret s, H = SHA256(s)</text>
+<text x="16" y="98.5" font-size="15" xml:space="preserve"> publish Offer  ─────────────────────────────────────────────► (over Nostr)</text>
+<text x="16" y="120.5" font-size="15" xml:space="preserve">                          ◄───────────────── Bid (swap id, taker key hashes)</text>
+<text x="16" y="142.5" font-size="15" xml:space="preserve"> Accept (H, maker key hashes) ────────────────────────────────►</text>
+<text x="16" y="164.5" font-size="15" xml:space="preserve"> fund HTLC #1 on xBTC ─────────────────────────────────────────────────► xBTC: locked</text>
+<text x="16" y="186.5" font-size="15" xml:space="preserve">      (claim: taker+s / refund: maker after 40)</text>
+<text x="16" y="208.5" font-size="15" xml:space="preserve">                          taker reads and verifies HTLC #1</text>
+<text x="16" y="230.5" font-size="15" xml:space="preserve">                          fund HTLC #2 on BTC ─────────────────────────► BTC: locked</text>
+<text x="16" y="252.5" font-size="15" xml:space="preserve">                               (claim: maker+s / refund: taker after 20)</text>
+<text x="16" y="274.5" font-size="15" xml:space="preserve"> maker reads and verifies HTLC #2</text>
+<text x="16" y="296.5" font-size="15" xml:space="preserve"> claim BTC with s ─────────────────────────────────────────────────────► BTC: s now public</text>
+<text x="16" y="318.5" font-size="15" xml:space="preserve">                          taker reads s from the BTC claim</text>
+<text x="16" y="340.5" font-size="15" xml:space="preserve">                          claim xBTC with s ───────────────────────────► xBTC: taker paid</text>
+<text x="16" y="362.5" font-size="15" xml:space="preserve"> ✅ maker now holds BTC, taker now holds xBTC</text>
+</svg>
