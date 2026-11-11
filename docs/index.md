@@ -16,6 +16,9 @@ hero:
       text: Security and cryptography
       link: /guide/security-model
     - theme: alt
+      text: Project README
+      link: https://github.com/TwentyOneLife/sovereign-swap#readme
+    - theme: alt
       text: View on GitHub
       link: https://github.com/TwentyOneLife/sovereign-swap
 
@@ -48,6 +51,8 @@ get their own coin back.
 
 ## Start here
 
+- **Want the quick pitch and current status?** Read the project
+  [README](https://github.com/TwentyOneLife/sovereign-swap#readme).
 - **New to it?** Read the [Overview](/guide/overview) and the [User journey](/guide/user-journey).
 - **Want to know why it is trustless?** Read [How it works](/guide/how-it-works) and the
   [Security model](/guide/security-model).
