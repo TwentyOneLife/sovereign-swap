@@ -6,11 +6,14 @@ use std::time::{Duration, Instant};
 
 use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::secp256k1::{Keypair, Secp256k1};
+use bitcoin::Amount;
 use tungstenite::{connect, Message as WsMessage};
 
+use sovereign_swap::envelope::{sign_broadcast, Identity};
 use sovereign_swap::nostr::{p_tag, Event, KIND_SWAP};
 use sovereign_swap::relay_server::{RelayConfig, RelayServer};
 use sovereign_swap::routing::RelayConn;
+use sovereign_swap::swap::{Chain, Message, Offer};
 use sovereign_swap::ws::WsConn;
 
 fn relay(cfg: RelayConfig) -> String {
@@ -690,5 +693,173 @@ fn a_rejected_publish_is_recorded_not_silently_dropped() {
     assert!(
         rejections.iter().any(|r| r.contains("retention")),
         "a rejected publish must be recorded, got {rejections:?}"
+    );
+}
+
+// --- Design 0021: relay-side tombstone for retired offers (#117) ---------------------------------
+
+/// A sample offer with a given id; the other terms are irrelevant to the relay (it only reads the id).
+fn an_offer(id: [u8; 16]) -> Offer {
+    Offer {
+        id,
+        maker_chain: Chain::Xbtc,
+        maker_amount: Amount::from_sat(1_000_000),
+        taker_amount: Amount::from_sat(300_000),
+        min_maker_amount: Amount::from_sat(100_000),
+        maker_lock_blocks: 40,
+        taker_lock_blocks: 20,
+        maker_lock_depth: 2,
+        taker_lock_depth: 2,
+        margin_blocks: 3,
+        fee: None,
+    }
+}
+
+/// Build a signed broadcast event (an offer or its withdrawal) exactly as the client would: the
+/// envelope is `sign_broadcast`ed under identity `id_seed`, framed behind the public identity, and
+/// carried by a kind-4859 event under routing key `routing_seed`.
+fn broadcast(routing_seed: u8, id_seed: u8, msg: &Message, created_at: u64) -> Event {
+    let id = Identity::from_seed(&[id_seed; 32]);
+    let payload = serde_json::to_vec(msg).unwrap();
+    let env = sign_broadcast(&id, &payload, [9; 32]);
+    let mut frame = id.public().to_bytes().to_vec();
+    frame.extend_from_slice(&env);
+    Event::build(
+        &Secp256k1::new(),
+        &key(routing_seed),
+        created_at,
+        vec![],
+        &frame,
+    )
+}
+
+fn publish(url: &str, ev: &Event) -> Vec<String> {
+    send_and_read(url, &format!(r#"["EVENT",{}]"#, ev.to_json()))
+}
+
+fn req_all(url: &str, sub: &str) -> Vec<String> {
+    send_and_read(url, &format!(r#"["REQ","{sub}",{{"kinds":[4859]}}]"#))
+}
+
+fn accepted(replies: &[String]) -> bool {
+    replies
+        .iter()
+        .any(|r| r.contains("\"OK\"") && r.contains("true"))
+}
+
+fn refused_as_withdrawn(replies: &[String]) -> bool {
+    replies
+        .iter()
+        .any(|r| r.contains("\"OK\"") && r.contains("false") && r.contains("withdrawn"))
+}
+
+fn served(replies: &[String], ev: &Event) -> bool {
+    let hex = ev.id.to_hex_string(Case::Lower);
+    replies.iter().any(|r| r.contains(&hex))
+}
+
+#[test]
+fn an_authentic_withdraw_evicts_the_offer_and_a_later_req_no_longer_returns_it() {
+    let url = relay(RelayConfig::default());
+    let now = Event::now_for_test();
+    let oid = [7u8; 16];
+
+    let offer = broadcast(1, 2, &Message::Offer(an_offer(oid)), now);
+    assert!(accepted(&publish(&url, &offer)), "offer should be accepted");
+    assert!(
+        served(&req_all(&url, "s1"), &offer),
+        "offer should be served before it is withdrawn"
+    );
+
+    // The maker withdraws it under the SAME routing key (its author identity).
+    let withdraw = broadcast(1, 2, &Message::Withdraw { offer_id: oid }, now + 1);
+    publish(&url, &withdraw);
+
+    assert!(
+        !served(&req_all(&url, "s2"), &offer),
+        "the withdrawn offer must be evicted from the store"
+    );
+}
+
+#[test]
+fn a_withdraw_from_a_different_author_does_not_evict_the_offer() {
+    let url = relay(RelayConfig::default());
+    let now = Event::now_for_test();
+    let oid = [8u8; 16];
+
+    let offer = broadcast(1, 2, &Message::Offer(an_offer(oid)), now);
+    publish(&url, &offer);
+
+    // A different routing key / identity tries to withdraw someone else's offer id.
+    let forged = broadcast(3, 4, &Message::Withdraw { offer_id: oid }, now + 1);
+    publish(&url, &forged);
+    assert!(
+        served(&req_all(&url, "s1"), &offer),
+        "a foreign withdrawal must NOT evict another author's offer"
+    );
+
+    // And because it evicted nothing, it recorded no tombstone: author 3 may still publish its own
+    // offer carrying that id (this guards the "record a tombstone only on a real eviction" rule).
+    let own = broadcast(3, 4, &Message::Offer(an_offer(oid)), now + 2);
+    assert!(
+        accepted(&publish(&url, &own)),
+        "a no-op withdrawal must not tombstone, so the author's own offer is accepted"
+    );
+}
+
+#[test]
+fn a_replayed_offer_for_a_tombstoned_id_is_refused() {
+    let url = relay(RelayConfig::default());
+    let now = Event::now_for_test();
+    let oid = [9u8; 16];
+
+    publish(&url, &broadcast(1, 2, &Message::Offer(an_offer(oid)), now));
+    publish(
+        &url,
+        &broadcast(1, 2, &Message::Withdraw { offer_id: oid }, now + 1),
+    );
+
+    // Replay the same offer (a fresh event, so not a duplicate): the tombstone must refuse it.
+    let replay = broadcast(1, 2, &Message::Offer(an_offer(oid)), now + 2);
+    assert!(
+        refused_as_withdrawn(&publish(&url, &replay)),
+        "an offer the author already withdrew must be refused on replay"
+    );
+}
+
+#[test]
+fn the_tombstone_set_is_bounded_so_the_oldest_retired_offer_can_reappear() {
+    let url = relay(RelayConfig {
+        max_tombstones: 2,
+        ..Default::default()
+    });
+    let now = Event::now_for_test();
+    let ids = [[1u8; 16], [2u8; 16], [3u8; 16]];
+
+    // Three offers, each published then withdrawn by its own author: three real evictions, so three
+    // tombstones recorded, but the cap of 2 evicts the oldest.
+    for (i, oid) in ids.iter().enumerate() {
+        let (rk, ik) = (10 + i as u8, 20 + i as u8);
+        publish(
+            &url,
+            &broadcast(rk, ik, &Message::Offer(an_offer(*oid)), now),
+        );
+        publish(
+            &url,
+            &broadcast(rk, ik, &Message::Withdraw { offer_id: *oid }, now + 1),
+        );
+    }
+
+    // The oldest tombstone (ids[0]) was pushed out, so that offer may be republished...
+    let reappear = broadcast(10, 20, &Message::Offer(an_offer(ids[0])), now + 2);
+    assert!(
+        accepted(&publish(&url, &reappear)),
+        "the oldest tombstone should have been evicted, letting its offer reappear"
+    );
+    // ...while the newest tombstone (ids[2]) still refuses its offer.
+    let still_dead = broadcast(12, 22, &Message::Offer(an_offer(ids[2])), now + 2);
+    assert!(
+        refused_as_withdrawn(&publish(&url, &still_dead)),
+        "the newest tombstone must still refuse its offer"
     );
 }
