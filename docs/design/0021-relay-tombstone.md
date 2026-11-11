@@ -1,6 +1,6 @@
 # 0021 Relay-side tombstone for retired offers (defence in depth, #117)
 
-Status: proposal, 2026-11-10. Addresses #117 (split from #65). Builds on
+Status: implemented, 2026-11-11 (proposed 2026-11-10). Addresses #117 (split from #65). Builds on
 [0006](0006-nostr-client-and-relay.md) (Nostr transport), [0007](0007-abuse-deterrence-no-fund-freezing.md),
 and [0020](0020-store-flood-admission-and-proof-of-work.md) (store partition and retention). The client
 replay watermark (0015, `ws.rs` `since`) remains the PRIMARY guard against a retired offer re-animating;
@@ -84,3 +84,29 @@ It is defence in depth, so it is not urgent; but it is cheap and needs no wire c
 worth doing rather than deferring to the fidelity-bond or PoW work. Treat the implementation as the next
 step on #117; this note resolves the open question (broadcasts are readable, so no wire change) that
 blocked it.
+
+## Implementation notes (2026-11-11)
+
+Three refinements made while implementing the mechanism in `src/relay_server.rs`, none changing the wire
+or the client:
+
+- **A tombstone is recorded only when the withdrawal actually evicted a stored offer.** The count bound
+  alone would let anyone mint routing keys and flood withdrawals for random ids, pushing genuine
+  tombstones out of a full set. Requiring a real eviction first means a flooder must pay the offers
+  store's own (already bounded, 0020) budget before any tombstone is created, so the tombstone set
+  cannot be churned by forged withdrawals.
+- **The offer id is cached in the store at insert.** Each stored event carries its parsed offer id, so a
+  withdrawal evicts matching offers by a cheap compare on the id and the routing key, never re-reading or
+  re-verifying an envelope (an ML-DSA verify) while holding the store lock. The payload is parsed exactly
+  once, when the event is first accepted.
+- **Tombstone timestamps are relay-local**, not the withdrawal's `created_at`, since the acceptance path
+  admits a wide range of author-supplied timestamps and the author's clock must not set a tombstone's
+  lifetime.
+
+Tests: the four cases above live in `tests/relay_server.rs` as black-box checks over the WebSocket (an
+authentic withdraw evicts and a later REQ drops the offer; a foreign-author withdraw does not evict and
+records no tombstone; a replayed withdrawn offer is refused; the count bound lets the oldest retired
+offer reappear). The retention expiry and the author-keying are unit-tested on the tombstone set
+directly. Every assertion was mutation-verified (eviction, the author check, the tombstone insert, the
+membership check, the count bound, retention pruning, and the evict-first guard each fail exactly one
+test when neutered).
