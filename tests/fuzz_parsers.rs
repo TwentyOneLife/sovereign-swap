@@ -202,3 +202,29 @@ mod nostr_fuzz {
         }
     }
 }
+
+/// A hostile maker's fee address reaches `SilentPaymentAddress::parse` (via the engine's fundability
+/// and fee-dest checks). It must never panic on arbitrary input, and anything it DOES accept must
+/// round-trip through `encode`/`parse`. Iteration count overridable via `SOVSWAP_FUZZ_ITERS`.
+#[test]
+fn silent_payment_parse_never_panics_and_round_trips() {
+    use sovereign_swap::silentpayments::SilentPaymentAddress;
+    let mut rng = Rng(0x0A11_CE5E_EDF0_0D11_u64);
+    let prefixes = ["sp1", "tsp1", "sprt1", "bc1", "x1", ""];
+    let bech = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    for _ in 0..iters(40_000) {
+        let raw = rng.bytes(130);
+        let _ = SilentPaymentAddress::parse(&String::from_utf8_lossy(&raw));
+        let p = prefixes[rng.below(prefixes.len())];
+        let body: String = (0..rng.below(120))
+            .map(|_| bech[rng.below(bech.len())] as char)
+            .collect();
+        if let Ok(addr) = SilentPaymentAddress::parse(&format!("{p}{body}")) {
+            let enc = addr.encode();
+            let enc2 = SilentPaymentAddress::parse(&enc)
+                .expect("re-parse of an encoded address")
+                .encode();
+            assert_eq!(enc, enc2, "silent payment parse/encode must be inverse");
+        }
+    }
+}
