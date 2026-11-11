@@ -2,7 +2,8 @@
 name = "sovereign-swap"
 version = "0.6.8"
 edition = "2021"
-rust-version = "1.80"
+# 1.89 for std file locking (File::try_lock), used for the daemon single-writer state lock (0004).
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 description = "Peer-to-peer atomic swaps between BTC and xBTC (Bitcoin Blake2b)"
 publish = false

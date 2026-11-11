@@ -243,3 +243,28 @@ fn a_sub_floor_min_swap_sat_refuses_to_start_the_engine() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_second_daemon_on_the_same_data_dir_is_refused_then_allowed_after_release() {
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sovswap-lock-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let first = Daemon::open(&dir).expect("first daemon opens");
+    // A second daemon on the same data dir must refuse to start: two writers on one seed would reuse
+    // key indices and secrets and double-broadcast, risking loss of funds (design 0004).
+    match Daemon::open(&dir) {
+        Ok(_) => panic!("a second daemon on the same data dir must be refused"),
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "unexpected error: {e}"
+        ),
+    }
+
+    // Once the first releases the lock (dropped here), a fresh daemon can take over the same state.
+    drop(first);
+    let _second = Daemon::open(&dir).expect("a new daemon opens after the lock is released");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
