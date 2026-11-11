@@ -268,7 +268,7 @@ impl RelayConn for WsConn {
         drained
             .into_iter()
             .filter(|e| e.pubkey != *subscriber)
-            .filter(|e| e.recipient().map_or(true, |to| to == *subscriber))
+            .filter(|e| e.recipient().is_none_or(|to| to == *subscriber))
             .collect()
     }
 }
