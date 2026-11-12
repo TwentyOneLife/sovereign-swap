@@ -310,15 +310,13 @@ function offerForm(o) {
         <option value="xbtc">${chainShort("xbtc")}</option>
         <option value="btc">${chainShort("btc")}</option>
       </select></label>
-    <label>Amount <input id="f-amount" placeholder="0.5"></label>
+    <label>Amount (<span id="f-sell-coin">${chainShort("xbtc")}</span>) <input id="f-amount" placeholder="0.5"></label>
     <p id="f-market" class="muted">Loading the market rate…</p>
     <label title="Your margin off the nonkyc market rate, in whole percent (1% steps). Positive earns you more as the maker; negative undercuts the market to fill faster. The rate comes from nonkyc; you choose only the margin.">
       Your maker margin (%) <input id="f-margin" type="number" step="1" value="0"></label>
+    <label title="What the taker pays you for the whole amount, priced from the nonkyc rate and your margin. Computed from the market, not editable.">
+      You receive (<span id="f-recv-coin">${chainShort("btc")}</span>) <input id="f-recv" readonly></label>
     <p id="f-eff" class="muted"></p>
-    <details id="f-adv"><summary class="muted" style="cursor:pointer">Advanced: set an exact counter amount instead</summary>
-      <label title="A specific integer counter amount for the whole offer. Still checked against the market band. Leave blank to use the margin above.">
-        Exact counter amount <input id="f-counter" placeholder="leave blank to use the margin"></label>
-    </details>
     <div id="f-d6" class="warn hidden"></div>
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
@@ -360,18 +358,22 @@ function createSheet() {
   }
 
   function recompute() {
-    const market = $("#f-market"), eff = $("#f-eff"), d6 = $("#f-d6");
-    const counterRaw = ($("#f-counter") && $("#f-counter").value.trim()) || "";
+    const market = $("#f-market"), eff = $("#f-eff"), d6 = $("#f-d6"), recv = $("#f-recv");
     const sell = $("#f-chain").value, taker = sell === "xbtc" ? "btc" : "xbtc";
+    // Keep the leg labels in step with the direction.
+    $("#f-sell-coin").textContent = chainShort(sell);
+    $("#f-recv-coin").textContent = chainShort(taker);
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
-      // D6: no reference, no market-derived price. Only the Advanced exact-counter path can publish.
+      // D6: no reference, no market-derived price. The form prices only from the market, so it cannot
+      // publish until the reference is back.
       market.textContent = "";
       eff.textContent = "";
+      recv.value = "";
       d6.classList.remove("hidden");
       d6.innerHTML =
-        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference, or set an exact counter amount under Advanced.";
-      go.disabled = !counterRaw;
+        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference and reopen this form.";
+      go.disabled = true;
       return;
     }
     d6.classList.add("hidden");
@@ -382,22 +384,6 @@ function createSheet() {
       `Market (nonkyc): 1 ${chainShort("btc")} = <strong>${(1 / ref.rate).toFixed(2)}</strong> ${chainShort("xbtc")} · ` +
       `1 ${chainShort("xbtc")} = <strong>${ref.rate.toFixed(8)}</strong> ${chainShort("btc")}${verify}. Band ±${ref.band}%.`;
     const mp = marketPrice();
-    if (counterRaw) {
-      // Advanced: send the exact counter; show its implied rate and deviation from the market.
-      go.disabled = false;
-      const counter = parseBtc(counterRaw);
-      if (counter !== null && amount) {
-        const off = (counter / amount / mp - 1) * 100;
-        const warn = Math.abs(off) > ref.band
-          ? ` <span style="color:var(--orange)">⚠ outside the ±${ref.band}% band; will be rejected</span>`
-          : "";
-        eff.innerHTML = `Exact: ${fmtSats(counter)} ${chainShort(taker)} · rate ${fmtRate(counter / amount)} (${off >= 0 ? "+" : ""}${off.toFixed(1)}% vs market)${warn}`;
-      } else {
-        eff.textContent = "";
-      }
-      return;
-    }
-    // Market-derived: price = market * (1 + margin/100); the daemon finalizes the counter at publish.
     const margin = parseInt($("#f-margin").value, 10) || 0;
     const overBand = Math.abs(margin) > ref.band;
     go.disabled = overBand;
@@ -407,35 +393,32 @@ function createSheet() {
         ? `you undercut market by ${-margin}% (fill faster; earn less)`
         : "exactly the market rate";
     if (overBand) {
+      recv.value = "";
       eff.innerHTML = `<span style="color:var(--orange)">⚠ ${margin}% exceeds the ±${ref.band}% band; lower the margin.</span>`;
       return;
     }
+    // Market-derived: price = market * (1 + margin/100); the daemon finalizes the counter at publish.
     const price = mp * (1 + margin / 100);
-    eff.innerHTML = amount
-      ? `You offer ${fmtSats(amount)} ${chainShort(sell)} for ~${fmtSats(Math.ceil(amount * price))} ${chainShort(taker)} · rate ${fmtRate(price)} (${margin >= 0 ? "+" : ""}${margin}% vs market), ${profit}.`
-      : `Margin ${margin >= 0 ? "+" : ""}${margin}%, ${profit}. Enter an amount to see the total.`;
+    recv.value = amount ? fmtSats(Math.ceil(amount * price)) : "";
+    eff.innerHTML = `Rate ${fmtRate(price)} (${margin >= 0 ? "+" : ""}${margin}% vs market), ${profit}.`;
   }
 
   $("#f-chain").onchange = recompute;
   $("#f-amount").addEventListener("input", recompute);
   $("#f-margin").addEventListener("input", recompute);
-  if ($("#f-counter")) $("#f-counter").addEventListener("input", recompute);
   loadReference();
 
   go.onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
     if (amount === null) return ($("#f-msg").textContent = "Enter a valid amount.");
-    const body = { sell_chain: $("#f-chain").value, amount_sat: amount, min_amount_sat: amount };
-    const counterRaw = ($("#f-counter") && $("#f-counter").value.trim()) || "";
-    if (counterRaw) {
-      const counter = parseBtc(counterRaw);
-      if (counter === null) return ($("#f-msg").textContent = "Enter a valid counter amount.");
-      body.counter_amount_sat = counter;
-    } else {
-      // Market-derived path: send only the whole-percent margin; the daemon prices it off the live
-      // reference, so the published rate is the market rate at publish time, always in band.
-      body.margin_pct = parseInt($("#f-margin").value, 10) || 0;
-    }
+    // Always the market-derived path: send only the whole-percent margin; the daemon prices it off the
+    // live reference, so the published rate is the market rate at publish time, always in band.
+    const body = {
+      sell_chain: $("#f-chain").value,
+      amount_sat: amount,
+      min_amount_sat: amount,
+      margin_pct: parseInt($("#f-margin").value, 10) || 0,
+    };
     try {
       await api("POST", "/offers", body);
       $("#modal").classList.add("hidden");
