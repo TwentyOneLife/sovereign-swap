@@ -146,6 +146,12 @@ impl Store {
             .unwrap_or(0)
     }
 
+    /// True if an event with this id is currently stored (and so was already verified when first
+    /// accepted). Used for the replay fast-path in `accept_event`.
+    fn contains_id(&self, id: &[u8; 32]) -> bool {
+        self.ids.contains(id)
+    }
+
     fn fresh(&self, e: &Event) -> bool {
         e.created_at + self.retention >= Store::now()
     }
@@ -777,17 +783,28 @@ impl RelayServer {
             bump(&s.rejected_kind);
             return ok(&id, false, "blocked: kind not allowed");
         }
-        if event.verify(secp).is_err() {
-            bump(&s.rejected_bad_sig);
-            return ok(&id, false, "invalid: bad id or signature");
-        }
-        // Route by class: offers and directed messages have separate stores and budgets.
+        // Route by class first (cheap: a tag scan, no crypto): offers and directed messages have
+        // separate stores and budgets.
         let directed = is_directed(&event);
         let store = if directed {
             &self.directed
         } else {
             &self.offers
         };
+        // Replay fast-path (DoS, design 0003/0020): an event already in the store was fully verified
+        // when first accepted, and an event id is the hash of its content, so a matching id can only
+        // be the same event. Reject the replay as a duplicate BEFORE the Schnorr and ML-DSA verifies,
+        // so a flood of a captured valid event cannot force two signature verifies per copy. A
+        // withdrawn offer is evicted from the store (its id removed), so its replay still falls
+        // through to the tombstone check below rather than being waved through here.
+        if store.lock().unwrap().contains_id(&event.id) {
+            bump(&s.events_duplicate);
+            return ok(&id, true, "duplicate");
+        }
+        if event.verify(secp).is_err() {
+            bump(&s.rejected_bad_sig);
+            return ok(&id, false, "invalid: bad id or signature");
+        }
         if !store.lock().unwrap().fresh(&event) {
             bump(&s.rejected_stale);
             return ok(&id, false, "invalid: outside retention window");
@@ -1178,6 +1195,46 @@ mod tests {
         for forbidden in ["pubkey", "\"ip\"", "client", "peer"] {
             assert!(!lower.contains(forbidden), "NIP-11 leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn a_replay_is_dropped_as_duplicate_before_the_signature_verify() {
+        use crate::nostr::Event;
+        // DoS (design 0003/0020): a replay of a stored event must be rejected as a duplicate before
+        // the Schnorr and ML-DSA verifies run, so a flood of a captured valid event cannot force a
+        // verify per copy. We prove the dedup runs first by replaying with a CORRUPTED signature but
+        // the same id: the old order (verify first) answers "bad id or signature"; the fast-path
+        // answers "duplicate".
+        let server = RelayServer::new(RelayConfig::default());
+        let secp = Secp256k1::new();
+        let kp = bitcoin::secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let ev = Event::build(&secp, &kp, Event::now_for_test(), vec![], &[1, 2, 3]);
+        let mut limiter = RateLimiter::new(1000);
+
+        let good: Value = serde_json::from_str(&ev.to_json()).unwrap();
+        let r1 = server.accept_event(&good, &secp, &mut limiter);
+        assert!(r1.contains("true"), "first copy should be accepted: {r1}");
+        assert!(
+            !r1.contains("duplicate"),
+            "first copy is not a duplicate: {r1}"
+        );
+
+        // Same id (content unchanged, so id is unchanged), but flip one hex digit of the signature.
+        let mut bad = good.clone();
+        let sig = bad["sig"].as_str().unwrap().to_owned();
+        let last = sig.chars().last().unwrap();
+        let swapped = if last == '0' { '1' } else { '0' };
+        bad["sig"] = Value::String(format!("{}{}", &sig[..sig.len() - 1], swapped));
+
+        let r2 = server.accept_event(&bad, &secp, &mut limiter);
+        assert!(
+            r2.contains("duplicate"),
+            "a replay (even with a broken sig) must be dropped as a duplicate before the verify: {r2}"
+        );
+        assert!(
+            !r2.contains("bad id or signature"),
+            "the dedup fast-path must run before the signature verify: {r2}"
+        );
     }
 
     #[test]
