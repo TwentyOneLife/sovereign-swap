@@ -123,6 +123,17 @@ fn prune_seen(
     (seen_offers.len(), seen_at.len()) != before
 }
 
+/// Record that an offer `id` was just seen at `now`: refresh its stamp if known, else add it. The
+/// LAST-seen time (not the first) is what `prune_seen` ages against, so a live, re-announced offer
+/// stays fresh while a dead one (its maker gone, no more re-announce) ages out at the TTL (#88/#70).
+/// Pure, so the sliding-window behaviour is unit-tested directly.
+fn touch_seen(seen_at: &mut Vec<([u8; 16], u64)>, id: [u8; 16], now: u64) {
+    match seen_at.iter_mut().find(|(i, _)| *i == id) {
+        Some(e) => e.1 = now,
+        None => seen_at.push((id, now)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Lower bound (floor) on a claim/refund transaction fee, in sats. The actual fee is the greater
@@ -887,16 +898,7 @@ impl<T: Transport> Engine<T> {
                 }
                 // Refresh the seen-at on every sighting, so a live, re-announced offer stays fresh
                 // and a dead one ages out at its TTL (#88/#70).
-                let now = now_unix();
-                match self
-                    .state
-                    .seen_at
-                    .iter_mut()
-                    .find(|(id, _)| *id == offer.id)
-                {
-                    Some(e) => e.1 = now,
-                    None => self.state.seen_at.push((offer.id, now)),
-                }
+                touch_seen(&mut self.state.seen_at, offer.id, now_unix());
                 if !self.state.seen_offers.contains(&offer) {
                     self.state.seen_offers.push(offer);
                 }
@@ -1706,5 +1708,54 @@ mod tests {
             now + SEEN_OFFER_TTL_SECS + 1
         ));
         assert!(seen_offers.is_empty() && seen_at.is_empty());
+    }
+
+    #[test]
+    fn touch_seen_refreshes_so_a_re_announced_offer_survives_its_first_seen_ttl() {
+        // Regression: `seen_at` is a LAST-seen (freshness) stamp. An offer re-announced within the
+        // window must survive a prune past its FIRST-seen + TTL; one not re-seen must age out. This
+        // locks in the handle(Offer) refresh that `prune_seen` alone does not provide.
+        use super::{prune_seen, touch_seen, SEEN_OFFER_TTL_SECS};
+        use crate::swap::{Chain, Offer};
+        use bitcoin::Amount;
+        let offer = |n: u8| Offer {
+            id: [n; 16],
+            maker_chain: Chain::Xbtc,
+            maker_amount: Amount::from_sat(1000),
+            taker_amount: Amount::from_sat(1000),
+            min_maker_amount: Amount::ZERO,
+            maker_lock_blocks: 40,
+            taker_lock_blocks: 20,
+            maker_lock_depth: 2,
+            taker_lock_depth: 2,
+            margin_blocks: 3,
+            fee: None,
+        };
+        let t0 = 1_000_000u64;
+        let mut seen_offers = vec![offer(1), offer(2)];
+        let mut seen_at = Vec::new();
+        touch_seen(&mut seen_at, [1u8; 16], t0); // both first seen at t0
+        touch_seen(&mut seen_at, [2u8; 16], t0);
+        // offer 1 is re-announced near the end of its window; offer 2 is never re-seen.
+        touch_seen(&mut seen_at, [1u8; 16], t0 + SEEN_OFFER_TTL_SECS - 10);
+        // Prune just past offer 1's FIRST-seen + TTL.
+        prune_seen(&mut seen_offers, &mut seen_at, t0 + SEEN_OFFER_TTL_SECS + 5);
+        let ids: Vec<[u8; 16]> = seen_offers.iter().map(|o| o.id).collect();
+        assert!(
+            ids.contains(&[1u8; 16]),
+            "a re-announced offer must stay fresh past its first-seen TTL"
+        );
+        assert!(
+            !ids.contains(&[2u8; 16]),
+            "an offer not re-seen within the TTL must age out"
+        );
+        assert_eq!(
+            seen_at
+                .iter()
+                .find(|(i, _)| *i == [1u8; 16])
+                .map(|(_, t)| *t),
+            Some(t0 + SEEN_OFFER_TTL_SECS - 10),
+            "the stamp is the last-seen time, not the first-seen"
+        );
     }
 }
