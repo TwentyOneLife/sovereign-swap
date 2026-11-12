@@ -832,7 +832,7 @@ impl Daemon {
         };
         let vout = req["vout"].as_u64().unwrap_or(0);
         // Snapshot the node config, then release the state lock before any network I/O.
-        let (node, user, pass, ca, tor_socks) = {
+        let (node, user, pass, ca, tor_socks, fork_height) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -840,6 +840,7 @@ impl Daemon {
                 s.xbtc_rpc_pass.clone(),
                 s.xbtc_rpc_ca.clone(),
                 resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                s.split_fork_height,
             )
         };
         let client = match connect_client(&node, &user, &pass, &ca, &tor_socks) {
@@ -850,12 +851,7 @@ impl Daemon {
             Ok(s) => s,
             Err(e) => return (502, json!({"error": e.to_string()})),
         };
-        match crate::split::classify(
-            &src,
-            crate::split::MAINNET_FORK_HEIGHT,
-            txid,
-            crate::split::DEFAULT_MAX_LOOKUPS,
-        ) {
+        match crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS) {
             Ok(kind) => (
                 200,
                 json!({
@@ -988,7 +984,7 @@ impl Daemon {
         if coins.is_empty() {
             return (422, json!({"error": "sha_coins required"}));
         }
-        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, wallet_name) = {
+        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, fork_height, wallet_name) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1001,6 +997,7 @@ impl Daemon {
                 s.btc_rpc_ca.clone(),
                 resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
                 s.current_fee_address(Chain::Xbtc),
+                s.split_fork_height,
                 format!(
                     "swap-{}",
                     self.identity_seed[..4].to_hex_string(Case::Lower)
@@ -1057,7 +1054,7 @@ impl Daemon {
                     if st.pool.available_count() > 0 {
                         break;
                     }
-                    let Ok(kind) = classify_on(&xbtc, &u.0) else {
+                    let Ok(kind) = classify_on(&xbtc, fork_height, &u.0) else {
                         continue;
                     };
                     if kind != crate::split::CoinKind::Blake2bCoin {
@@ -1086,23 +1083,13 @@ impl Daemon {
         let build = (|| -> Result<(String, u64, String), (u16, Value)> {
             let mut prepared = Vec::new();
             for (txid, vout) in &coins {
-                let p = crate::split::prepare_input(
-                    &xbtc,
-                    crate::split::MAINNET_FORK_HEIGHT,
-                    txid,
-                    *vout,
-                )
-                .map_err(|e| (422, json!({"error": format!("input {txid}:{vout}: {e}")})))?;
+                let p = crate::split::prepare_input(&xbtc, fork_height, txid, *vout)
+                    .map_err(|e| (422, json!({"error": format!("input {txid}:{vout}: {e}")})))?;
                 prepared.push(p);
             }
             prepared.push(
-                crate::split::prepare_input(
-                    &xbtc,
-                    crate::split::MAINNET_FORK_HEIGHT,
-                    &marker.txid,
-                    marker.vout,
-                )
-                .map_err(|e| (502, json!({"error": format!("marker: {e}")})))?,
+                crate::split::prepare_input(&xbtc, fork_height, &marker.txid, marker.vout)
+                    .map_err(|e| (502, json!({"error": format!("marker: {e}")})))?,
             );
             let change_str = wallet
                 .call("getnewaddress", json!(["", "bech32"]))
@@ -1517,15 +1504,11 @@ fn list_unspent(wallet: &Client) -> Vec<(String, u32, u64)> {
 /// Classify a coin by its funding txid on the Blake2b node (for the marker auto-scan).
 fn classify_on(
     xbtc: &Client,
+    fork_height: u32,
     txid: &str,
 ) -> Result<crate::split::CoinKind, crate::split::SplitError> {
     let src = crate::split::NodeTxSource::new(xbtc)?;
-    crate::split::classify(
-        &src,
-        crate::split::MAINNET_FORK_HEIGHT,
-        txid,
-        crate::split::DEFAULT_MAX_LOOKUPS,
-    )
+    crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS)
 }
 
 /// A rough network fee for the split: sat/vB from `estimatesmartfee` (fallback 1 sat/vB on a chain that
