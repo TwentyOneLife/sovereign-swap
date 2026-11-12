@@ -665,48 +665,63 @@ function loadSplit() {
   if (splitWired) return;
   splitWired = true;
   splitJob = { job_id: null, txid: null };
+  const build = $("#sp-build"), step1 = $("#sp-step1");
+  // Build stays disabled until the check confirms the coin is a pre-fork coin that needs separating.
+  // Changing the coin invalidates a prior check, so disable Build again and clear the result.
+  $("#sp-coin").addEventListener("input", () => { build.disabled = true; step1.textContent = ""; });
   $("#sp-classify").addEventListener("click", async () => {
     const c = splitCoin();
-    $("#sp-step1").textContent = "checking…";
+    if (!c.txid) { step1.textContent = "Enter the coin as txid:vout first."; return; }
+    step1.textContent = "Checking the coin on the BTC (Blake2b) node…";
     try {
       const r = await api("POST", "/split/classify", { txid: c.txid, vout: c.vout });
-      $("#sp-step1").textContent = r.needs_split
-        ? "This is a pre-fork coin (replayable) - it needs separating."
-        : "This coin is already chain-specific; no split needed.";
-    } catch (e) { $("#sp-step1").textContent = splitErr(e); }
+      if (r.needs_split) {
+        step1.textContent = "✓ Pre-fork coin — it needs separating. Now click “Build the split”.";
+        build.disabled = false;
+      } else {
+        step1.textContent = "This coin is already chain-specific; it does not need separating.";
+        build.disabled = true;
+      }
+    } catch (e) { step1.textContent = "✗ " + splitErr(e); build.disabled = true; }
   });
   $("#sp-build").addEventListener("click", async () => {
     const c = splitCoin();
     const dest = $("#sp-dest").value.trim();
-    $("#sp-step1").textContent = "building…";
+    if (!dest) { step1.textContent = "Enter your BTC (Blake2b) destination address first."; return; }
+    step1.textContent = "Building the unsigned transaction…";
     try {
+      // The daemon validates the destination address here (right network, parseable) and confirms the
+      // coin is spendable; a bad address or coin comes back as a clear error, not a built tx.
       const r = await api("POST", "/split/build", { sha_coins: [{ txid: c.txid, vout: c.vout }], dest });
       splitJob.job_id = r.job_id;
       $("#sp-psbt").value = r.psbt;
       $("#sp-sign-card").classList.remove("hidden");
-      $("#sp-step1").textContent = "Built (fee " + fmtSats(r.fee_sat) + " XBT). Sign the PSBT below.";
-    } catch (e) { $("#sp-step1").textContent = splitErr(e); }
+      step1.textContent = "✓ Built. Fee " + fmtSats(r.fee_sat) + " XBT. Sign it in step 3.";
+      $("#sp-sign-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { step1.textContent = "✗ " + splitErr(e); }
   });
   $("#sp-submit").addEventListener("click", async () => {
     const psbt = $("#sp-signed").value.trim();
-    $("#sp-step2").textContent = "co-signing and broadcasting…";
+    if (!psbt) { $("#sp-step2").textContent = "Paste your signed PSBT first."; return; }
+    $("#sp-step2").textContent = "Checking your signature, co-signing the marker, broadcasting…";
     try {
       const r = await api("POST", "/split/submit", { job_id: splitJob.job_id, psbt });
       splitJob.txid = r.txid;
       $("#sp-verify-card").classList.remove("hidden");
-      $("#sp-step2").textContent = "Broadcast on Blake2b. txid " + r.txid;
-    } catch (e) { $("#sp-step2").textContent = splitErr(e); }
+      $("#sp-step2").textContent = "✓ Broadcast on BTC (Blake2b). txid " + r.txid;
+      $("#sp-verify-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { $("#sp-step2").textContent = "✗ " + splitErr(e); }
   });
   $("#sp-verify").addEventListener("click", async () => {
-    $("#sp-step3").textContent = "verifying on the SHA256 node…";
+    $("#sp-step3").textContent = "Verifying on the BTC (SHA256) node…";
     try {
       const r = await api("POST", "/split/verify", { txid: splitJob.txid });
       $("#sp-step3").textContent = r.final
-        ? "FINAL: replay not possible. The SHA256 side is now safe to spend."
+        ? "✓ FINAL: replay not possible. Your BTC (SHA256) coin is now safe to spend."
         : r.separated
-          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " confirmations - wait."
-          : "Not yet separated - check it confirmed on Blake2b.";
-    } catch (e) { $("#sp-step3").textContent = splitErr(e); }
+          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations — wait a little longer."
+          : "Not separated yet — check the transaction confirmed on BTC (Blake2b).";
+    } catch (e) { $("#sp-step3").textContent = "✗ " + splitErr(e); }
   });
 }
 
