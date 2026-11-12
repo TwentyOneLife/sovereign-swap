@@ -354,13 +354,21 @@ pub fn validate_user_signed(
     for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
         let input = &psbt.inputs[i];
         if txin.previous_output == marker {
-            if !input.partial_sigs.is_empty() || input.tap_key_sig.is_some() {
+            // Our marker: no signature of any form (partial OR finalized) - we add the only one.
+            if !input.partial_sigs.is_empty()
+                || input.tap_key_sig.is_some()
+                || input.final_script_witness.is_some()
+                || input.final_script_sig.is_some()
+            {
                 return Err(SplitError::Malformed(
                     "the marker input must be left unsigned for us to co-sign".to_owned(),
                 ));
             }
             continue;
         }
+        // A user input must be signed with an ALL-family sighash. A signer may leave the signature as a
+        // PSBT partial_sig/tap_key_sig OR already FINALIZE the input (Bitcoin Core does the latter when
+        // it can fully satisfy an input), so accept both forms and read the sighash flag from whichever.
         let all_family = if !input.partial_sigs.is_empty() {
             input
                 .partial_sigs
@@ -371,6 +379,12 @@ pub fn validate_user_signed(
                 s.sighash_type,
                 TapSighashType::Default | TapSighashType::All
             )
+        } else if let Some(w) = input.final_script_witness.as_ref() {
+            w.iter().next().map(sig_is_all_family).unwrap_or(false)
+        } else if let Some(ss) = input.final_script_sig.as_ref() {
+            first_push(ss)
+                .map(|s| sig_is_all_family(&s))
+                .unwrap_or(false)
         } else {
             return Err(SplitError::Malformed(format!(
                 "user input {i} is not signed"
@@ -383,6 +397,30 @@ pub fn validate_user_signed(
         }
     }
     Ok(())
+}
+
+/// Is a raw signature's sighash flag an ALL-family one (never ANYONECANPAY/NONE/SINGLE)? A 64-byte
+/// Schnorr signature is taproot SIGHASH_DEFAULT (= ALL); otherwise the last byte is the sighash flag
+/// (ECDSA DER+flag or a 65-byte Schnorr+flag), ALL being `(flag & 0x1f) == 1` with the ANYONECANPAY bit
+/// `0x80` clear (so the fork's `0x21` also passes). Too-short bytes fail closed.
+fn sig_is_all_family(sig: &[u8]) -> bool {
+    match sig.len() {
+        0..=63 => false,
+        64 => true,
+        n => {
+            let flag = sig[n - 1];
+            (flag & 0x1f) == 0x01 && (flag & 0x80) == 0
+        }
+    }
+}
+
+/// The first pushed data in a scriptSig (the signature, for a finalized legacy P2PKH input).
+fn first_push(script: &bitcoin::Script) -> Option<Vec<u8>> {
+    use bitcoin::script::Instruction;
+    script.instructions().flatten().find_map(|ins| match ins {
+        Instruction::PushBytes(b) => Some(b.as_bytes().to_vec()),
+        _ => None,
+    })
 }
 
 /// Build the UNSIGNED separating PSBT for the lent-marker move. Constructed directly (NOT via a funding
@@ -1132,6 +1170,23 @@ mod tests {
         .unwrap();
         let other_hex = serialize_hex(&other.parse::<Psbt>().unwrap().unsigned_tx);
         assert!(validate_user_signed(&other_hex, &psbt.to_string(), marker).is_err());
+    }
+
+    #[test]
+    fn submit_accepts_a_finalized_all_input_and_rejects_finalized_acp_or_none() {
+        use bitcoin::Witness;
+        for (flag, ok) in [(0x01u8, true), (0x21, true), (0x81, false), (0x03, false)] {
+            let (expected, mut psbt, marker) = unsigned_job();
+            let mut sig = vec![0x30u8; 70];
+            sig.push(flag); // a finalized P2WPKH witness: [sig(DER)+flag, pubkey]
+            psbt.inputs[0].final_script_witness =
+                Some(Witness::from_slice(&[sig, vec![0x02u8; 33]]));
+            assert_eq!(
+                validate_user_signed(&expected, &psbt.to_string(), marker).is_ok(),
+                ok,
+                "finalized sighash flag {flag:#x} should be ok={ok}"
+            );
+        }
     }
 
     #[test]
