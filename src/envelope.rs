@@ -196,6 +196,23 @@ pub fn sign_broadcast(id: &Identity, payload: &[u8], dsa_rand: [u8; 32]) -> Vec<
     out
 }
 
+/// Read a broadcast's payload WITHOUT verifying either signature. For the untrusted relay only: the
+/// relay authenticates a broadcast's author by the outer nostr event signature (`event.pubkey`) and
+/// its tombstone/eviction logic keys on that author, so it never needs the envelope's own Schnorr or
+/// ML-DSA signatures. Skipping them drops a ~4.6 KB ML-DSA verify per broadcast, the dominant cost on
+/// the relay host. Clients MUST use `verify_broadcast` for end-to-end authenticity; this is deliberately
+/// not a verification. Returns `None` on a malformed or too-short frame.
+pub fn read_broadcast_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let rest = match bytes {
+        [VERSION, SUITE, rest @ ..] => rest,
+        _ => return None,
+    };
+    if rest.len() < SCHNORR_SIG + DSA_SIG {
+        return None;
+    }
+    Some(&rest[SCHNORR_SIG + DSA_SIG..])
+}
+
 pub fn verify_broadcast(sender: &PublicIdentity, bytes: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
     let rest = check_header(bytes)?;
     if rest.len() < SCHNORR_SIG + DSA_SIG {
@@ -412,6 +429,33 @@ mod tests {
             verify_broadcast(bob.public(), &signed).is_err(),
             "another signer's key must not verify"
         );
+    }
+
+    #[test]
+    fn read_broadcast_payload_returns_the_payload_without_verifying() {
+        let alice = Identity::from_seed(&[1; 32]);
+        let payload = b"an offer: 0.5 xBTC for 0.15 BTC";
+        let signed = sign_broadcast(&alice, payload, [8; 32]);
+
+        // The unverified read returns exactly the payload verify_broadcast authenticates.
+        assert_eq!(read_broadcast_payload(&signed), Some(&payload[..]));
+
+        // It does NOT verify: a broadcast whose signatures are corrupted (but whose layout is intact)
+        // still yields the payload, while verify_broadcast rejects it. This is the relay's fast path;
+        // authenticity is enforced by the outer event signature, not here.
+        let mut corrupt = signed.clone();
+        corrupt[2] ^= 0xff; // flip a Schnorr-signature byte
+        *corrupt.last_mut().unwrap() ^= 0xff; // and a payload-trailing byte stays in the payload
+        assert!(verify_broadcast(alice.public(), &corrupt).is_err());
+        assert!(
+            read_broadcast_payload(&corrupt).is_some(),
+            "the unverified read must still decode a broadcast with a bad signature"
+        );
+
+        // A truncated frame (shorter than the two fixed-size signatures) is rejected, not panicked on.
+        assert_eq!(read_broadcast_payload(&signed[..10]), None);
+        assert_eq!(read_broadcast_payload(&[]), None);
+        assert_eq!(read_broadcast_payload(&[VERSION, SUITE]), None);
     }
 
     #[test]

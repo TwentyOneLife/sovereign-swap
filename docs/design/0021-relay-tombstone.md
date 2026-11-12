@@ -110,3 +110,42 @@ offer reappear). The retention expiry and the author-keying are unit-tested on t
 directly. Every assertion was mutation-verified (eviction, the author check, the tombstone insert, the
 membership check, the count bound, retention pruning, and the evict-first guard each fail exactly one
 test when neutered).
+
+## Correction (2026-11-11): the relay decodes a broadcast, it does not verify it
+
+The original note above said the relay reads a broadcast with `verify_broadcast(sender, envelope)`,
+which "both authenticates the broadcast and returns the payload". That verification was redundant, and
+it was a denial-of-service lever, so it has been removed. The relay now decodes the payload with
+`envelope::read_broadcast_payload` (strip the public-identity prefix, skip the header and the two
+fixed-size signature fields, return the payload bytes) and never runs the envelope's Schnorr or ML-DSA
+verify.
+
+Why this is safe:
+
+- **The author is already authenticated by the outer nostr event signature.** `accept_event` runs
+  `event.verify` (the event's own Schnorr signature over `event.pubkey`) before it ever reads the
+  payload. The tombstone and eviction logic key on `event.pubkey` (the routing key), so a withdrawal or
+  an offer can only ever affect offers published under that same authenticated key. A forger cannot sign
+  an event as another key, so cannot evict or tombstone another author's offers. The envelope's inner
+  signatures added no authority the relay relies on.
+- **The verify never kept anything out.** A broadcast whose inner signature failed was stored and served
+  anyway (just without its parsed offer id); the verify only decided whether the offer id was extracted
+  for the tombstone path. Decoding instead extracts the offer id regardless, which is strictly more
+  correct for the author's own offers and changes nothing an attacker can reach.
+- **Clients still verify end to end.** The relay is untrusted by design; the receiving client runs the
+  full hybrid `verify_broadcast` in `routing.rs`. Post-quantum authenticity of an offer is a client
+  property, never a relay one.
+
+Why it matters: an ML-DSA-87 verify is ~4.6 KB of signature and, measured in release on a fast desktop
+core, ~136 us per broadcast (~7.3k/s). The relay runs on a shared, low-power host; the per-connection
+rate limit (240/min) across the connection cap (512) put the ceiling near 2k verifies/s, enough for a
+flood of cheaply-generated signed events to pin a core. Removing the verify, together with the earlier
+"reject a replay before the verify" change, takes the ML-DSA cost off the relay's accept path entirely.
+
+New tests: `envelope::read_broadcast_payload_returns_the_payload_without_verifying` (the decode returns
+exactly the payload `verify_broadcast` authenticates, still decodes a signature-corrupted frame, and
+rejects a truncated one) and a never-panic fuzz of `read_broadcast_payload` on random bytes
+(`tests/fuzz_parsers.rs`), since it now parses attacker input with no verification. The existing
+black-box tombstone tests (a foreign-author withdraw does not evict; a replayed withdrawn offer is
+refused) still pass with the verify removed, which is itself the proof that the inner verify was
+redundant for the relay's safety.
