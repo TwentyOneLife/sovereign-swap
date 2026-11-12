@@ -50,6 +50,18 @@ pub enum SplitError {
     TooDeep,
 }
 
+impl std::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitError::Rpc(e) => write!(f, "node RPC error: {e:?}"),
+            SplitError::Malformed(m) => write!(f, "malformed: {m}"),
+            SplitError::TooDeep => write!(f, "ancestry trace exceeded its lookup budget"),
+        }
+    }
+}
+
+impl std::error::Error for SplitError {}
+
 /// The facts the classifier needs about one transaction: whether it is a coinbase, the block height it
 /// confirmed at (`None` if still unconfirmed), and its inputs' funding outpoints. A trait so the
 /// classifier is unit-testable without a live node.
@@ -272,7 +284,7 @@ pub fn build_split_psbt(
 
 /// Sats to a BTC-denominated JSON number string, as bitcoind RPC expects for amounts.
 fn sat_to_btc(sat: u64) -> f64 {
-    sat as f64 / 100_000_000.0
+    bitcoin::Amount::from_sat(sat).to_btc()
 }
 
 // ---- P3: survey a wallet (what needs splitting, what can split it) -------------------------------
