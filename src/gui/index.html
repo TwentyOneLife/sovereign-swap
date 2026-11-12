@@ -93,11 +93,19 @@
     </div>
     <div class="card">
       <h2>1. Your coin, and where to send it</h2>
-      <label title="The pre-fork coin you want to protect. In Sparrow, open the UTXOs tab, right-click the coin and copy its transaction id, then add its output number (usually 0), like abcd...:0. This picks one exact coin, not a whole address.">
-        Your BTC (SHA256) coin to protect, from Sparrow (transaction id and output number)
-        <input id="sp-coin" placeholder="e.g. 9f86d0b0ff...:0"
-          title="Sparrow UTXOs tab: right-click a coin, copy its transaction id, then add its output number (e.g. :0).">
+      <label title="Your BTC (SHA256) address that holds the pre-fork coin, from Sparrow. We look up the coins at this address for you, so you do not have to find a transaction id. Paste a receive address from Sparrow.">
+        Your BTC (SHA256) address to protect, from Sparrow
+        <input id="sp-addr" placeholder="a BTC (SHA256) address you control"
+          title="We scan this address for its coins. A receive address from Sparrow.">
       </label>
+      <details id="sp-adv">
+        <summary class="muted" style="cursor:pointer">Advanced: use one specific coin instead of an address</summary>
+        <label title="A specific coin as txid:vout. In Sparrow, UTXOs tab, right-click a coin, copy its transaction id, then add its output number (usually 0), like abcd...:0.">
+          Specific coin (transaction id and output number)
+          <input id="sp-coin" placeholder="e.g. 9f86d0b0ff...:0"
+            title="Sparrow UTXOs tab: right-click a coin, copy its transaction id, then add its output number (e.g. :0).">
+        </label>
+      </details>
       <label title="A fresh receive address from your Shrike (BTC Blake2b) wallet. The separated coin lands here and is yours alone from then on.">
         Your BTC (Blake2b) destination address, from Shrike
         <input id="sp-dest" placeholder="a receive address from Shrike"
@@ -106,9 +114,10 @@
       <p class="muted">You only need one new address, the BTC (Blake2b) destination. Your BTC (SHA256)
       coin is not moved; it stays put and is safe to spend afterwards.</p>
       <div class="row">
-        <button id="sp-classify" class="ghost" title="Asks the node whether this coin is a pre-fork coin that still needs protecting. Run this first.">1. Check this coin</button>
-        <button id="sp-build" class="primary" disabled title="Enabled only after the check confirms the coin needs protecting.">2. Build the split</button>
+        <button id="sp-classify" class="ghost" title="Look up the coins at your address (or check the specific coin). Run this first.">1. Find coins to protect</button>
+        <button id="sp-build" class="primary" disabled title="Enabled after a pre-fork coin is selected.">2. Build the split</button>
       </div>
+      <div id="sp-coins"></div>
       <p id="sp-step1" class="muted"></p>
     </div>
     <div class="card hidden" id="sp-sign-card">

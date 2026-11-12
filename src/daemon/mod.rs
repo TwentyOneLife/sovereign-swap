@@ -637,6 +637,7 @@ impl Daemon {
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
             ("POST", "/split/classify") => self.split_classify(&req.body),
+            ("POST", "/split/scan") => self.split_scan(&req.body),
             ("POST", "/split/verify") => self.split_verify(&req.body),
             ("POST", "/split/build") => self.split_build(&req.body),
             ("POST", "/split/submit") => self.split_submit(&req.body),
@@ -957,6 +958,89 @@ impl Daemon {
                 json!({"error": format!("could not verify on the SHA256 node: {e}")}),
             ),
         }
+    }
+
+    /// Coin-split service: list the coins at a BTC (SHA256) address and classify each, so a user can give
+    /// an address instead of a specific coin. Body `{"address":"..."}`. Uses `scantxoutset` on the
+    /// Blake2b node (the shared pre-fork UTXOs live there too); that scans the UTXO set and can take a
+    /// while. Returns each coin as `{txid, vout, value_sat, kind, needs_split}`; the pre-fork ones (kind
+    /// `sha_coin`, `needs_split` true) are the ones to protect. The actual split still builds from a
+    /// specific coin (`/split/build`); this only resolves an address to its coins.
+    fn split_scan(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(address) = req["address"].as_str() else {
+            return (422, json!({"error": "address required"}));
+        };
+        let (xn, xu, xp, xca, tor, fork_height) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                s.split_fork_height,
+            )
+        };
+        let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let network = match net_of(&xbtc) {
+            Ok(n) => n,
+            Err(e) => return (502, json!({"error": e})),
+        };
+        if address
+            .parse::<bitcoin::Address<_>>()
+            .ok()
+            .and_then(|a| a.require_network(network).ok())
+            .is_none()
+        {
+            return (422, json!({"error": "not a valid address for this chain"}));
+        }
+        // classify reads getrawtransaction, so the Blake2b node needs a synced txindex.
+        if crate::split::require_txindex(&xbtc).is_err() {
+            return (
+                502,
+                json!({"error": "the Blake2b node needs a synced txindex to classify coins"}),
+            );
+        }
+        let scan = match xbtc.call(
+            "scantxoutset",
+            json!(["start", [{"desc": format!("addr({address})")}]]),
+        ) {
+            Ok(v) => v,
+            Err(e) => return (502, json!({"error": format!("scan failed: {e:?}")})),
+        };
+        let src = match crate::split::NodeTxSource::new(&xbtc) {
+            Ok(s) => s,
+            Err(e) => return (502, json!({"error": e.to_string()})),
+        };
+        let mut coins = Vec::new();
+        for u in scan["unspents"].as_array().into_iter().flatten() {
+            let (Some(txid), Some(vout)) = (u["txid"].as_str(), u["vout"].as_u64()) else {
+                continue;
+            };
+            let value_sat = u["amount"]
+                .as_f64()
+                .map(|b| (b * 1e8).round() as u64)
+                .unwrap_or(0);
+            let Ok(kind) =
+                crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS)
+            else {
+                continue;
+            };
+            coins.push(json!({
+                "txid": txid,
+                "vout": vout,
+                "value_sat": value_sat,
+                "kind": match kind { crate::split::CoinKind::ShaCoin => "sha_coin", _ => "blake2b_coin" },
+                "needs_split": kind.needs_split(),
+            }));
+        }
+        (200, json!({ "address": address, "coins": coins }))
     }
 
     /// Coin-split service (P5): build the UNSIGNED separating PSBT for the lent-marker move. Body

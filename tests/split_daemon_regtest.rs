@@ -114,6 +114,33 @@ fn split_build_sign_submit_through_the_daemon() {
     let sha = pair.knots_sha_coin_txid(); // the user's pre-fork SHA-Coin (fixture 'w' wallet)
     let dest = xbtc.new_bech32_address();
 
+    // 0) /split/scan resolves the coin's ADDRESS to its coins, each classified. The coin's address holds
+    // only pre-fork coinbases here, so every coin should come back needs_split=true.
+    let coin_addr = xbtc.call("getrawtransaction", json!([sha, true]))["vout"][0]["scriptPubKey"]
+        ["address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/scan",
+        &token,
+        &format!(r#"{{"address":"{coin_addr}"}}"#),
+    );
+    assert_eq!(code, 200, "scan failed: {body}");
+    let scanned: Value = serde_json::from_str(&body).unwrap();
+    let scoins = scanned["coins"].as_array().unwrap();
+    assert!(!scoins.is_empty(), "scan found the address's coins");
+    assert!(
+        scoins.iter().all(|c| c["needs_split"] == json!(true)),
+        "pre-fork coins at this address need protecting"
+    );
+    assert!(
+        scoins.iter().any(|c| c["txid"] == json!(sha)),
+        "the known coin is in the scan"
+    );
+
     // 1) build the unsigned split
     let (code, body) = request(
         &addr,
