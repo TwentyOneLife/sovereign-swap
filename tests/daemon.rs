@@ -239,12 +239,19 @@ fn the_gui_is_served_with_security_headers() {
         "form-action 'self'",
         "X-Frame-Options: DENY",
         "X-Content-Type-Options: nosniff",
+        // script-src must be exactly 'self' with no 'unsafe-inline' (the terminating ';' proves it):
+        // the GUI carries no inline script, so inline-script XSS is blocked outright.
+        "script-src 'self';",
     ] {
         assert!(
             headers.contains(needle),
             "GUI response missing `{needle}` in:\n{headers}"
         );
     }
+    assert!(
+        !headers.contains("script-src 'self' 'unsafe-inline'"),
+        "script-src must not allow 'unsafe-inline':\n{headers}"
+    );
 }
 
 #[test]

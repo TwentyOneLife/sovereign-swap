@@ -1,7 +1,18 @@
 "use strict";
-const TOKEN = window.SWAP_TOKEN;
+// The API token is injected into the page as a body data attribute (not an inline <script>), so the
+// Content-Security-Policy can forbid inline scripts entirely (script-src 'self').
+const TOKEN = document.body.dataset.token;
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+
+// Select-all-on-click for read-only copy fields. A single delegated listener replaces the per-element
+// inline `onclick` handlers, which CSP (script-src 'self', no 'unsafe-inline') would otherwise block.
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (t && t.classList && t.classList.contains("copyable") && typeof t.select === "function") {
+    t.select();
+  }
+});
 
 async function api(method, path, body) {
   const r = await fetch(path, {
@@ -379,7 +390,7 @@ function donateSheet() {
   ];
   const fb = fallback.map((a) =>
     `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
-    `<input readonly value="${escapeHtml(a.addr)}" onclick="this.select()"></label>`,
+    `<input readonly class="copyable" value="${escapeHtml(a.addr)}"></label>`,
   ).join("");
   return (
     `<div class="row between"><strong>Donate to TwentyOne.Life</strong>` +
@@ -388,7 +399,7 @@ function donateSheet() {
     `Each donation lands on a fresh, unlinkable address, so nothing clusters to this one. It settles on ` +
     `whichever chain you send from. Needs a wallet that supports silent payments (BIP352).</p>` +
     `<label>Silent payment (BTC or xBTC)` +
-    `<input readonly value="${escapeHtml(sp)}" onclick="this.select()"></label>` +
+    `<input readonly class="copyable" value="${escapeHtml(sp)}"></label>` +
     `<p class="muted">Or a standard address, if your wallet cannot send to a silent-payment one. These ` +
     `two share Bitcoin's address format but are different assets on different networks: send only the ` +
     `matching coin to each, or it will not arrive as intended.</p>${fb}` +
@@ -427,7 +438,7 @@ function explorerLink(chain, txid) {
   const base = chain === "btc" ? statusData?.btc_explorer_url : statusData?.xbtc_explorer_url;
   const short = String(txid).slice(0, 16) + "…";
   return base
-    ? `<a href="${escapeHtml(base.replace(/\/$/, ""))}/tx/${escapeHtml(txid)}" target="_blank" rel="noopener">${short}</a>`
+    ? `<a href="${escapeHtml(base.replace(/\/$/, ""))}/tx/${escapeHtml(txid)}" target="_blank" rel="noopener">${escapeHtml(short)}</a>`
     : short;
 }
 
@@ -512,7 +523,7 @@ async function fillSwapDetail(id, box) {
         `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
         `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
         `lock only the engine can refund.</p>` +
-        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" onclick="this.select()">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
         `<div class="row" style="justify-content:flex-end"><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`

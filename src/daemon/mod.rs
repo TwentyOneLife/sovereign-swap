@@ -69,11 +69,12 @@ const APP_JS: &str = include_str!("../gui/app.js");
 
 /// Response headers that harden the embedded GUI: `frame-ancestors`/`X-Frame-Options` block framing
 /// (clickjacking), the CSP pins every resource to this origin, and `base-uri`/`form-action` close the
-/// base-tag and cross-origin-form vectors. `script-src`/`style-src` still allow `'unsafe-inline'`
-/// because `index.html` bootstraps the API token in an inline `<script>` and the GUI uses a few inline
-/// event handlers; removing both (tracked follow-up) would let `script-src` drop to `'self'` only.
-/// Each line ends in CRLF so it slots straight into the response header block.
-const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\n";
+/// base-tag and cross-origin-form vectors. `script-src 'self'` forbids inline scripts entirely: the
+/// API token rides in a `<body data-token>` attribute (not an inline `<script>`) and the GUI uses
+/// delegated listeners (no inline `onclick`), so no inline script is needed. `style-src` keeps
+/// `'unsafe-inline'` for the GUI's inline style attributes; script injection, the real XSS risk, is
+/// fully blocked. Each line ends in CRLF so it slots straight into the response header block.
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\n";
 
 /// Fuzz entry: run the HTTP request reader over arbitrary bytes (a `Cursor` stands in for the socket).
 /// Exposed only under the `fuzzing` feature so the normal build keeps the parser crate-private. The
