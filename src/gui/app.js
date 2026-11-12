@@ -646,6 +646,68 @@ function refresh(tab) {
   if (tab === "market") loadMarket();
   else if (tab === "swaps") loadSwaps();
   else if (tab === "history") loadHistory();
+  else if (tab === "split") loadSplit();
+}
+
+// ---- Split tab: separate a pre-fork coin (classify -> build -> sign -> submit -> verify). The money
+// steps are the daemon's; this is the guided, non-custodial front end. Handlers are wired once (CSP
+// forbids inline onclick), and the per-step <p> shows progress/errors. ----
+let splitJob = null; // { job_id, txid }
+let splitWired = false;
+function splitErr(e) {
+  return "error: " + ((e.data && e.data.error) || e.status || e.message || e);
+}
+function splitCoin() {
+  const [txid, vout] = (($("#sp-coin").value || "").trim().split(":"));
+  return { txid: (txid || "").trim(), vout: Number(vout || 0) };
+}
+function loadSplit() {
+  if (splitWired) return;
+  splitWired = true;
+  splitJob = { job_id: null, txid: null };
+  $("#sp-classify").addEventListener("click", async () => {
+    const c = splitCoin();
+    $("#sp-step1").textContent = "checking…";
+    try {
+      const r = await api("POST", "/split/classify", { txid: c.txid, vout: c.vout });
+      $("#sp-step1").textContent = r.needs_split
+        ? "This is a pre-fork coin (replayable) - it needs separating."
+        : "This coin is already chain-specific; no split needed.";
+    } catch (e) { $("#sp-step1").textContent = splitErr(e); }
+  });
+  $("#sp-build").addEventListener("click", async () => {
+    const c = splitCoin();
+    const dest = $("#sp-dest").value.trim();
+    $("#sp-step1").textContent = "building…";
+    try {
+      const r = await api("POST", "/split/build", { sha_coins: [{ txid: c.txid, vout: c.vout }], dest });
+      splitJob.job_id = r.job_id;
+      $("#sp-psbt").value = r.psbt;
+      $("#sp-sign-card").classList.remove("hidden");
+      $("#sp-step1").textContent = "Built (fee " + fmtSats(r.fee_sat) + " XBT). Sign the PSBT below.";
+    } catch (e) { $("#sp-step1").textContent = splitErr(e); }
+  });
+  $("#sp-submit").addEventListener("click", async () => {
+    const psbt = $("#sp-signed").value.trim();
+    $("#sp-step2").textContent = "co-signing and broadcasting…";
+    try {
+      const r = await api("POST", "/split/submit", { job_id: splitJob.job_id, psbt });
+      splitJob.txid = r.txid;
+      $("#sp-verify-card").classList.remove("hidden");
+      $("#sp-step2").textContent = "Broadcast on Blake2b. txid " + r.txid;
+    } catch (e) { $("#sp-step2").textContent = splitErr(e); }
+  });
+  $("#sp-verify").addEventListener("click", async () => {
+    $("#sp-step3").textContent = "verifying on the SHA256 node…";
+    try {
+      const r = await api("POST", "/split/verify", { txid: splitJob.txid });
+      $("#sp-step3").textContent = r.final
+        ? "FINAL: replay not possible. The SHA256 side is now safe to spend."
+        : r.separated
+          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " confirmations - wait."
+          : "Not yet separated - check it confirmed on Blake2b.";
+    } catch (e) { $("#sp-step3").textContent = splitErr(e); }
+  });
 }
 
 loadStatus();

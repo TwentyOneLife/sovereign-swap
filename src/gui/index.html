@@ -14,6 +14,7 @@
     <button class="tab active" data-tab="market" title="Offers from other people">Market</button>
     <button class="tab" data-tab="swaps" title="Swaps in progress right now">Swaps</button>
     <button class="tab" data-tab="history" title="Settled swaps, with realized rate, fees and totals">History</button>
+    <button class="tab" data-tab="split" title="Separate a pre-fork coin so it cannot be replayed">Split</button>
   </nav>
   <div id="status" class="status" title="Node and Tor connectivity">…</div>
 </header>
@@ -68,6 +69,58 @@
       <tbody></tbody>
     </table>
     <p id="history-empty" class="muted center">No settled swaps yet.</p>
+  </section>
+
+  <!-- SPLIT -->
+  <section id="split" class="view">
+    <h1>Separate a pre-fork coin</h1>
+    <div class="card">
+      <p>A coin you held at block <strong>961,631</strong> or earlier exists on <em>both</em> chains under
+      the same key. Until you separate it, a move you make on one chain can be copied ("replayed") onto
+      the other.</p>
+      <p><strong>Signing with a Blake2b wallet (Shrike)?</strong> Its signatures are rejected by the
+      SHA256 chain at consensus, so a spend you make there is already non-replayable - you do not need
+      this tool. Get Shrike for StartOS:
+      <a href="https://github.com/TwentyOneLife/shrike-startos" target="_blank" rel="noopener noreferrer">TwentyOneLife/shrike-startos</a>.</p>
+      <p>This is for a coin you must move with a <strong>stock / legacy signer</strong>, or when you want a
+      guarantee independent of your signer. We lend a Blake2b-only "marker" coin (and recover it): the
+      move cannot exist on the SHA256 chain because that input does not exist there. Fee 0.5%, in XBT.
+      Non-custodial - you sign on your own device; we only co-sign our marker.</p>
+    </div>
+    <div class="card">
+      <h2>1. Your coin</h2>
+      <label>Coin to separate (txid:vout)<input id="sp-coin" placeholder="txid:0"></label>
+      <label>Your clean Blake2b destination address<input id="sp-dest" placeholder="bc1..."></label>
+      <div class="row">
+        <button id="sp-classify" class="link">Does it need separating?</button>
+        <button id="sp-build" class="primary">Build the split</button>
+      </div>
+      <p id="sp-step1" class="muted"></p>
+    </div>
+    <div class="card hidden" id="sp-sign-card">
+      <h2>2. Sign it</h2>
+      <p class="muted">Sign this unsigned PSBT on your own device/signer, then paste the signed PSBT back.</p>
+      <textarea id="sp-psbt" class="copyable" readonly rows="3"></textarea>
+      <label>Signed PSBT<textarea id="sp-signed" rows="3" placeholder="paste the signed PSBT"></textarea></label>
+      <button id="sp-submit" class="primary">Co-sign &amp; broadcast</button>
+      <p id="sp-step2" class="muted"></p>
+    </div>
+    <div class="card hidden" id="sp-verify-card">
+      <h2>3. Confirm it is safe</h2>
+      <p class="muted">Wait for 12 confirmations on the Blake2b chain, then verify the coin can never be
+      replayed before you spend the SHA256 side.</p>
+      <button id="sp-verify" class="link">Verify "replay not possible"</button>
+      <p id="sp-step3" class="muted"></p>
+    </div>
+    <div class="card">
+      <h2>Safety</h2>
+      <ul class="muted">
+        <li>Never move or consolidate the coin on the SHA256 side first - that move is replayable.</li>
+        <li>The separating move must include our Blake2b marker (the builder enforces it).</li>
+        <li>Wait at least 12 Blake2b confirmations before trusting it (this low-hashrate chain reorgs).</li>
+        <li>Only when verify says FINAL is it safe to spend the SHA256 side.</li>
+      </ul>
+    </div>
   </section>
 
 </main>
