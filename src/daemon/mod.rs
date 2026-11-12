@@ -67,6 +67,14 @@ const INDEX_HTML: &str = include_str!("../gui/index.html");
 const APP_CSS: &str = include_str!("../gui/app.css");
 const APP_JS: &str = include_str!("../gui/app.js");
 
+/// Response headers that harden the embedded GUI: `frame-ancestors`/`X-Frame-Options` block framing
+/// (clickjacking), the CSP pins every resource to this origin, and `base-uri`/`form-action` close the
+/// base-tag and cross-origin-form vectors. `script-src`/`style-src` still allow `'unsafe-inline'`
+/// because `index.html` bootstraps the API token in an inline `<script>` and the GUI uses a few inline
+/// event handlers; removing both (tracked follow-up) would let `script-src` drop to `'self'` only.
+/// Each line ends in CRLF so it slots straight into the response header block.
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\n";
+
 /// Fuzz entry: run the HTTP request reader over arbitrary bytes (a `Cursor` stands in for the socket).
 /// Exposed only under the `fuzzing` feature so the normal build keeps the parser crate-private. The
 /// reader takes fully untrusted client input, so a panic here is a remote DoS; the fuzzer hunts them.
@@ -537,7 +545,7 @@ impl Daemon {
     fn write_asset(&self, stream: &mut TcpStream, content_type: &str, body: &[u8]) {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-             Connection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+             Connection: close\r\nX-Content-Type-Options: nosniff\r\n{SECURITY_HEADERS}\r\n",
             body.len()
         );
         let _ = stream.write_all(header.as_bytes());
