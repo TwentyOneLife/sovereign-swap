@@ -17,11 +17,11 @@ use std::collections::{HashMap, HashSet};
 
 use std::path::Path;
 
-use bitcoin::consensus::encode::deserialize_hex;
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::transaction::Version;
 use bitcoin::{
-    absolute, Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Witness,
+    absolute, Address, Amount, EcdsaSighashType, OutPoint, Psbt, ScriptBuf, Sequence,
+    TapSighashType, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -326,6 +326,61 @@ pub fn verify_marker(btc_rpc: &Client, marker_txid: &str) -> Result<(), SplitErr
             "{marker_txid} exists on the SHA256 chain; not a Blake2b-only marker, it would not make the \
              move non-replayable"
         )));
+    }
+    Ok(())
+}
+
+/// The SECURITY gate of `/split/submit`: validate a user-signed PSBT before we co-sign our marker. All
+/// three must hold or we refuse. (a) The submitted transaction is byte-for-byte the one we built
+/// (`expected_unsigned_tx_hex`), so the user cannot have changed an output after we picked the marker and
+/// fee. (b) Every input EXCEPT our `marker` is signed with an ALL-family sighash (0x01 or the fork's
+/// 0x21, both parse to `All`), NEVER ANYONECANPAY/NONE/SINGLE - an ANYONECANPAY input could be lifted
+/// into a SHA256-funded transaction and replayed. (c) Our marker input is left unsigned (we add the only
+/// signature on it). It parses the PSBT read-only; the caller co-signs and broadcasts the ORIGINAL
+/// base64, so a 0x21 sighash byte is never rewritten (which would invalidate the user's signature).
+pub fn validate_user_signed(
+    expected_unsigned_tx_hex: &str,
+    submitted_psbt_b64: &str,
+    marker: OutPoint,
+) -> Result<(), SplitError> {
+    use std::str::FromStr;
+    let psbt = Psbt::from_str(submitted_psbt_b64)
+        .map_err(|e| SplitError::Malformed(format!("psbt: {e}")))?;
+    if serialize_hex(&psbt.unsigned_tx) != expected_unsigned_tx_hex {
+        return Err(SplitError::Malformed(
+            "submitted transaction does not match the one we built".to_owned(),
+        ));
+    }
+    for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        let input = &psbt.inputs[i];
+        if txin.previous_output == marker {
+            if !input.partial_sigs.is_empty() || input.tap_key_sig.is_some() {
+                return Err(SplitError::Malformed(
+                    "the marker input must be left unsigned for us to co-sign".to_owned(),
+                ));
+            }
+            continue;
+        }
+        let all_family = if !input.partial_sigs.is_empty() {
+            input
+                .partial_sigs
+                .values()
+                .all(|s| s.sighash_type == EcdsaSighashType::All)
+        } else if let Some(s) = input.tap_key_sig.as_ref() {
+            matches!(
+                s.sighash_type,
+                TapSighashType::Default | TapSighashType::All
+            )
+        } else {
+            return Err(SplitError::Malformed(format!(
+                "user input {i} is not signed"
+            )));
+        };
+        if !all_family {
+            return Err(SplitError::Malformed(format!(
+                "user input {i} is not signed with SIGHASH_ALL (ANYONECANPAY/NONE/SINGLE would be replayable)"
+            )));
+        }
     }
     Ok(())
 }
@@ -990,6 +1045,97 @@ mod tests {
             prepared(2, CoinKind::Blake2bCoin, 10_000),
         ];
         assert!(build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), 10_000).is_err());
+    }
+
+    // ---- P5: submit validation ----
+
+    fn dummy_ecdsa(sighash: EcdsaSighashType) -> (bitcoin::PublicKey, bitcoin::ecdsa::Signature) {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let pk = bitcoin::PublicKey::new(sk.public_key(&secp));
+        let sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&[0x22u8; 64]).unwrap();
+        (
+            pk,
+            bitcoin::ecdsa::Signature {
+                signature: sig,
+                sighash_type: sighash,
+            },
+        )
+    }
+
+    /// (expected unsigned-tx hex, the unsigned PSBT, the marker outpoint) for a user+marker build.
+    fn unsigned_job() -> (String, Psbt, OutPoint) {
+        let inputs = [
+            prepared(1, CoinKind::ShaCoin, 1_000_000), // user input (prev txid 00..01)
+            prepared(2, CoinKind::Blake2bCoin, 10_000), // marker (prev txid 00..02)
+        ];
+        let b64 = build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), 500).unwrap();
+        let psbt: Psbt = b64.parse().unwrap();
+        let expected = serialize_hex(&psbt.unsigned_tx);
+        let marker = psbt.unsigned_tx.input[1].previous_output;
+        (expected, psbt, marker)
+    }
+
+    #[test]
+    fn submit_refuses_an_unsigned_user_input() {
+        let (expected, psbt, marker) = unsigned_job();
+        assert!(validate_user_signed(&expected, &psbt.to_string(), marker).is_err());
+    }
+
+    #[test]
+    fn submit_accepts_a_sighash_all_user_signature() {
+        let (expected, mut psbt, marker) = unsigned_job();
+        let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[0].partial_sigs.insert(pk, sig);
+        validate_user_signed(&expected, &psbt.to_string(), marker).unwrap();
+    }
+
+    #[test]
+    fn submit_refuses_a_non_all_sighash() {
+        for bad in [
+            EcdsaSighashType::None,
+            EcdsaSighashType::Single,
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+        ] {
+            let (expected, mut psbt, marker) = unsigned_job();
+            let (pk, sig) = dummy_ecdsa(bad);
+            psbt.inputs[0].partial_sigs.insert(pk, sig);
+            assert!(
+                validate_user_signed(&expected, &psbt.to_string(), marker).is_err(),
+                "sighash {bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn submit_refuses_a_tampered_transaction() {
+        let (_expected, mut psbt, marker) = unsigned_job();
+        let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[0].partial_sigs.insert(pk, sig);
+        // A build to a DIFFERENT destination has a different unsigned tx, so its hex must not match.
+        let other = build_split_psbt(
+            &[
+                prepared(1, CoinKind::ShaCoin, 1_000_000),
+                prepared(2, CoinKind::Blake2bCoin, 10_000),
+            ],
+            &addr(6),
+            &addr(4),
+            &addr(5),
+            500,
+        )
+        .unwrap();
+        let other_hex = serialize_hex(&other.parse::<Psbt>().unwrap().unsigned_tx);
+        assert!(validate_user_signed(&other_hex, &psbt.to_string(), marker).is_err());
+    }
+
+    #[test]
+    fn submit_refuses_a_pre_signed_marker() {
+        let (expected, mut psbt, marker) = unsigned_job();
+        let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[0].partial_sigs.insert(pk, sig); // user signed (ok)
+        let (pk2, sig2) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[1].partial_sigs.insert(pk2, sig2); // marker pre-signed (NOT ok)
+        assert!(validate_user_signed(&expected, &psbt.to_string(), marker).is_err());
     }
 
     // ---- P3: wallet survey ----
