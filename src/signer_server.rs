@@ -65,7 +65,7 @@ use std::net::{TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::{Address, Network, Psbt, ScriptBuf};
 use serde_json::{json, Value};
@@ -241,6 +241,12 @@ impl SignerService {
     /// local daemon, so this is generous; it mirrors the daemon's and relay's own guard.
     const MAX_CONNECTIONS: usize = 64;
 
+    /// Absolute bound on reading one request, the slowloris defence (see the daemon's equivalent): a
+    /// per-read socket timeout is reset by every trickled byte, so without this a dribbling connection
+    /// holds one of the few signer slots indefinitely. The signer sits behind an authenticated boundary
+    /// and holds keys, so denial of its availability is worth closing too.
+    const REQUEST_READ_DEADLINE_SECS: u64 = 5;
+
     /// Binds and serves forever on `bind`. A thread per connection.
     pub fn serve(self, bind: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(bind)?;
@@ -276,8 +282,13 @@ impl SignerService {
     }
 
     fn serve_connection(&self, mut stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-        let req = match read_request(&mut stream) {
+        // Short per-read timeout so a stalled read wakes to re-check the absolute deadline that bounds
+        // a slow-drip (slowloris) connection.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let req = match read_request(
+            &mut stream,
+            Some(Instant::now() + Duration::from_secs(Self::REQUEST_READ_DEADLINE_SECS)),
+        ) {
             Ok(req) => req,
             // A framing error is still a JSON-RPC error object (HTTP 200), never a bare status, so the
             // daemon reads a message instead of a confusing empty refusal.

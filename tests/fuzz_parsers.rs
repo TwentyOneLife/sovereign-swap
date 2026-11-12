@@ -169,7 +169,22 @@ fn extract_preimage_never_panics_and_only_returns_the_real_secret() {
 
 mod envelope_fuzz {
     use super::{iters, Rng};
-    use sovereign_swap::envelope::{open, verify_broadcast, Identity};
+    use sovereign_swap::envelope::{open, read_broadcast_payload, verify_broadcast, Identity};
+
+    #[test]
+    fn read_broadcast_payload_never_panics_on_random_bytes() {
+        let mut rng = Rng(0x0DE1_2345);
+        for _ in 0..iters(200_000) {
+            // Lengths spanning below and above the header + the two fixed-size signature fields.
+            let len = rng.below(5200);
+            let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            // The relay decodes attacker bytes here WITHOUT verifying, so this must never panic and
+            // must only ever return a sub-slice of its input (never fabricate or over-read).
+            if let Some(payload) = read_broadcast_payload(&bytes) {
+                assert!(payload.len() <= bytes.len());
+            }
+        }
+    }
 
     #[test]
     fn open_and_verify_never_panic_on_random_bytes() {

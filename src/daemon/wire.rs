@@ -56,10 +56,27 @@ pub(crate) struct Request {
 }
 
 /// Reads one HTTP/1.1 request, size-capped. `Err(code)` is the status to answer with.
-pub(crate) fn read_request<R: Read>(stream: &mut R) -> Result<Request, u16> {
+/// Reads and parses one HTTP/1.1 request. `deadline`, when set, is an ABSOLUTE wall-clock bound on the
+/// whole read: once it passes, the read is abandoned with 408. This is the slowloris defence. The
+/// socket's own per-read timeout only bounds a single `read` call, so a connection that dribbles one
+/// byte before each timeout resets it forever and can hold a connection-table slot indefinitely; the
+/// absolute deadline is what actually caps that. A per-read timeout that fires (`WouldBlock`/`TimedOut`)
+/// is therefore not fatal while the deadline has room: we loop back to re-check it, so the caller should
+/// set a socket read timeout well under the deadline so a stalled read wakes to be cut. `None` (the
+/// fuzz/in-memory path, where reads never block) keeps the original behaviour.
+pub(crate) fn read_request<R: Read>(
+    stream: &mut R,
+    deadline: Option<std::time::Instant>,
+) -> Result<Request, u16> {
+    let timed_out = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    };
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    // Read until the header terminator, bounded by the cap.
+    // Read until the header terminator, bounded by the cap and the deadline.
     let header_end = loop {
         if let Some(pos) = find(&buf, b"\r\n\r\n") {
             break pos;
@@ -67,9 +84,14 @@ pub(crate) fn read_request<R: Read>(stream: &mut R) -> Result<Request, u16> {
         if buf.len() > MAX_REQUEST_BYTES {
             return Err(413);
         }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(408);
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return Err(400),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A per-read timeout is not fatal while the deadline has room: re-check and retry.
+            Err(ref e) if deadline.is_some() && timed_out(e) => continue,
             Err(_) => return Err(400),
         }
     };
@@ -96,9 +118,13 @@ pub(crate) fn read_request<R: Read>(stream: &mut R) -> Result<Request, u16> {
     }
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_len {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(408);
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(ref e) if deadline.is_some() && timed_out(e) => continue,
             Err(_) => return Err(400),
         }
         if body.len() > MAX_REQUEST_BYTES {
@@ -191,6 +217,7 @@ pub(crate) fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        408 => "Request Timeout",
         404 => "Not Found",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
@@ -221,7 +248,7 @@ mod fuzz {
                 s ^= s << 17;
                 bytes.push((s & 0xff) as u8);
             }
-            let _ = read_request(&mut Cursor::new(bytes));
+            let _ = read_request(&mut Cursor::new(bytes), None);
         }
         for c in [
             "",
@@ -233,7 +260,7 @@ mod fuzz {
             "GET / HTTP/1.1\r\nContent-Length: -5\r\n\r\n",
             "PUT / HTTP/1.1\r\n: v\r\nX:\r\n\r\n",
         ] {
-            let _ = read_request(&mut Cursor::new(c.as_bytes().to_vec()));
+            let _ = read_request(&mut Cursor::new(c.as_bytes().to_vec()), None);
         }
         // An oversized Content-Length is rejected (413), never allocated.
         let big = format!(
@@ -241,8 +268,89 @@ mod fuzz {
             MAX_REQUEST_BYTES + 1
         );
         assert!(matches!(
-            read_request(&mut Cursor::new(big.into_bytes())),
+            read_request(&mut Cursor::new(big.into_bytes()), None),
             Err(413)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    /// A `Read` that plays a scripted sequence of results. `Ok(bytes)` yields those bytes (empty = EOF),
+    /// `Err` yields that error; once the script is empty it returns `WouldBlock`, standing in for a
+    /// socket whose per-read timeout keeps firing (a slowloris dribble).
+    struct ScriptReader(VecDeque<io::Result<Vec<u8>>>);
+    impl Read for ScriptReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+    }
+    fn wb() -> io::Result<Vec<u8>> {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    #[test]
+    fn read_request_aborts_at_the_deadline_rather_than_holding_the_slot() {
+        // A slowloris: a partial header line, then reads that keep timing out (WouldBlock) and would
+        // never complete the headers. With the deadline already reached, read_request must give up
+        // with 408 instead of looping forever and holding the connection slot.
+        let mut r = ScriptReader(
+            [
+                Ok(b"GET / HTTP/1.1\r\n".to_vec()),
+                wb(),
+                wb(),
+                Ok(Vec::new()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // A deadline captured now has passed by the time the loop checks it.
+        match read_request(&mut r, Some(Instant::now())) {
+            Err(code) => assert_eq!(code, 408, "a timed-out read must be 408"),
+            Ok(_) => panic!("expected a 408 timeout, not a parsed request"),
+        }
+    }
+
+    #[test]
+    fn read_request_retries_through_read_timeouts_while_the_deadline_has_room() {
+        // A healthy client whose bytes arrive across reads that time out in between: the per-read
+        // timeouts are not fatal while the deadline has room, so the request still parses.
+        let mut r = ScriptReader(
+            [
+                wb(),
+                Ok(b"POST /offers HTTP/1.1\r\n".to_vec()),
+                wb(),
+                Ok(b"Content-Length: 2\r\n\r\nhi".to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let req = read_request(&mut r, Some(Instant::now() + Duration::from_secs(30)))
+            .expect("should parse across read timeouts");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/offers");
+        assert_eq!(req.body, b"hi");
+    }
+
+    #[test]
+    fn read_request_without_a_deadline_parses_a_whole_request() {
+        // The in-memory / fuzz path (no deadline, reads never block) keeps the original behaviour.
+        let mut r = io::Cursor::new(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
+        let req = read_request(&mut r, None).expect("plain request parses");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/status");
     }
 }
