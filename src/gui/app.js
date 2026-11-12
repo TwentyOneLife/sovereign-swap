@@ -11,6 +11,42 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const TERMINAL_PHASES = ["done", "refunded", "abandoned"];
 const isTerminal = (s) => TERMINAL_PHASES.includes(s.phase);
 
+// ---- Chain display names: single source of truth ------------------------------------------------
+// The Blake2b chain's ticker is NOT settled: nonkyc and the mining pools use BTCB2, some exchanges use
+// XBT, and XBT also means Bitcoin elsewhere. So every user-facing chain name lives here, keyed by the
+// wire chain id ('btc'/'xbtc', which never changes - the daemon API keeps using those). To rename the
+// whole GUI (e.g. switch 'short' to BTCB2, or drop the proto suffix) edit THIS object only.
+//   short: compact label for tables and the status row
+//   long:  unambiguous form for detail panels, tooltips and prose
+//   url:   the chain's official site, linked from the detail/donate panels
+const CHAIN = {
+  btc: {
+    short: "BTC",
+    long: "BTC (SHA256)",
+    note: "Bitcoin (SHA256 proof-of-work)",
+    url: "https://bitcoin.org/en/",
+  },
+  xbtc: {
+    short: "XBT",
+    long: "BTC (Blake2b)",
+    note: "Bitcoin Blake2b, a different asset from Bitcoin",
+    url: "https://bitcoinknots.org/",
+  },
+};
+const chainShort = (c) => (CHAIN[c] || {}).short || String(c).toUpperCase();
+const chainLong = (c) => (CHAIN[c] || {}).long || String(c).toUpperCase();
+const chainNote = (c) => (CHAIN[c] || {}).note || String(c).toUpperCase();
+const chainUrl = (c) => (CHAIN[c] || {}).url || "";
+// The chain's long name as a link to its official site (detail/donate panels). External navigation is
+// allowed under the CSP (script-src 'self' governs scripts, not <a> links).
+const chainLink = (c) => {
+  const u = chainUrl(c);
+  const name = escapeHtml(chainLong(c));
+  return u
+    ? `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer">${name}</a>`
+    : name;
+};
+
 // Select-all-on-click for read-only copy fields. A single delegated listener replaces the per-element
 // inline `onclick` handlers, which CSP (script-src 'self', no 'unsafe-inline') would otherwise block.
 document.addEventListener("click", (e) => {
@@ -175,8 +211,8 @@ function renderStatus() {
         ? "External price reference: enabled, but the fetch is failing (often a blocked Tor exit; it retries)"
         : "External price reference: off (price discovery is this relay's order book)";
   // Each dot names the exact connection it reports, so a red dot points at the right place.
-  const btcTitle = `BTC node RPC: ${s.btc_node ? "reachable" : "unreachable"}`;
-  const xbtcTitle = `xBTC (Bitcoin Blake2b) node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
+  const btcTitle = `${chainLong("btc")} node RPC: ${s.btc_node ? "reachable" : "unreachable"}`;
+  const xbtcTitle = `${chainLong("xbtc")} node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
   const engineTitle = `Swap engine (the daemon's tick loop): ${s.engine ? "running" : "stopped"}`;
   const relayTitle = `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
   const activeTitle = `Swaps currently in flight on this node: ${s.active_swaps ?? "unknown"}`;
@@ -186,8 +222,8 @@ function renderStatus() {
     `<span class="stat" title="${title}"><span class="dot ${cls}"></span>${label}</span>`;
   const sep = `<span class="sep" aria-hidden="true">|</span>`;
   el.innerHTML = [
-    item(onoff(s.btc_node), btcTitle, "BTC"),
-    item(onoff(s.xbtc_node), xbtcTitle, "xBTC"),
+    item(onoff(s.btc_node), btcTitle, chainShort("btc")),
+    item(onoff(s.xbtc_node), xbtcTitle, chainShort("xbtc")),
     item(onoff(s.engine), engineTitle, "engine"),
     item(onoff(s.relays > 0), relayTitle, "relay"),
     item(priceState, priceTitle, "price"),
@@ -244,9 +280,9 @@ async function loadMarket() {
     defaultDir: "desc",
     columns: [
       { label: "Seen", get: (o) => o.seen_at || 0, cell: (o) => { const t = fmtTime(o.seen_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
-      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => o.sell_chain.toUpperCase() },
+      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => chainShort(o.sell_chain) },
       { label: "Amount", num: true, get: (o) => o.amount_sat, cell: (o) => fmtSats(o.amount_sat) },
-      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}` },
+      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}` },
       { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => fmtRate(o.counter_amount_sat / o.amount_sat) },
     ],
     actions: () => `<button class="link take-btn">Take</button> `,
@@ -256,8 +292,8 @@ async function loadMarket() {
       box.innerHTML =
         `<div class="row between"><strong>Offer #${escapeHtml(o.id.slice(0, 8))}</strong>` +
         `<button class="primary take-btn2">Take this offer</button></div>` +
-        `<p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${o.sell_chain.toUpperCase()}</strong> for ` +
-        `<strong>${fmtSats(o.counter_amount_sat)} ${o.taker_chain.toUpperCase()}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)} · seen ${t.text}</p>` +
+        `<p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
+        `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)} · seen ${t.text}</p>` +
         `<p class="muted">Lock windows: maker ${o.maker_lock_blocks} blk, taker ${o.taker_lock_blocks} blk · smallest take ${fmtSats(o.min_amount_sat)}.</p>`;
       const b = box.querySelector(".take-btn2");
       if (b) b.addEventListener("click", () => takeSheet(o));
@@ -276,8 +312,8 @@ function offerForm(o) {
       <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
     <label>I am selling
       <select id="f-chain" ${o ? "disabled" : ""}>
-        <option value="xbtc" ${sell === "xbtc" ? "selected" : ""}>xBTC</option>
-        <option value="btc" ${sell === "btc" ? "selected" : ""}>BTC</option>
+        <option value="xbtc" ${sell === "xbtc" ? "selected" : ""}>${chainShort("xbtc")}</option>
+        <option value="btc" ${sell === "btc" ? "selected" : ""}>${chainShort("btc")}</option>
       </select></label>
     <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
     <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
@@ -391,20 +427,20 @@ function donateSheet() {
   // Standard-address fallback for wallets that cannot send to a silent-payment address: the project's
   // published per-chain donation addresses.
   const fallback = [
-    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
-    { coin: "BitcoinB2B (xBTC)", note: "Bitcoin Blake2b, a different asset from Bitcoin", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
+    { chain: "btc", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
+    { chain: "xbtc", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
   ];
   const fb = fallback.map((a) =>
-    `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
+    `<label>${chainLink(a.chain)} <span class="muted">(${escapeHtml(chainNote(a.chain))})</span>` +
     `<input readonly class="copyable" value="${escapeHtml(a.addr)}"></label>`,
   ).join("");
   return (
     `<div class="row between"><strong>Donate to TwentyOne.Life</strong>` +
     `<button class="link" id="f-x" title="Close">✕</button></div>` +
-    `<p class="muted"><strong>Silent payment (recommended).</strong> One address for both BTC and xBTC. ` +
+    `<p class="muted"><strong>Silent payment (recommended).</strong> One address for both ${chainShort("btc")} and ${chainShort("xbtc")}. ` +
     `Each donation lands on a fresh, unlinkable address, so nothing clusters to this one. It settles on ` +
     `whichever chain you send from. Needs a wallet that supports silent payments (BIP352).</p>` +
-    `<label>Silent payment (BTC or xBTC)` +
+    `<label>Silent payment (${chainShort("btc")} or ${chainShort("xbtc")})` +
     `<input readonly class="copyable" value="${escapeHtml(sp)}"></label>` +
     `<p class="muted">Or a standard address, if your wallet cannot send to a silent-payment one. These ` +
     `two share Bitcoin's address format but are different assets on different networks: send only the ` +
@@ -431,7 +467,7 @@ async function loadSwaps() {
       { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const t = fmtTime(s.started_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
       { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => fillSwapDetail(s.id, box),
@@ -470,7 +506,7 @@ async function loadHistory() {
   $("#history-totals").innerHTML = t
     ? `${t.count} swap(s) · ${t.done} done · ${t.refunded} refunded · ${t.abandoned} abandoned` +
       (t.active ? ` · ${t.active} in flight` : "") +
-      ` · volume ${fmtSats(t.volume_sat.btc)} BTC / ${fmtSats(t.volume_sat.xbtc)} xBTC` +
+      ` · volume ${fmtSats(t.volume_sat.btc)} ${chainShort("btc")} / ${fmtSats(t.volume_sat.xbtc)} ${chainShort("xbtc")}` +
       ` · voluntary fee paid ${fmtSats(t.voluntary_fee_paid.total_sat)} over ${t.voluntary_fee_paid.swaps} swap(s)`
     : "";
   mountTable($("#history-table"), {
@@ -482,7 +518,7 @@ async function loadHistory() {
       { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const tt = fmtTime(s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
       { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
       { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
       { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
@@ -490,11 +526,11 @@ async function loadHistory() {
     detailInto: (s, box) => {
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
       box.innerHTML =
-        `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ` +
-        `${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()} · realized rate ${fmtRate(s.rate)}` +
+        `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ` +
+        `${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)} · realized rate ${fmtRate(s.rate)}` +
         (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
-        `<p class="muted">Voluntary fee paid: ${s.voluntary_fee_paid_sat == null ? "none" : fmtSats(s.voluntary_fee_paid_sat) + " " + ownChain.toUpperCase()}</p>` +
-        `<p class="muted">Your lock (${ownChain.toUpperCase()}): ${explorerLink(ownChain, s.our_lock_txid)}</p>` +
+        `<p class="muted">Voluntary fee paid: ${s.voluntary_fee_paid_sat == null ? "none" : fmtSats(s.voluntary_fee_paid_sat) + " " + chainShort(ownChain)}</p>` +
+        `<p class="muted">Your lock (${chainShort(ownChain)}): ${explorerLink(ownChain, s.our_lock_txid)}</p>` +
         `<p class="muted">The counterparty leg's txids are on the live Swaps view while a swap is in flight.</p>`;
     },
   });
@@ -515,20 +551,20 @@ async function fillSwapDetail(id, box) {
   const ownLock = s.role === "maker" ? c.maker_lock : c.taker_lock;
   const cpLock = s.role === "maker" ? c.taker_lock : c.maker_lock;
   live.innerHTML =
-    `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${s.maker_chain.toUpperCase()} for ${fmtSats(s.taker_amount_sat)} ${s.taker_chain.toUpperCase()}` +
+    `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">` +
-    `<div class="leg card"><strong>Your leg (${ownChain.toUpperCase()})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
-    `<div class="leg card"><strong>Counterparty (${cpChain.toUpperCase()})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
+    `<div class="leg card"><strong>Your leg (${chainLink(ownChain)})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
+    `<div class="leg card"><strong>Counterparty (${chainLink(cpChain)})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
     `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
     // E2 (design 0017): when funding is parked for the user, show the PSBT handoff.
     (s.pending_lock_psbt
       ? `<div class="card" style="border-left:3px solid var(--orange)">` +
-        `<p><strong>Sign your funding (${ownChain.toUpperCase()})</strong></p>` +
+        `<p><strong>Sign your funding (${chainShort(ownChain)})</strong></p>` +
         `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
-        `in your own wallet (Sparrow for BTC, Shrike for xBTC), and paste the signed PSBT back. Your keys ` +
+        `in your own wallet (Sparrow for ${chainShort("btc")}, Shrike for ${chainShort("xbtc")}), and paste the signed PSBT back. Your keys ` +
         `never leave your wallet.</p>` +
         `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
         `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
