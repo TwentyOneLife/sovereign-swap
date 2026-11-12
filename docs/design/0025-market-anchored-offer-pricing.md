@@ -54,28 +54,31 @@ The Create-offer form, on open, fetches the reference and pre-fills the price at
 chosen direction, and computes `counter_amount_sat` from it. The maker never has to hand-type a
 counter amount to be on-market.
 
-### D3. A margin, set only by the human maker, moves the price off market by a bounded amount
-Add a maker **margin in basis points** (`margin_bps`, signed: positive earns the maker more, i.e. asks
-for more of the counter coin than the market; negative undercuts the market to fill faster). The
-effective price = `market_price * (1 + margin_bps/10_000)`. `margin_bps` is clamped to
-`[-MARGIN_CAP_BPS, +MARGIN_CAP_BPS]` (proposed 1000 = 10%). The default is `0` (exactly the market).
-`counter_amount_sat` is derived from the effective price; integer rounding favours the maker by at most
-one sat and is shown.
+### D3. A margin, set only by the human maker, in whole-percent (1%) steps
+Add a maker **margin in whole percent** (`margin_pct`, a signed integer: positive earns the maker more,
+i.e. asks for more of the counter coin than the market; negative undercuts the market to fill faster).
+The effective price = `market_price * (1 + margin_pct/100)`. The UI stepper moves in **1% steps**; the
+value is an integer percent (no fractional percents, no continuous slider). The default is `0` (exactly
+the market). There is **no fixed `+-10%` clamp**; how far off-market an offer may sit is governed solely
+by the band in D4, which is an **operator setting, not a hardcoded constant**. `counter_amount_sat` is
+derived from the effective price; integer rounding favours the maker by at most one sat and is shown.
 
 ### D4. The price band becomes RELATIVE to the market rate, replacing the absolute 0.5-2.0
-An offer is in band iff its implied price is within `MARGIN_CAP_BPS` of the current market rate, in
-either direction. The absolute `MIN_PRICE/MAX_PRICE` constants are removed from the publish path (they
-were only meaningful for a parity pair). A `price` or a `counter_amount_sat` that implies an out-of-band
-rate is **rejected at publish** with the market rate and the allowed range in the error. The check is
-also run take-side before a taker commits (it is the maker's published price the taker is about to act
-on), mirroring the F3 fee-band pattern: **enforced locally at publish and at take, never in
+An offer is in band iff its implied price is within the operator-configured `price_band_pct` of the
+current market rate, in either direction (a `Settings` field, default proposed 10%, expressed in whole
+percent to match the D3 step; **not** a compiled-in constant). The absolute `MIN_PRICE`/`MAX_PRICE`
+constants are **deleted** (dead after this change - they were only meaningful for a parity pair; the
+"remove unused hardcoded values" requirement). A `price` or a `counter_amount_sat` that implies an
+out-of-band rate is **rejected at publish** with the market rate and the allowed range in the error. The
+check also runs take-side before a taker commits (it is the maker's published price the taker is about
+to act on), mirroring the F3 fee-band pattern: **enforced locally at publish and at take, never in
 counterparty verification**, so no wire-format change and no new-vs-old peer disagreement.
 
 ### D5. `counter_amount_sat` is retained only as a derived, in-band value
 The API still accepts `counter_amount_sat` (lopsided integers are needed and a float price cannot
 express ~270 precisely, #89), but it is now **validated against the band in D4** instead of skipping
 it. A direct `counter_amount_sat` that lands outside the band is refused, so the verbatim-bypass hole is
-closed. The GUI always sends `counter_amount_sat` derived from `market_price` and `margin_bps`.
+closed. The GUI always sends `counter_amount_sat` derived from `market_price` and `margin_pct`.
 
 ### D6. No reference, no off-market offer
 If the reference is absent or stale (D1), the default price cannot be computed. In that state:
@@ -93,7 +96,7 @@ market-anchored pricing to function, otherwise every offer needs the manual esca
 
 The Create-offer form shows, live as the maker types the amount or drags the margin:
 - the market rate both ways ("1 BTC = N xBTC  /  1 xBTC = M BTC", from nonkyc, with `as_of` age),
-- the maker's `margin_bps` control (slider/number, default 0, clamp +-10%),
+- the maker's `margin_pct` control (a 1% stepper, default 0, bounded only by `price_band_pct`),
 - the **effective price** and the resulting `counter_amount_sat`,
 - a plain-language profit line ("you receive ~X% more/less than market as the maker"),
 - a stale/unavailable banner when D6 applies.
@@ -121,9 +124,9 @@ The two-asset reminder stays: this is BTC-Blake2b, a different asset from Bitcoi
 
 ## Implementation sketch (for the tracking issue)
 
-1. `fee.rs`-style pricing module: `effective_price(market, margin_bps)`, `in_band(price, market)`,
+1. `fee.rs`-style pricing module: `effective_price(market, margin_pct)`, `in_band(price, market, band_pct)`,
    `counter_from(amount_sat, price)`, with the caps/age constants.
-2. `NewOffer`: add `margin_bps: Option<i32>` (human margin); keep `price`/`counter_amount_sat`; validate
+2. `NewOffer`: add `margin_pct: Option<i32>` (human margin, whole percent); keep `price`/`counter_amount_sat`; validate
    all three against the band using the reference the daemon already fetches.
 3. `post_offer` + the take pre-check: pull the current reference (reuse `reference_rate`'s path), apply
    D4/D5/D6.
