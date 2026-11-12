@@ -629,6 +629,7 @@ impl Daemon {
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
+            ("POST", "/split/classify") => self.split_classify(&req.body),
             ("POST", p)
                 if p.starts_with("/offers/")
                     && p.ends_with("/take")
@@ -804,6 +805,60 @@ impl Daemon {
         match self.engine_call(EngineCmd::History) {
             Ok(v) => (200, v),
             Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// Coin-split service (P5), read-only: classify a UTXO on the Blake2b chain as a pre-fork
+    /// **SHA-Coin** (exists on both chains, replayable, needs splitting) or a post-fork
+    /// **Blake2b-Coin** (chain-specific). Moves nothing; it only reads the Blake2b node. Body:
+    /// `{"txid": "...", "vout": N}`. The money-moving steps (build the separating PSBT, verify
+    /// separation on the SHA256 node) are separate endpoints.
+    fn split_classify(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(txid) = req["txid"].as_str() else {
+            return (422, json!({"error": "txid required"}));
+        };
+        let vout = req["vout"].as_u64().unwrap_or(0);
+        // Snapshot the node config, then release the state lock before any network I/O.
+        let (node, user, pass, ca, tor_socks) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+            )
+        };
+        let client = match connect_client(&node, &user, &pass, &ca, &tor_socks) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let src = match crate::split::NodeTxSource::new(&client) {
+            Ok(s) => s,
+            Err(e) => return (502, json!({"error": e.to_string()})),
+        };
+        match crate::split::classify(
+            &src,
+            crate::split::MAINNET_FORK_HEIGHT,
+            txid,
+            crate::split::DEFAULT_MAX_LOOKUPS,
+        ) {
+            Ok(kind) => (
+                200,
+                json!({
+                    "txid": txid,
+                    "vout": vout,
+                    "kind": match kind {
+                        crate::split::CoinKind::ShaCoin => "sha_coin",
+                        crate::split::CoinKind::Blake2bCoin => "blake2b_coin",
+                    },
+                    "needs_split": kind.needs_split(),
+                }),
+            ),
+            Err(e) => (502, json!({"error": e.to_string()})),
         }
     }
 

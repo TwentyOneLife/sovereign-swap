@@ -64,6 +64,28 @@ fn every_route_needs_the_token() {
 }
 
 #[test]
+fn split_classify_is_token_gated_and_validates_its_body() {
+    // Coin-split classify endpoint (P5): auth-gated like every route, and its body is validated before
+    // any node I/O, so these cases never touch the Blake2b node.
+    let (addr, token) = daemon();
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", None, "{}").0,
+        401,
+        "classify needs the token"
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", Some(&token), "not json").0,
+        400,
+        "non-JSON body is 400"
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", Some(&token), "{}").0,
+        422,
+        "missing txid is 422"
+    );
+}
+
+#[test]
 fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
     // Input validation runs regardless of engine state: below dust, out-of-band price, min above
