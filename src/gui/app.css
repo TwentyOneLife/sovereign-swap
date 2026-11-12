@@ -14,11 +14,14 @@ a{color:var(--orange)}
 
 header{display:flex;align-items:center;gap:1rem;padding:.7rem 1rem;
   border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;flex-wrap:wrap}
-.brand{font-size:1.05rem;color:#f0f6fc}
-header nav{display:flex;gap:.25rem;margin-left:.5rem}
-.tab{background:none;border:0;color:var(--dim);padding:.4rem .7rem;border-radius:6px;cursor:pointer;font:inherit}
+.brand{font-size:1.05rem;color:#f0f6fc;display:flex;align-items:center;gap:.4rem}
+.brandicon{width:1.3rem;height:1.3rem;display:block}
+header nav{display:flex;gap:.25rem;margin-left:.5rem;flex-wrap:wrap}
+.tab{background:none;border:0;color:var(--dim);padding:.4rem .7rem;border-radius:6px;cursor:pointer;font:inherit;white-space:nowrap}
 .tab:hover{color:var(--text)}
 .tab.active{color:#f0f6fc;background:#21262d}
+/* Tab glyphs kept monochrome (text presentation) so they take the brand orange in every state. */
+.tico{color:var(--orange);font-style:normal;font-weight:600}
 .status{margin-left:auto;font-size:.85rem;color:var(--dim)}
 .status .dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%;margin-right:.35rem;vertical-align:middle}
 .status .stat{white-space:nowrap}
@@ -74,6 +77,8 @@ th.sortable:hover{color:var(--text)}
 
 @media(max-width:620px){
   header{gap:.5rem} .status{order:3;width:100%;margin-left:0}
+  header nav{margin-left:0;width:100%;order:2;justify-content:space-between}
+  .tab{padding:.35rem .5rem}
   th:nth-child(3),td:nth-child(3){display:none}
   main{padding:1rem .6rem 3rem}
 }
