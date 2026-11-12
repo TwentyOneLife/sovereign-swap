@@ -15,15 +15,19 @@
 
 use std::collections::{HashMap, HashSet};
 
+use std::path::Path;
+
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::transaction::Version;
 use bitcoin::{
     absolute, Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::rpc::{Client, RpcError};
+use crate::store::write_atomic;
 
 /// Mainnet fork height: the FIRST block that differs between the SHA256 and Blake2b chains, so a
 /// coinbase at or above it on the Blake2b chain is a Blake2b-only coin. This is the BIP-110 split at
@@ -569,7 +573,7 @@ pub const MARKER_RESERVATION_SECS: u64 = 3600;
 
 /// A Blake2b-Coin we lend as the separating marker. It is RECOVERED as change by the builder (never
 /// given away), so a marker is a modest UTXO from our own mining.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
     pub txid: String,
     pub vout: u32,
@@ -588,7 +592,7 @@ pub struct TaintedChange;
 /// (2) the change a split returns to us is NEVER reused as a future marker - otherwise every user's
 /// split would spend the previous one's change, chaining all users into one common-input cluster.
 /// Markers come only from our mining; their recovered change is tainted and sequestered.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MarkerPool {
     available: Vec<Marker>,
     reserved: HashMap<String, (Marker, u64)>, // job_id -> (marker, reserved_at unix)
@@ -621,8 +625,9 @@ impl MarkerPool {
         Some(m)
     }
 
-    /// Release reservations older than `timeout` back to the pool; returns how many were freed.
-    pub fn expire(&mut self, now: u64, timeout: u64) -> usize {
+    /// Release reservations older than `timeout` back to the pool; returns the freed job ids (so a
+    /// caller tracking per-job state can drop them too).
+    pub fn expire(&mut self, now: u64, timeout: u64) -> Vec<String> {
         let stale: Vec<String> = self
             .reserved
             .iter()
@@ -634,7 +639,7 @@ impl MarkerPool {
                 self.available.push(m);
             }
         }
-        stale.len()
+        stale
     }
 
     /// Explicitly release a job's reservation (aborted before broadcast); the marker returns to the pool.
@@ -658,6 +663,60 @@ impl MarkerPool {
     }
     pub fn reserved_count(&self) -> usize {
         self.reserved.len()
+    }
+}
+
+/// The persisted split-service state: the lent-marker [`MarkerPool`] plus the pending jobs (the exact
+/// unsigned transaction we built per job, so `/split/submit` can require the submitted PSBT to be the
+/// very transaction we built and reserved a marker for). Persisted to `split.json` in the data dir, so a
+/// reserved marker or a pending job survives a daemon restart (else a restart could double-lend a marker).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SplitState {
+    pub pool: MarkerPool,
+    /// job_id -> the exact unsigned transaction we built (hex), matched byte-for-byte at submit.
+    jobs: HashMap<String, String>,
+}
+
+impl SplitState {
+    /// Load from `path`, or a fresh empty state if it is absent or unreadable.
+    pub fn load(path: &Path) -> SplitState {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist atomically (same `write_atomic` the engine uses).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        write_atomic(
+            path,
+            &serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
+        )
+    }
+
+    /// Record the exact unsigned tx built for `job_id` (its marker is already reserved in the pool).
+    pub fn set_job(&mut self, job_id: &str, unsigned_tx_hex: String) {
+        self.jobs.insert(job_id.to_owned(), unsigned_tx_hex);
+    }
+
+    /// The exact unsigned tx we built for `job_id`, to match a submitted PSBT against.
+    pub fn job(&self, job_id: &str) -> Option<&str> {
+        self.jobs.get(job_id).map(String::as_str)
+    }
+
+    /// Release every job whose marker reservation has expired (user never submitted): the marker returns
+    /// to the pool and the stale job is dropped. Call before reserving.
+    pub fn expire(&mut self, now: u64, timeout: u64) {
+        for job_id in self.pool.expire(now, timeout) {
+            self.jobs.remove(&job_id);
+        }
+    }
+
+    /// The job's marker was spent on-chain: drop the job and taint its change (via the pool) so the
+    /// recovered coin never becomes a future marker. Returns the consumed marker.
+    pub fn finish_job(&mut self, job_id: &str, change_txid: String) -> Option<Marker> {
+        self.jobs.remove(job_id);
+        self.pool.consume(job_id, change_txid)
     }
 }
 
@@ -1049,14 +1108,13 @@ mod tests {
         pool.reserve("abandoned", 1_000);
         assert_eq!(pool.available_count(), 0);
         // Not yet stale.
-        assert_eq!(
-            pool.expire(1_000 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS),
-            0
-        );
-        // Past the timeout: freed.
+        assert!(pool
+            .expire(1_000 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS)
+            .is_empty());
+        // Past the timeout: freed (the job id comes back).
         assert_eq!(
             pool.expire(1_001 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS),
-            1
+            vec!["abandoned".to_owned()]
         );
         assert_eq!(pool.available_count(), 1);
         assert!(pool.reserve("fresh", 0).is_some());
@@ -1093,5 +1151,57 @@ mod tests {
         pool.release("job");
         assert_eq!(pool.available_count(), 1);
         assert_eq!(pool.reserved_count(), 0);
+    }
+
+    #[test]
+    fn split_state_round_trips_through_disk() {
+        let mut st = SplitState::default();
+        st.pool.add_marker(marker(1)).unwrap();
+        st.pool.add_marker(marker(2)).unwrap();
+        let m = st.pool.reserve("job-a", 1_000).unwrap();
+        st.set_job("job-a", "deadbeef".to_owned());
+        let path =
+            std::env::temp_dir().join(format!("split-state-test-{}.json", std::process::id()));
+        st.save(&path).unwrap();
+        let mut loaded = SplitState::load(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.job("job-a"), Some("deadbeef"));
+        assert_eq!(loaded.pool.reserved_count(), 1);
+        assert_eq!(loaded.pool.available_count(), 1);
+        // the reserved marker survived the round trip
+        assert_eq!(loaded.pool.reserve("job-a", 2_000).unwrap(), m);
+    }
+
+    #[test]
+    fn split_state_expiry_drops_the_job_and_frees_the_marker() {
+        let mut st = SplitState::default();
+        st.pool.add_marker(marker(1)).unwrap();
+        st.pool.reserve("stale", 1_000).unwrap();
+        st.set_job("stale", "aa".to_owned());
+        st.expire(1_001 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS);
+        assert_eq!(st.job("stale"), None, "stale job dropped");
+        assert_eq!(st.pool.available_count(), 1, "marker back in the pool");
+    }
+
+    #[test]
+    fn finishing_a_job_drops_it_and_taints_the_change() {
+        let mut st = SplitState::default();
+        st.pool.add_marker(marker(1)).unwrap();
+        st.pool.reserve("job", 0).unwrap();
+        st.set_job("job", "bb".to_owned());
+        let change = format!("{:064x}", 0xfe);
+        st.finish_job("job", change.clone()).unwrap();
+        assert_eq!(st.job("job"), None);
+        assert_eq!(
+            st.pool.available_count(),
+            0,
+            "consumed marker does not return"
+        );
+        let recycled = Marker {
+            txid: change,
+            vout: 0,
+            value_sat: 9_000,
+        };
+        assert_eq!(st.pool.add_marker(recycled), Err(TaintedChange));
     }
 }
