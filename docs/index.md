@@ -39,7 +39,8 @@ features:
 
 ## What this is
 
-**Sovereign Swap** trades Bitcoin (BTC) for Bitcoin Blake2b (xBTC) and back, directly between two
+**Sovereign Swap** trades [Bitcoin (BTC)](https://bitcoin.org/en/) for
+[Bitcoin Blake2b (xBTC)](https://bitcoinknots.org/) and back, directly between two
 people, with no exchange, no custodian, and no account. The two sides never have to trust each other:
 the trade is enforced by cryptography on both chains, so the worst case for an honest party is that they
 get their own coin back.

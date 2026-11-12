@@ -18,21 +18,34 @@ const isTerminal = (s) => TERMINAL_PHASES.includes(s.phase);
 // whole GUI (e.g. switch 'short' to BTCB2, or drop the proto suffix) edit THIS object only.
 //   short: compact label for tables and the status row
 //   long:  unambiguous form for detail panels, tooltips and prose
+//   url:   the chain's official site, linked from the detail/donate panels
 const CHAIN = {
   btc: {
     short: "BTC",
     long: "BTC (SHA256)",
     note: "Bitcoin (SHA256 proof-of-work)",
+    url: "https://bitcoin.org/en/",
   },
   xbtc: {
     short: "XBT",
     long: "BTC (Blake2b)",
     note: "Bitcoin Blake2b, a different asset from Bitcoin",
+    url: "https://bitcoinknots.org/",
   },
 };
 const chainShort = (c) => (CHAIN[c] || {}).short || String(c).toUpperCase();
 const chainLong = (c) => (CHAIN[c] || {}).long || String(c).toUpperCase();
 const chainNote = (c) => (CHAIN[c] || {}).note || String(c).toUpperCase();
+const chainUrl = (c) => (CHAIN[c] || {}).url || "";
+// The chain's long name as a link to its official site (detail/donate panels). External navigation is
+// allowed under the CSP (script-src 'self' governs scripts, not <a> links).
+const chainLink = (c) => {
+  const u = chainUrl(c);
+  const name = escapeHtml(chainLong(c));
+  return u
+    ? `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer">${name}</a>`
+    : name;
+};
 
 // Select-all-on-click for read-only copy fields. A single delegated listener replaces the per-element
 // inline `onclick` handlers, which CSP (script-src 'self', no 'unsafe-inline') would otherwise block.
@@ -414,11 +427,11 @@ function donateSheet() {
   // Standard-address fallback for wallets that cannot send to a silent-payment address: the project's
   // published per-chain donation addresses.
   const fallback = [
-    { coin: "Bitcoin (BTC)", note: "the SHA-256 Bitcoin network", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
-    { coin: chainLong("xbtc"), note: chainNote("xbtc"), addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
+    { chain: "btc", addr: "bc1qzz077zqg9e0ymy7euhrmfyfmsfuqggtlr7v9mf" },
+    { chain: "xbtc", addr: "bc1ql66ssq24t7w4jl8updfrs820efnujp0m5jjuqk" },
   ];
   const fb = fallback.map((a) =>
-    `<label>${escapeHtml(a.coin)} <span class="muted">(${escapeHtml(a.note)})</span>` +
+    `<label>${chainLink(a.chain)} <span class="muted">(${escapeHtml(chainNote(a.chain))})</span>` +
     `<input readonly class="copyable" value="${escapeHtml(a.addr)}"></label>`,
   ).join("");
   return (
@@ -541,8 +554,8 @@ async function fillSwapDetail(id, box) {
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">` +
-    `<div class="leg card"><strong>Your leg (${chainShort(ownChain)})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
-    `<div class="leg card"><strong>Counterparty (${chainShort(cpChain)})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
+    `<div class="leg card"><strong>Your leg (${chainLink(ownChain)})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
+    `<div class="leg card"><strong>Counterparty (${chainLink(cpChain)})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
     `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
