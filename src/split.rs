@@ -13,6 +13,8 @@
 //! Safety invariant (from the proven runbook): a separating transaction MUST have at least one
 //! Blake2b-Coin input, or it is replayable. The builder enforces that; the classifier is how we check.
 
+use std::collections::{HashMap, HashSet};
+
 use bitcoin::transaction::Version;
 use bitcoin::{
     absolute, Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -528,10 +530,109 @@ pub fn survey_wallet<S: TxSource>(
     Ok(survey)
 }
 
+// ---- P3: the lent-marker pool (reservation + privacy) -------------------------------------------
+
+/// How long a reserved marker is held for a job before it auto-releases (the user never broadcast), so
+/// an abandoned job cannot hold or drain the pool. An hour is ample for signing a PSBT out of band.
+pub const MARKER_RESERVATION_SECS: u64 = 3600;
+
+/// A Blake2b-Coin we lend as the separating marker. It is RECOVERED as change by the builder (never
+/// given away), so a marker is a modest UTXO from our own mining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub txid: String,
+    pub vout: u32,
+    pub value_sat: u64,
+}
+
+/// The coin offered as a marker is the change of a previous split; using it would chain users'
+/// transactions together through our change (a privacy leak), so the pool refuses it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaintedChange;
+
+/// A pool of lent Blake2b-Coin markers. Pure in-memory state (the daemon persists it) enforcing the two
+/// rules the marker scheme needs:
+/// (1) a marker is reserved to at most ONE job at a time and a reservation EXPIRES after
+/// [`MARKER_RESERVATION_SECS`], so a user who never broadcasts cannot hold or drain the pool; and
+/// (2) the change a split returns to us is NEVER reused as a future marker - otherwise every user's
+/// split would spend the previous one's change, chaining all users into one common-input cluster.
+/// Markers come only from our mining; their recovered change is tainted and sequestered.
+#[derive(Debug, Default)]
+pub struct MarkerPool {
+    available: Vec<Marker>,
+    reserved: HashMap<String, (Marker, u64)>, // job_id -> (marker, reserved_at unix)
+    tainted: HashSet<String>, // txids of our own split change, never usable as markers
+}
+
+impl MarkerPool {
+    /// Add a marker from our mining. Refused if the coin is the change of a previous split. Returns
+    /// whether it was newly added (idempotent for a coin already held or reserved).
+    pub fn add_marker(&mut self, m: Marker) -> Result<bool, TaintedChange> {
+        if self.tainted.contains(&m.txid) {
+            return Err(TaintedChange);
+        }
+        let held = |v: &Marker| v.txid == m.txid && v.vout == m.vout;
+        if self.available.iter().any(held) || self.reserved.values().any(|(r, _)| held(r)) {
+            return Ok(false);
+        }
+        self.available.push(m);
+        Ok(true)
+    }
+
+    /// Reserve a marker for `job_id` (idempotent: the same job keeps its marker). `None` if the pool is
+    /// empty. Call [`MarkerPool::expire`] first to reclaim stale reservations.
+    pub fn reserve(&mut self, job_id: &str, now: u64) -> Option<Marker> {
+        if let Some((m, _)) = self.reserved.get(job_id) {
+            return Some(m.clone());
+        }
+        let m = self.available.pop()?;
+        self.reserved.insert(job_id.to_owned(), (m.clone(), now));
+        Some(m)
+    }
+
+    /// Release reservations older than `timeout` back to the pool; returns how many were freed.
+    pub fn expire(&mut self, now: u64, timeout: u64) -> usize {
+        let stale: Vec<String> = self
+            .reserved
+            .iter()
+            .filter(|(_, (_, at))| now.saturating_sub(*at) > timeout)
+            .map(|(j, _)| j.clone())
+            .collect();
+        for j in &stale {
+            if let Some((m, _)) = self.reserved.remove(j) {
+                self.available.push(m);
+            }
+        }
+        stale.len()
+    }
+
+    /// Explicitly release a job's reservation (aborted before broadcast); the marker returns to the pool.
+    pub fn release(&mut self, job_id: &str) {
+        if let Some((m, _)) = self.reserved.remove(job_id) {
+            self.available.push(m);
+        }
+    }
+
+    /// The job broadcast its split: the marker is spent on-chain, so drop the reservation WITHOUT
+    /// returning it to the pool, and taint the split's change `change_txid` so the recovered coin can
+    /// never become a future marker (privacy). Returns the consumed marker.
+    pub fn consume(&mut self, job_id: &str, change_txid: String) -> Option<Marker> {
+        let (m, _) = self.reserved.remove(job_id)?;
+        self.tainted.insert(change_txid);
+        Some(m)
+    }
+
+    pub fn available_count(&self) -> usize {
+        self.available.len()
+    }
+    pub fn reserved_count(&self) -> usize {
+        self.reserved.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// A mock chain: txid -> TxInfo, for unit-testing the classifier without a node.
     struct Mock(HashMap<&'static str, TxInfo>);
@@ -830,5 +931,88 @@ mod tests {
         assert!(sep.separated); // the input is Blake2b-only
         assert!(!sep.deep_enough); // only 3 confirmations, needs 12
         assert!(!sep.is_final()); // separated but not yet safe from a reorg
+    }
+
+    // ---- P3: the lent-marker pool ----
+
+    fn marker(n: u8) -> Marker {
+        Marker {
+            txid: format!("{n:064x}"),
+            vout: 0,
+            value_sat: 10_000,
+        }
+    }
+
+    #[test]
+    fn a_marker_is_reserved_to_one_job_and_the_same_job_is_idempotent() {
+        let mut pool = MarkerPool::default();
+        pool.add_marker(marker(1)).unwrap();
+        pool.add_marker(marker(2)).unwrap();
+        let a = pool.reserve("job-a", 100).unwrap();
+        let a_again = pool.reserve("job-a", 200).unwrap();
+        assert_eq!(a, a_again, "same job keeps its marker");
+        let b = pool.reserve("job-b", 100).unwrap();
+        assert_ne!(a, b, "a different job gets a different marker");
+        assert_eq!(pool.available_count(), 0);
+        assert_eq!(pool.reserved_count(), 2);
+    }
+
+    #[test]
+    fn reserve_is_none_when_the_pool_is_empty() {
+        let mut pool = MarkerPool::default();
+        assert!(pool.reserve("job", 0).is_none());
+    }
+
+    #[test]
+    fn a_stale_reservation_expires_back_to_the_pool() {
+        let mut pool = MarkerPool::default();
+        pool.add_marker(marker(1)).unwrap();
+        pool.reserve("abandoned", 1_000);
+        assert_eq!(pool.available_count(), 0);
+        // Not yet stale.
+        assert_eq!(
+            pool.expire(1_000 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS),
+            0
+        );
+        // Past the timeout: freed.
+        assert_eq!(
+            pool.expire(1_001 + MARKER_RESERVATION_SECS, MARKER_RESERVATION_SECS),
+            1
+        );
+        assert_eq!(pool.available_count(), 1);
+        assert!(pool.reserve("fresh", 0).is_some());
+    }
+
+    #[test]
+    fn a_split_change_is_never_reusable_as_a_marker() {
+        let mut pool = MarkerPool::default();
+        pool.add_marker(marker(1)).unwrap();
+        pool.reserve("job", 0).unwrap();
+        // The job broadcast; its change (say the tx 00..0f) is now tainted.
+        let change = format!("{:064x}", 0x0f);
+        pool.consume("job", change.clone()).unwrap();
+        assert_eq!(pool.reserved_count(), 0);
+        assert_eq!(
+            pool.available_count(),
+            0,
+            "a consumed marker does not return"
+        );
+        // Trying to feed that change back as a marker is refused.
+        let recycled = Marker {
+            txid: change,
+            vout: 1,
+            value_sat: 9_500,
+        };
+        assert_eq!(pool.add_marker(recycled), Err(TaintedChange));
+    }
+
+    #[test]
+    fn an_aborted_job_releases_its_marker() {
+        let mut pool = MarkerPool::default();
+        pool.add_marker(marker(1)).unwrap();
+        pool.reserve("job", 0).unwrap();
+        pool.release("job");
+        assert_eq!(pool.available_count(), 1);
+        assert_eq!(pool.reserved_count(), 0);
     }
 }
