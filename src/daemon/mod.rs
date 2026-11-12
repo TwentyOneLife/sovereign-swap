@@ -734,6 +734,9 @@ impl Daemon {
                         "rate": r.rate, "bid": r.bid, "ask": r.ask,
                         "source": source,
                         "verify_url": "https://nonkyc.io/market/BTCB2_BTC",
+                        // The operator's pricing band (design 0025), so the Create-offer form can show
+                        // the allowed range and keep the margin stepper inside it.
+                        "price_band_pct": settings.price_band_pct,
                     }),
                 )
             }
