@@ -275,6 +275,60 @@ fn sat_to_btc(sat: u64) -> f64 {
     sat as f64 / 100_000_000.0
 }
 
+// ---- P3: survey a wallet (what needs splitting, what can split it) -------------------------------
+
+/// One wallet UTXO to be surveyed.
+#[derive(Debug, Clone)]
+pub struct WalletUtxo {
+    pub txid: String,
+    pub vout: u32,
+    pub value_sat: u64,
+}
+
+/// The result of surveying a wallet: the SHA-Coins that still need separating, and the Blake2b-Coins
+/// available to separate them with (the "ingredients", e.g. our mining rewards). A SHA-Coin can be
+/// separated when at least one ingredient exists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Survey {
+    pub to_split: Vec<SplitInput>,
+    pub ingredients: Vec<SplitInput>,
+}
+
+impl Survey {
+    /// Whether every SHA-Coin found can be separated with the ingredients on hand (one per move, but an
+    /// ingredient's change is itself an ingredient, so one is enough to start).
+    pub fn can_split(&self) -> bool {
+        self.to_split.is_empty() || !self.ingredients.is_empty()
+    }
+}
+
+/// Classify every wallet UTXO and partition it into SHA-Coins (replayable, need separating) and
+/// Blake2b-Coins (chain-specific, usable as the separating ingredient). This is what the service shows a
+/// user: "these coins need splitting; here is what can split them." Each classification is bounded by
+/// `max_lookups`.
+pub fn survey_wallet<S: TxSource>(
+    src: &S,
+    fork_height: u32,
+    utxos: &[WalletUtxo],
+    max_lookups: u32,
+) -> Result<Survey, SplitError> {
+    let mut survey = Survey::default();
+    for u in utxos {
+        let kind = classify(src, fork_height, &u.txid, max_lookups)?;
+        let input = SplitInput {
+            txid: u.txid.clone(),
+            vout: u.vout,
+            kind,
+            value_sat: u.value_sat,
+        };
+        match kind {
+            CoinKind::ShaCoin => survey.to_split.push(input),
+            CoinKind::Blake2bCoin => survey.ingredients.push(input),
+        }
+    }
+    Ok(survey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +478,52 @@ mod tests {
         assert_eq!(plan.total_sat, 1_020_353);
         assert_eq!(plan.sha_value_sat, 1_010_115); // fee is on the separated value, not the ingredient
         assert_eq!(plan.fee_sat, project_fee_sat(1_010_115, FEE_BPS)); // 0.5%
+    }
+
+    // ---- P3: wallet survey ----
+
+    #[test]
+    fn survey_partitions_sha_coins_from_ingredients_and_reports_splittability() {
+        // Wallet: a pre-fork SHA-Coin, a post-fork Blake2b-Coin (ingredient), and another SHA-Coin.
+        let m = Mock(HashMap::from([
+            ("sha1", cb(50)),              // pre-fork coinbase -> SHA-Coin
+            ("ing", cb(130)),              // post-fork coinbase -> Blake2b-Coin
+            ("sha2", tx(40, &[("x", 0)])), // pre-fork -> SHA-Coin
+        ]));
+        let utxos = [
+            WalletUtxo {
+                txid: "sha1".to_owned(),
+                vout: 0,
+                value_sat: 1_000_000,
+            },
+            WalletUtxo {
+                txid: "ing".to_owned(),
+                vout: 0,
+                value_sat: 50_000,
+            },
+            WalletUtxo {
+                txid: "sha2".to_owned(),
+                vout: 1,
+                value_sat: 500_000,
+            },
+        ];
+        let s = survey_wallet(&m, FORK, &utxos, 50).unwrap();
+        assert_eq!(s.to_split.len(), 2);
+        assert_eq!(s.ingredients.len(), 1);
+        assert!(s.can_split());
+    }
+
+    #[test]
+    fn survey_reports_not_splittable_without_an_ingredient() {
+        let m = Mock(HashMap::from([("sha1", cb(50))]));
+        let utxos = [WalletUtxo {
+            txid: "sha1".to_owned(),
+            vout: 0,
+            value_sat: 1_000_000,
+        }];
+        let s = survey_wallet(&m, FORK, &utxos, 50).unwrap();
+        assert_eq!(s.to_split.len(), 1);
+        assert!(s.ingredients.is_empty());
+        assert!(!s.can_split()); // has a SHA-Coin but no Blake2b-Coin to separate it with
     }
 }
