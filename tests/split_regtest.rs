@@ -235,7 +235,7 @@ fn split_core_against_real_forked_nodes() {
 /// for any confirmed tx not in the mempool, which would make a replayable input look absent. verify must
 /// refuse (error), never report a separation. So `require_txindex` must fail on such a node.
 #[test]
-fn verify_refuses_without_a_synced_txindex() {
+fn split_verify_refuses_without_a_synced_txindex() {
     let Some((core, _)) = common::binaries() else {
         return;
     };
