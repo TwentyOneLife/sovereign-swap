@@ -254,24 +254,9 @@ async function loadReference() {
 }
 
 // --- market ---
-let lastOffers = [];
-
-// Price context from OUR order book (no external oracle; xBTC has no liquid market to derive a rate
-// from, so the offers on our relay are the price discovery). Returns the rate range and midpoint for
-// a sell direction, to prefill the create form and show where the market is.
-function rateHint(sellChain) {
-  const rates = lastOffers
-    .filter((o) => o.sell_chain === sellChain)
-    .map((o) => o.counter_amount_sat / o.amount_sat)
-    .filter((r) => isFinite(r) && r > 0)
-    .sort((a, b) => a - b);
-  if (!rates.length) return null;
-  return { count: rates.length, min: rates[0], max: rates[rates.length - 1], mid: rates[Math.floor(rates.length / 2)] };
-}
 
 async function loadMarket() {
   const offers = await api("GET", "/offers").catch(() => []);
-  lastOffers = offers;
   $("#offers-empty").style.display = offers.length ? "none" : "block";
   mountTable($("#offers"), {
     rows: offers,
@@ -302,28 +287,43 @@ async function loadMarket() {
 }
 
 function offerForm(o) {
-  const sell = o ? o.sell_chain : "xbtc";
-  const hint = o ? null : rateHint(sell);
-  const price = o ? fmtRate(o.counter_amount_sat / o.amount_sat) : (hint ? fmtRate(hint.mid) : "0.997");
-  const hintLine = hint
-    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${fmtRate(hint.min)} - ${fmtRate(hint.max)}. You set your own price.</p>`
-    : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
-  return `<div class="row between"><h2>${o ? "Take offer" : "Create offer"}</h2>
+  if (o) {
+    // Take: the terms are the maker's; you take the whole offer, nothing to set.
+    return `<div class="row between"><h2>Take offer</h2>
+        <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
+      <p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for
+        <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
+        rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
+      <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
+      <div class="row between">
+        <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
+        <button class="primary" id="f-go">Take</button>
+      </div>
+      <p id="f-msg" class="muted"></p>`;
+  }
+  // Create: market-anchored pricing (design 0025). The nonkyc rate is the default and anchor; you add a
+  // whole-percent maker margin. The rate is not something you invent.
+  return `<div class="row between"><h2>Create offer</h2>
       <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
     <label>I am selling
-      <select id="f-chain" ${o ? "disabled" : ""}>
-        <option value="xbtc" ${sell === "xbtc" ? "selected" : ""}>${chainShort("xbtc")}</option>
-        <option value="btc" ${sell === "btc" ? "selected" : ""}>${chainShort("btc")}</option>
+      <select id="f-chain">
+        <option value="xbtc">${chainShort("xbtc")}</option>
+        <option value="btc">${chainShort("btc")}</option>
       </select></label>
-    <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
-    <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
-    ${o ? "" : '<label title="For a lopsided real rate (e.g. BTC vs the much cheaper xBTC): the exact total amount of the other coin you want for the whole amount. Overrides Price when set.">Exact counter amount (optional) <input id="f-counter" placeholder="leave blank to use Price"></label>'}
-    ${hintLine}
-    ${o ? "" : '<p id="f-ref" class="muted"></p><p id="f-dev" class="muted" style="color:var(--orange)"></p>'}
+    <label>Amount <input id="f-amount" placeholder="0.5"></label>
+    <p id="f-market" class="muted">Loading the market rate…</p>
+    <label title="Your margin off the nonkyc market rate, in whole percent (1% steps). Positive earns you more as the maker; negative undercuts the market to fill faster. The rate comes from nonkyc; you choose only the margin.">
+      Your maker margin (%) <input id="f-margin" type="number" step="1" value="0"></label>
+    <p id="f-eff" class="muted"></p>
+    <details id="f-adv"><summary class="muted" style="cursor:pointer">Advanced: set an exact counter amount instead</summary>
+      <label title="A specific integer counter amount for the whole offer. Still checked against the market band. Leave blank to use the margin above.">
+        Exact counter amount <input id="f-counter" placeholder="leave blank to use the margin"></label>
+    </details>
+    <div id="f-d6" class="warn hidden"></div>
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
       <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
-      <button class="primary" id="f-go">${o ? "Take" : "Publish offer"}</button>
+      <button class="primary" id="f-go">Publish offer</button>
     </div>
     <p id="f-msg" class="muted"></p>`;
 }
@@ -339,57 +339,102 @@ function openSheet(html) {
 
 function createSheet() {
   openSheet(offerForm(null));
-  // Re-suggest the price from the order book when the direction changes.
-  $("#f-chain").onchange = () => {
-    const h = rateHint($("#f-chain").value);
-    if (h) $("#f-price").value = fmtRate(h.mid);
-    showReference();
-  };
-  // Optional external reference (nonkyc, over Tor) + a fat-finger deviation warning.
-  let refRate = null; // BTC per xBTC
-  async function showReference() {
-    const box = $("#f-ref");
-    if (!box) return;
+  let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
+  const go = $("#f-go");
+
+  // The market price (counter coin per unit of the sold coin) for the current direction.
+  const marketPrice = () =>
+    !ref ? null : $("#f-chain").value === "xbtc" ? ref.rate : 1 / ref.rate;
+
+  async function loadReference() {
     try {
       const r = await api("GET", "/reference-rate");
-      if (!r.enabled) { box.textContent = ""; refRate = null; return; }
-      if (r.error) { box.textContent = "Reference unavailable (" + r.error + "); using the order book."; refRate = null; return; }
-      refRate = r.rate;
-      const sell = $("#f-chain").value;
-      const shown = sell === "xbtc" ? r.rate : 1 / r.rate; // price is per-unit of what you sell
-      const verify = r.verify_url
-        ? ` · <a href="${escapeHtml(r.verify_url)}" target="_blank" rel="noopener noreferrer">verify on nonkyc</a>`
-        : "";
-      box.innerHTML =
-        `Reference: <strong>${shown.toFixed(sell === "xbtc" ? 8 : 4)}</strong> ` +
-        `(${escapeHtml(r.source)})${verify}. You still set the price.`;
-    } catch (e) { box.textContent = ""; refRate = null; }
+      ref =
+        r.enabled && !r.error && isFinite(r.rate) && r.rate > 0
+          ? { rate: r.rate, band: Number.isFinite(r.price_band_pct) ? r.price_band_pct : 10, verify: r.verify_url }
+          : null;
+    } catch (e) {
+      ref = null;
+    }
+    recompute();
   }
-  function checkDeviation() {
-    const w = $("#f-dev");
-    if (!w || refRate === null) return;
-    const sell = $("#f-chain").value;
-    const ref = sell === "xbtc" ? refRate : 1 / refRate;
-    const p = parseFloat($("#f-price").value.replace(",", "."));
-    const off = isFinite(p) && ref > 0 ? Math.abs(p - ref) / ref : 0;
-    w.textContent = off > 0.05 ? `⚠ ${(off * 100).toFixed(0)}% from the reference - check the price.` : "";
+
+  function recompute() {
+    const market = $("#f-market"), eff = $("#f-eff"), d6 = $("#f-d6");
+    const counterRaw = ($("#f-counter") && $("#f-counter").value.trim()) || "";
+    const sell = $("#f-chain").value, taker = sell === "xbtc" ? "btc" : "xbtc";
+    const amount = parseBtc($("#f-amount").value);
+    if (!ref) {
+      // D6: no reference, no market-derived price. Only the Advanced exact-counter path can publish.
+      market.textContent = "";
+      eff.textContent = "";
+      d6.classList.remove("hidden");
+      d6.innerHTML =
+        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference, or set an exact counter amount under Advanced.";
+      go.disabled = !counterRaw;
+      return;
+    }
+    d6.classList.add("hidden");
+    const verify = ref.verify
+      ? ` · <a href="${escapeHtml(ref.verify)}" target="_blank" rel="noopener noreferrer">verify</a>`
+      : "";
+    market.innerHTML =
+      `Market (nonkyc): 1 ${chainShort("btc")} = <strong>${(1 / ref.rate).toFixed(2)}</strong> ${chainShort("xbtc")} · ` +
+      `1 ${chainShort("xbtc")} = <strong>${ref.rate.toFixed(8)}</strong> ${chainShort("btc")}${verify}. Band ±${ref.band}%.`;
+    const mp = marketPrice();
+    if (counterRaw) {
+      // Advanced: send the exact counter; show its implied rate and deviation from the market.
+      go.disabled = false;
+      const counter = parseBtc(counterRaw);
+      if (counter !== null && amount) {
+        const off = (counter / amount / mp - 1) * 100;
+        const warn = Math.abs(off) > ref.band
+          ? ` <span style="color:var(--orange)">⚠ outside the ±${ref.band}% band; will be rejected</span>`
+          : "";
+        eff.innerHTML = `Exact: ${fmtSats(counter)} ${chainShort(taker)} · rate ${fmtRate(counter / amount)} (${off >= 0 ? "+" : ""}${off.toFixed(1)}% vs market)${warn}`;
+      } else {
+        eff.textContent = "";
+      }
+      return;
+    }
+    // Market-derived: price = market * (1 + margin/100); the daemon finalizes the counter at publish.
+    const margin = parseInt($("#f-margin").value, 10) || 0;
+    const overBand = Math.abs(margin) > ref.band;
+    go.disabled = overBand;
+    const profit = margin > 0
+      ? `you ask ${margin}% above market (earn more; may fill slower)`
+      : margin < 0
+        ? `you undercut market by ${-margin}% (fill faster; earn less)`
+        : "exactly the market rate";
+    if (overBand) {
+      eff.innerHTML = `<span style="color:var(--orange)">⚠ ${margin}% exceeds the ±${ref.band}% band; lower the margin.</span>`;
+      return;
+    }
+    const price = mp * (1 + margin / 100);
+    eff.innerHTML = amount
+      ? `You offer ${fmtSats(amount)} ${chainShort(sell)} for ~${fmtSats(Math.ceil(amount * price))} ${chainShort(taker)} · rate ${fmtRate(price)} (${margin >= 0 ? "+" : ""}${margin}% vs market), ${profit}.`
+      : `Margin ${margin >= 0 ? "+" : ""}${margin}%, ${profit}. Enter an amount to see the total.`;
   }
-  $("#f-price").addEventListener("input", checkDeviation);
-  showReference();
-  $("#f-go").onclick = async () => {
+
+  $("#f-chain").onchange = recompute;
+  $("#f-amount").addEventListener("input", recompute);
+  $("#f-margin").addEventListener("input", recompute);
+  if ($("#f-counter")) $("#f-counter").addEventListener("input", recompute);
+  loadReference();
+
+  go.onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
     if (amount === null) return ($("#f-msg").textContent = "Enter a valid amount.");
-    const counterRaw = $("#f-counter") ? $("#f-counter").value.trim() : "";
     const body = { sell_chain: $("#f-chain").value, amount_sat: amount, min_amount_sat: amount };
+    const counterRaw = ($("#f-counter") && $("#f-counter").value.trim()) || "";
     if (counterRaw) {
-      // F1/F2: an exact counter amount expresses a lopsided real rate the band/price-field cannot.
       const counter = parseBtc(counterRaw);
       if (counter === null) return ($("#f-msg").textContent = "Enter a valid counter amount.");
       body.counter_amount_sat = counter;
     } else {
-      const price = parseFloat($("#f-price").value.replace(",", "."));
-      if (!isFinite(price)) return ($("#f-msg").textContent = "Enter a price or an exact counter amount.");
-      body.price = price;
+      // Market-derived path: send only the whole-percent margin; the daemon prices it off the live
+      // reference, so the published rate is the market rate at publish time, always in band.
+      body.margin_pct = parseInt($("#f-margin").value, 10) || 0;
     }
     try {
       await api("POST", "/offers", body);

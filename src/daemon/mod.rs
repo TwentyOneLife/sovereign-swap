@@ -734,6 +734,9 @@ impl Daemon {
                         "rate": r.rate, "bid": r.bid, "ask": r.ask,
                         "source": source,
                         "verify_url": "https://nonkyc.io/market/BTCB2_BTC",
+                        // The operator's pricing band (design 0025), so the Create-offer form can show
+                        // the allowed range and keep the margin stepper inside it.
+                        "price_band_pct": settings.price_band_pct,
                     }),
                 )
             }
@@ -1430,7 +1433,7 @@ impl Daemon {
     }
 
     fn post_offer(&self, body: &[u8]) -> (u16, Value) {
-        let Ok(new) = serde_json::from_slice::<NewOffer>(body) else {
+        let Ok(mut new) = serde_json::from_slice::<NewOffer>(body) else {
             return (400, json!({"error": "offer must be a valid JSON object"}));
         };
         let (min_swap_sat, max_swap_sat) = {
@@ -1475,6 +1478,77 @@ impl Daemon {
                     }
                 }
             }
+        }
+        // Market-anchored pricing (design 0025): resolve the offer's price against the nonkyc reference
+        // and refuse an off-market rate. Closes the 1:1 hole - a silent parity fallback, or a raw
+        // off-market counter_amount_sat taken verbatim. Local check, like the F3 fee band; no wire
+        // change. The market-derived path (no explicit price or counter) REQUIRES a live reference, so
+        // automation can never post a parity offer by omission.
+        {
+            let (price_ref_on, band_pct, relays, tor_socks) = {
+                let s = &self.state.lock().unwrap().settings;
+                (
+                    s.price_reference,
+                    s.price_band_pct,
+                    s.relays.clone(),
+                    resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                )
+            };
+            // The live market price for this direction (counter per unit sold), when the reference is
+            // on and resolves; None when off or unavailable.
+            let market = if price_ref_on {
+                self.reference
+                    .get(&relays, &tor_socks)
+                    .ok()
+                    .and_then(|(r, _)| crate::pricing::market_price(new.sell_chain, r.rate))
+            } else {
+                None
+            };
+            // The offer's implied price (counter per unit sold): an explicit counter or price verbatim,
+            // else the market-derived path (market * (1 + margin_pct/100)), which needs a reference.
+            let price = if let Some(counter) = new.counter_amount_sat {
+                counter as f64 / new.amount_sat as f64
+            } else if let Some(p) = new.price {
+                p
+            } else {
+                match market {
+                    Some(m) => crate::pricing::effective_price(m, new.margin_pct.unwrap_or(0)),
+                    None => {
+                        return (
+                            503,
+                            json!({"error": "market reference required to price an offer from the market rate (design 0025): enable the price reference, or give an explicit price or counter_amount_sat"}),
+                        );
+                    }
+                }
+            };
+            // Band check against the market when we have one; an off-market offer is refused with range.
+            if let Some(m) = market {
+                if !crate::pricing::in_band(price, m, band_pct) {
+                    let (lo, hi) = crate::pricing::band_range(m, band_pct);
+                    return (
+                        422,
+                        json!({"error": format!(
+                            "price {price:.8} is outside {band_pct}% of the market rate {m:.8} (allowed {lo:.8}..{hi:.8})"
+                        )}),
+                    );
+                }
+            }
+            // Resolve to a concrete counter amount, floor-checked, and let into_swap_offer take it
+            // verbatim (clear the price/margin inputs so only the resolved counter remains).
+            let counter = new
+                .counter_amount_sat
+                .unwrap_or_else(|| crate::pricing::counter_from(new.amount_sat, price));
+            if counter < min_swap_sat {
+                return (
+                    422,
+                    json!({"error": format!(
+                        "resolved counter_amount_sat ({counter}) is below the minimum leg ({min_swap_sat})"
+                    )}),
+                );
+            }
+            new.counter_amount_sat = Some(counter);
+            new.price = None;
+            new.margin_pct = None;
         }
         let offer = new.into_swap_offer(&self.state.lock().unwrap().settings);
         let id = offer.id.to_hex_string(Case::Lower);

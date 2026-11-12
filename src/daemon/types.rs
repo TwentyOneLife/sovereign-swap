@@ -19,10 +19,10 @@ pub(crate) const DUST_SAT: u64 = 10_000;
 /// dust-sized swaps. A setting below this is rejected at config load.
 pub(crate) const MIN_SWAP_FLOOR_SAT: u64 = 3_000;
 
-/// A sane band for a swap price, so a fat-fingered or hostile rate is caught before it is published.
-pub(crate) const MIN_PRICE: f64 = 0.5;
-
-pub(crate) const MAX_PRICE: f64 = 2.0;
+/// Default for `price_band_pct` (design 0025): how far, in whole percent, an offer's price may sit from
+/// the nonkyc reference. Replaces the old absolute `MIN_PRICE`/`MAX_PRICE` band, which was meaningless
+/// for a lopsided pair. Operator-configurable; this is only the default.
+pub(crate) const DEFAULT_PRICE_BAND_PCT: u32 = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -188,6 +188,11 @@ pub struct Settings {
     /// Opt-in external price reference (nonkyc BTCB2/BTC, fetched over Tor). A hint only; off by default.
     #[serde(default)]
     pub price_reference: bool,
+    /// Market-anchored pricing band (design 0025): how far, in whole percent, an offer's price may sit
+    /// from the nonkyc reference before publish rejects it. Operator-configurable; `.catch` keeps an
+    /// existing config on the default when the key is absent.
+    #[serde(default = "default_price_band_pct")]
+    pub price_band_pct: u32,
     /// Voluntary fee (design 0010). On by default for a fresh install, paying the project's per-chain
     /// addresses; an operator can turn it off in the Fee config action. `serde(default)` is `false`, so
     /// an existing config that never had the key stays off (no silent migration); only a truly fresh
@@ -300,6 +305,10 @@ fn default_min_trade_sat() -> u64 {
 /// amount you can lose, large enough that the real-rate dust swaps we run (a few thousand sat on the
 /// BTC side) are well within it. An operator raises `max_swap_sat` to allow larger swaps.
 pub(crate) const DEFAULT_MAX_SWAP_SAT: u64 = 100_000;
+fn default_price_band_pct() -> u32 {
+    DEFAULT_PRICE_BAND_PCT
+}
+
 fn default_max_swap_sat() -> u64 {
     DEFAULT_MAX_SWAP_SAT
 }
@@ -332,6 +341,7 @@ impl Default for Settings {
             xbtc_rpc_user: String::new(),
             xbtc_rpc_pass: String::new(),
             price_reference: false,
+            price_band_pct: default_price_band_pct(),
             // On by default for a fresh install (design 0010, revised): this reverses the earlier
             // "off until a legal opinion". Shipped WITH the project fee addresses so the default still
             // validates (an enabled fee requires an address). An existing config that lacks the key
@@ -568,6 +578,12 @@ pub(crate) struct NewOffer {
     /// amount removes both problems, so the band check is skipped and the amount is taken verbatim.
     #[serde(default)]
     pub(crate) counter_amount_sat: Option<u64>,
+    /// A human maker's margin off the market rate, in whole percent (design 0025, 1% steps): positive
+    /// earns the maker more, negative undercuts. Only meaningful on the market-derived path, i.e. when
+    /// neither `price` nor `counter_amount_sat` is given; the resolved price is band-checked at publish
+    /// against the nonkyc reference. Default `0` (exactly the market).
+    #[serde(default)]
+    pub(crate) margin_pct: Option<i32>,
     pub(crate) min_amount_sat: u64,
 }
 
@@ -603,18 +619,17 @@ impl NewOffer {
         if self.amount_sat > 21_000_000 * 100_000_000 {
             e.push("amount_sat: above the supply cap".to_owned());
         }
-        // Exactly one of `price` or `counter_amount_sat`. The band check guards only the float price
-        // path; an exact counter amount is a plain minimum-leg-and-cap check, with no band.
+        // Pricing is market-anchored (design 0025): the structural rules here are shape-only; the
+        // price-vs-market band check needs the live nonkyc reference and runs in `post_offer`, not here.
+        // At most one explicit rate source (`price` or `counter_amount_sat`). `margin_pct` is only for
+        // the market-derived path, so it may not be combined with an explicit source.
         match (self.price, self.counter_amount_sat) {
             (Some(_), Some(_)) => {
-                e.push("price and counter_amount_sat: set exactly one, not both".to_owned());
-            }
-            (None, None) => {
-                e.push("price or counter_amount_sat: one is required".to_owned());
+                e.push("price and counter_amount_sat: set at most one, not both".to_owned());
             }
             (Some(price), None) => {
-                if !(price.is_finite() && (MIN_PRICE..=MAX_PRICE).contains(&price)) {
-                    e.push(format!("price: expected {MIN_PRICE}..={MAX_PRICE}"));
+                if !(price.is_finite() && price > 0.0) {
+                    e.push("price: must be a positive number".to_owned());
                 }
             }
             (None, Some(counter)) => {
@@ -627,6 +642,16 @@ impl NewOffer {
                     e.push("counter_amount_sat: above the supply cap".to_owned());
                 }
             }
+            // Neither given: the market-derived path (price = market * (1 + margin_pct/100)), resolved
+            // in `post_offer`. Valid; nothing to check structurally here.
+            (None, None) => {}
+        }
+        if self.margin_pct.is_some() && (self.price.is_some() || self.counter_amount_sat.is_some())
+        {
+            e.push(
+                "margin_pct: only on the market-derived path; omit price and counter_amount_sat"
+                    .to_owned(),
+            );
         }
         // Offers are atomic: the whole amount is taken at once. Partial or pro-rata fills are not
         // supported yet (they need offer decrement, re-broadcast, and take-time concurrency), so the
@@ -788,6 +813,7 @@ mod tests {
             amount_sat: 50_000_000,
             price: Some(1.0),
             counter_amount_sat: None,
+            margin_pct: None,
             min_amount_sat: 50_000_000,
         }
     }
@@ -1027,6 +1053,7 @@ mod tests {
             amount_sat: 1_000_000,
             price: None,
             counter_amount_sat: Some(287_000_000),
+            margin_pct: None,
             min_amount_sat: 1_000_000,
         };
         assert!(
@@ -1047,6 +1074,7 @@ mod tests {
             amount_sat: 2_000_000,
             price: None,
             counter_amount_sat: Some(2_000_000),
+            margin_pct: None,
             min_amount_sat: 1_000_000,
         };
         assert!(partial
@@ -1054,6 +1082,7 @@ mod tests {
             .iter()
             .any(|m| m.contains("min_amount_sat")));
         let atomic = NewOffer {
+            margin_pct: None,
             min_amount_sat: 2_000_000,
             ..partial
         };
@@ -1061,31 +1090,47 @@ mod tests {
     }
 
     #[test]
-    fn price_and_counter_amount_are_mutually_exclusive() {
-        // Both set: refused.
+    fn price_counter_and_margin_are_shaped_right() {
+        // Both price and counter set: refused (at most one explicit source).
         let both = NewOffer {
             sell_chain: Chain::Btc,
             amount_sat: 1_000_000,
             price: Some(1.0),
             counter_amount_sat: Some(1_000_000),
+            margin_pct: None,
             min_amount_sat: 1_000_000,
         };
         assert!(both
             .validate(DUST_SAT, u64::MAX)
             .iter()
-            .any(|m| m.contains("exactly one")));
-        // Neither set: refused.
+            .any(|m| m.contains("not both")));
+        // Neither set: now VALID structurally - the market-derived path (design 0025). The market
+        // requirement is enforced in post_offer against the reference, not here.
         let neither = NewOffer {
             sell_chain: Chain::Btc,
             amount_sat: 1_000_000,
             price: None,
             counter_amount_sat: None,
+            margin_pct: None,
             min_amount_sat: 1_000_000,
         };
-        assert!(neither
+        assert!(
+            neither.validate(DUST_SAT, u64::MAX).is_empty(),
+            "neither price nor counter is the valid market-derived path"
+        );
+        // margin_pct alongside an explicit source: refused (margin is only for the market path).
+        let margin_and_price = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 1_000_000,
+            price: Some(1.0),
+            counter_amount_sat: None,
+            margin_pct: Some(2),
+            min_amount_sat: 1_000_000,
+        };
+        assert!(margin_and_price
             .validate(DUST_SAT, u64::MAX)
             .iter()
-            .any(|m| m.contains("one is required")));
+            .any(|m| m.contains("margin_pct")));
     }
 
     #[test]
@@ -1121,6 +1166,7 @@ mod tests {
             amount_sat: 4_000,
             price: Some(1.0),
             counter_amount_sat: None,
+            margin_pct: None,
             min_amount_sat: 4_000,
         };
         assert!(
@@ -1137,6 +1183,7 @@ mod tests {
             amount_sat: 4_000,
             price: None,
             counter_amount_sat: Some(4_000),
+            margin_pct: None,
             min_amount_sat: 4_000,
         };
         assert!(
