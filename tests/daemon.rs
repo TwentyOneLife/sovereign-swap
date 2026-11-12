@@ -182,7 +182,7 @@ fn offers_are_validated_and_need_a_running_engine() {
     assert!(body.contains("engine not running"), "wrong reason: {body}");
 
     // Listing offers or swaps with no engine says so plainly; it never returns empty or fake data.
-    for path in ["/offers", "/swaps"] {
+    for path in ["/offers", "/my-offers", "/swaps"] {
         let (code, body) = request(&addr, "GET", path, Some(&token), "");
         assert_eq!(code, 503, "{path} should need a running engine: {body}");
     }

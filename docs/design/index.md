@@ -17,6 +17,7 @@ The notes below are listed in order. Each links to the full text.
   always reach claim-or-refund: maker deadline, offer teardown, replay handling.
 - [0024 - Coin-split / replay-protection service](/design/0024-coin-split-replay-protection) - separating
   a pre-fork coin so it can never be replayed between the two chains, for any signer.
+- [0026 - Offer lifecycle and maker reliability](/design/0026-offer-lifecycle-and-maker-reliability) - withdraw, maker-set expiry, and why penalizing a maker does not fit a non-custodial, no-identity system.
 
 ## Transport, client, and cryptography
 

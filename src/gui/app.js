@@ -255,7 +255,41 @@ async function loadReference() {
 
 // --- market ---
 
+// The maker's own offers (#211), with a Withdraw button each. Separate from the market table below,
+// which lists other peers' offers.
+async function loadMyOffers() {
+  const wrap = $("#my-offers"), list = $("#my-offers-list"), msg = $("#my-offers-msg");
+  const offers = await api("GET", "/my-offers").catch(() => []);
+  if (!offers.length) { wrap.classList.add("hidden"); list.innerHTML = ""; msg.textContent = ""; return; }
+  wrap.classList.remove("hidden");
+  msg.textContent = "";
+  list.innerHTML = offers.map((o) =>
+    `<div class="row between" data-id="${escapeHtml(o.id)}" style="padding:.35rem 0;border-bottom:1px solid var(--line)">` +
+    `<span>Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
+    `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}</span>` +
+    `<button class="ghost wd-btn" title="Remove this offer from the market (cannot be undone; re-create to re-post)">Withdraw</button></div>`
+  ).join("");
+  list.querySelectorAll(".wd-btn").forEach((b) =>
+    b.addEventListener("click", () => withdrawOffer(b.closest("[data-id]").dataset.id, b))
+  );
+}
+
+async function withdrawOffer(id, btn) {
+  const msg = $("#my-offers-msg");
+  if (btn) { btn.disabled = true; btn.textContent = "Withdrawing…"; }
+  msg.textContent = "";
+  try {
+    await api("POST", "/offers/" + id + "/withdraw");
+    await loadMyOffers();
+    loadMarket();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Withdraw"; }
+    msg.textContent = "✗ " + ((e.data && e.data.error) || "withdraw failed");
+  }
+}
+
 async function loadMarket() {
+  loadMyOffers();
   const offers = await api("GET", "/offers").catch(() => []);
   $("#offers-empty").style.display = offers.length ? "none" : "block";
   mountTable($("#offers"), {
