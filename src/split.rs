@@ -173,7 +173,7 @@ impl TxSource for NodeTxSource<'_> {
 pub const FEE_BPS: u64 = 50;
 
 /// A UTXO offered as an input to a separating transaction, with its classified kind and value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitInput {
     pub txid: String,
     pub vout: u32,
