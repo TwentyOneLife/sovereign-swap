@@ -53,7 +53,10 @@ pub use types::{parse_btc_to_sats, Chain, FundingConfig, FundingMode, Settings, 
 /// stalled signer must never hang the engine thread.
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(60);
 
-use engine::{engine_config, offer_to_json, run_engine, EngineCmd};
+use engine::{
+    engine_config, offer_to_json, run_engine, Dispatch, EngineCmd, ENGINE_CALL_TIMEOUT,
+    ENGINE_CMD_DEADLINE,
+};
 use reference::Reference;
 use types::NewOffer;
 use wire::{
@@ -94,7 +97,7 @@ pub struct Daemon {
     data_dir: PathBuf,
     /// The channel to the engine thread, present once the engine is started from settings. Behind a
     /// Mutex because a configure can (re)start it.
-    engine: Arc<Mutex<Option<Sender<EngineCmd>>>>,
+    engine: Arc<Mutex<Option<Sender<Dispatch>>>>,
     /// This node's long-term identity and per-connection routing key seeds, persisted so the identity
     /// is stable across restarts.
     identity_seed: [u8; 32],
@@ -975,7 +978,7 @@ impl Daemon {
 /// publish pre-check) stay responsive, and N stalled calls each time out in parallel at ~10 s
 /// instead of compounding. Free function (not a method) so it is unit-testable without a `Daemon`.
 fn engine_call_on<R>(
-    engine: &Mutex<Option<Sender<EngineCmd>>>,
+    engine: &Mutex<Option<Sender<Dispatch>>>,
     make: impl FnOnce(Sender<R>) -> EngineCmd,
 ) -> Result<R, String> {
     let tx = {
@@ -983,11 +986,23 @@ fn engine_call_on<R>(
         guard.as_ref().ok_or("engine not running")?.clone()
     };
     let (reply_tx, reply_rx) = mpsc::channel();
-    tx.send(make(reply_tx)).map_err(|_| "engine stopped")?;
+    let dispatch = Dispatch {
+        cmd: make(reply_tx),
+        deadline: Instant::now() + ENGINE_CMD_DEADLINE,
+    };
+    tx.send(dispatch).map_err(|_| "engine stopped")?;
     drop(tx); // release our clone before the wait; the engine keeps its own sender
-    reply_rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "engine timed out".to_owned())
+    reply_rx.recv_timeout(ENGINE_CALL_TIMEOUT).map_err(|e| {
+        match e {
+            // The engine dropped the command without replying: it gated a stale Publish/Take (#176),
+            // so the action definitely did not happen and retrying is safe.
+            RecvTimeoutError::Disconnected => "not applied; safe to retry",
+            // The engine is still busy and never replied in time: the action may or may not have run,
+            // so the caller should check Swaps/Offers before retrying rather than blindly resend.
+            RecvTimeoutError::Timeout => "outcome unknown; check Swaps and Offers before retrying",
+        }
+        .to_owned()
+    })
 }
 
 /// The Tor SOCKS proxy to dial through: `SWAP_TOR_SOCKS` wins when set and non-empty (StartOS
@@ -1040,9 +1055,13 @@ fn serve_guard(bind: &str, has_basic_auth: bool) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_is_loopback, engine_call_on, resolve_tor_socks, serve_guard, EngineCmd};
+    use super::{
+        bind_is_loopback, engine_call_on, resolve_tor_socks, serve_guard, Dispatch, EngineCmd,
+        ENGINE_CALL_TIMEOUT,
+    };
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     #[test]
     fn engine_call_does_not_hold_the_lock_across_the_reply_wait() {
@@ -1051,8 +1070,8 @@ mod tests {
         // behaviour), a slow engine reply would freeze every lock-only check (engine_running, the
         // publish pre-check) and serialize unrelated API calls. We prove the lock is free while a
         // call is parked in recv_timeout.
-        let (eng_tx, eng_rx) = mpsc::channel::<EngineCmd>();
-        let engine: Arc<Mutex<Option<Sender<EngineCmd>>>> = Arc::new(Mutex::new(Some(eng_tx)));
+        let (eng_tx, eng_rx) = mpsc::channel::<Dispatch>();
+        let engine: Arc<Mutex<Option<Sender<Dispatch>>>> = Arc::new(Mutex::new(Some(eng_tx)));
 
         let eng = Arc::clone(&engine);
         let (sent_tx, sent_rx) = mpsc::channel();
@@ -1067,7 +1086,14 @@ mod tests {
 
         // The caller has handed us its command and is now parked in recv_timeout.
         sent_rx.recv().unwrap();
-        let cmd = eng_rx.recv().unwrap();
+        let d = eng_rx.recv().unwrap();
+
+        // The command's deadline must be strictly before the caller's wait would expire, so a dropped
+        // (gated) command disconnects the reply channel before the caller times out (#176).
+        assert!(
+            d.deadline < Instant::now() + ENGINE_CALL_TIMEOUT,
+            "command deadline must be earlier than the caller's wait"
+        );
 
         // The mutex must be free while the caller waits. Under the old code the caller still holds
         // the guard here and this try_lock returns WouldBlock, failing the test.
@@ -1077,12 +1103,31 @@ mod tests {
         );
 
         // Reply so the caller returns promptly, then join.
-        match cmd {
+        match d.cmd {
             EngineCmd::Offers(reply) => reply.send(Vec::new()).unwrap(),
             _ => panic!("expected Offers"),
         }
         let got = caller.join().unwrap();
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_stale_command_returns_not_applied_at_once() {
+        // When the engine gates a stale Publish/Take, it drops the Dispatch without replying, which
+        // disconnects the reply channel. engine_call_on must surface that as the "not applied" case
+        // promptly (not wait out the full timeout, not report an ambiguous "outcome unknown").
+        let (eng_tx, eng_rx) = mpsc::channel::<Dispatch>();
+        let engine: Arc<Mutex<Option<Sender<Dispatch>>>> = Arc::new(Mutex::new(Some(eng_tx)));
+        let started = Instant::now();
+        let caller = std::thread::spawn(move || engine_call_on(&engine, EngineCmd::Offers));
+        // Receive and immediately drop the Dispatch (simulating the gate dropping a stale command).
+        drop(eng_rx.recv().unwrap());
+        let res = caller.join().unwrap();
+        assert_eq!(res, Err("not applied; safe to retry".to_owned()));
+        assert!(
+            started.elapsed() < ENGINE_CALL_TIMEOUT,
+            "a disconnected reply must return before the full timeout"
+        );
     }
 
     #[test]
