@@ -54,6 +54,12 @@ The notes below are listed in order. Each links to the full text.
 - [0022 - Silent-payment fee and donation collection](/design/0022-sp1-fee-collection) - adopting sp1
   for the project's own collection.
 
+## Pricing
+
+- [0025 - Market-anchored offer pricing](/design/0025-market-anchored-offer-pricing) - the nonkyc
+  BTCB2/BTC rate is the default and the anchor, displayed to the maker, who alone sets a bounded margin;
+  automation never invents a rate.
+
 ## Security and abuse deterrence
 
 - [0003 - Adversarial testing and hardening](/design/0003-adversarial-testing) - how the code is probed
