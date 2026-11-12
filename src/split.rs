@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::transaction::Version;
 use bitcoin::{
     absolute, Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -260,40 +261,44 @@ pub fn validate_split_inputs(inputs: &[SplitInput]) -> Result<SplitPlan, SplitEr
     })
 }
 
-/// An input paired with its prevout scriptPubKey, so the PSBT can carry `witness_utxo` for it (segwit
-/// and taproot signers commit to every input's amount and scriptPubKey). Built by [`prepare_input`].
+/// An input prepared for the PSBT: its classified kind + value, its prevout scriptPubKey, and the full
+/// previous transaction. The builder sets `witness_utxo` (segwit/taproot) and `non_witness_utxo` (BIP174
+/// requires it for non-witness inputs, and many hardware signers want it for segwit v0), so an out-of-
+/// band signer can sign from the PSBT alone. The kind is DERIVED from the chain by [`prepare_input`],
+/// never supplied by the caller, so a mislabelled coin cannot slip a replayable input into a build.
 #[derive(Debug, Clone)]
 pub struct PreparedInput {
     pub input: SplitInput,
     pub script_pubkey: ScriptBuf,
+    pub prev_tx: Transaction,
 }
 
-/// Fetch an input's prevout (value + scriptPubKey) from the node and pair it with its classified kind,
-/// so [`build_split_psbt`] can set `witness_utxo` without a funding wallet. Uses `gettxout`, so the
-/// input must be unspent (it is, at build time). The value comes from the chain, not the caller.
+/// Prepare an input of the move from the Blake2b node: fetch its full funding transaction, read the
+/// prevout's value + scriptPubKey from it, and CLASSIFY its kind on-chain (never trusting a caller tag).
+/// `fork_height` is the classifier boundary (mainnet [`MAINNET_FORK_HEIGHT`], or the regtest value).
+/// Needs `txindex` on the node (`getrawtransaction` of an arbitrary funding tx).
 pub fn prepare_input(
     rpc: &Client,
+    fork_height: u32,
     txid: &str,
     vout: u32,
-    kind: CoinKind,
 ) -> Result<PreparedInput, SplitError> {
-    let v = rpc
-        .call("gettxout", json!([txid, vout]))
+    let hex = rpc
+        .call("getrawtransaction", json!([txid, false]))
         .map_err(SplitError::Rpc)?;
-    if v.is_null() {
-        return Err(SplitError::Malformed(format!(
-            "{txid}:{vout} not found or already spent"
-        )));
-    }
-    let value_sat = v["value"]
-        .as_f64()
-        .map(|b| (b * 1e8).round() as u64)
-        .ok_or_else(|| SplitError::Malformed(format!("{txid}:{vout}: no value")))?;
-    let hex = v["scriptPubKey"]["hex"]
+    let hex = hex
         .as_str()
-        .ok_or_else(|| SplitError::Malformed(format!("{txid}:{vout}: no scriptPubKey")))?;
-    let script_pubkey = ScriptBuf::from_hex(hex)
-        .map_err(|e| SplitError::Malformed(format!("scriptPubKey: {e}")))?;
+        .ok_or_else(|| SplitError::Malformed(format!("{txid}: no raw tx")))?;
+    let prev_tx: Transaction = deserialize_hex(hex)
+        .map_err(|e| SplitError::Malformed(format!("{txid}: prev tx decode: {e}")))?;
+    let out = prev_tx
+        .output
+        .get(vout as usize)
+        .ok_or_else(|| SplitError::Malformed(format!("{txid}:{vout} out of range")))?;
+    let value_sat = out.value.to_sat();
+    let script_pubkey = out.script_pubkey.clone();
+    let src = NodeTxSource::new(rpc)?;
+    let kind = classify(&src, fork_height, txid, DEFAULT_MAX_LOOKUPS)?;
     Ok(PreparedInput {
         input: SplitInput {
             txid: txid.to_owned(),
@@ -302,7 +307,23 @@ pub fn prepare_input(
             value_sat,
         },
         script_pubkey,
+        prev_tx,
     })
+}
+
+/// Directly verify a coin is a valid marker: it must NOT exist on the SHA256 chain, so a transaction
+/// spending it can never be replayed there. This is the same -5 existence test [`verify_separation`]
+/// uses (so it needs a synced txindex on the SHA256 node) and is independent of the fork-height constant.
+/// Call it before lending a coin as the marker.
+pub fn verify_marker(btc_rpc: &Client, marker_txid: &str) -> Result<(), SplitError> {
+    require_txindex(btc_rpc)?;
+    if exists_on_node(btc_rpc, marker_txid)? {
+        return Err(SplitError::Malformed(format!(
+            "{marker_txid} exists on the SHA256 chain; not a Blake2b-only marker, it would not make the \
+             move non-replayable"
+        )));
+    }
+    Ok(())
 }
 
 /// Build the UNSIGNED separating PSBT for the lent-marker move. Constructed directly (NOT via a funding
@@ -377,10 +398,20 @@ pub fn build_split_psbt(
     let mut psbt =
         Psbt::from_unsigned_tx(tx).map_err(|e| SplitError::Malformed(format!("psbt: {e}")))?;
     for (slot, inp) in psbt.inputs.iter_mut().zip(inputs) {
-        slot.witness_utxo = Some(TxOut {
+        let txout = TxOut {
             value: Amount::from_sat(inp.input.value_sat),
             script_pubkey: inp.script_pubkey.clone(),
-        });
+        };
+        // Taproot: witness_utxo only. Segwit v0: both. Legacy (P2PKH/P2SH): non_witness_utxo (BIP174
+        // requires it for non-witness inputs; stock/hardware signers reject a PSBT that lacks it).
+        if inp.script_pubkey.is_p2tr() {
+            slot.witness_utxo = Some(txout);
+        } else {
+            slot.non_witness_utxo = Some(inp.prev_tx.clone());
+            if inp.script_pubkey.is_witness_program() {
+                slot.witness_utxo = Some(txout);
+            }
+        }
     }
     Ok(psbt.to_string())
 }
@@ -789,16 +820,36 @@ mod tests {
     fn addr(n: u8) -> Address {
         Address::from_script(&spk(n), bitcoin::Network::Regtest).unwrap()
     }
-    fn prepared(n: u8, kind: CoinKind, value_sat: u64) -> PreparedInput {
+    fn prev_tx_for(spk: &ScriptBuf, value_sat: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(value_sat),
+                script_pubkey: spk.clone(),
+            }],
+        }
+    }
+    fn prepared_spk(
+        txid_byte: u8,
+        spk: ScriptBuf,
+        kind: CoinKind,
+        value_sat: u64,
+    ) -> PreparedInput {
         PreparedInput {
             input: SplitInput {
-                txid: format!("{n:064x}"),
+                txid: format!("{txid_byte:064x}"),
                 vout: 0,
                 kind,
                 value_sat,
             },
-            script_pubkey: spk(n),
+            prev_tx: prev_tx_for(&spk, value_sat),
+            script_pubkey: spk,
         }
+    }
+    fn prepared(n: u8, kind: CoinKind, value_sat: u64) -> PreparedInput {
+        prepared_spk(n, spk(n), kind, value_sat)
     }
 
     #[test]
@@ -831,12 +882,40 @@ mod tests {
         assert_eq!(out[1].script_pubkey, spk(4));
         assert_eq!(out[2].value, Amount::from_sat(10_000));
         assert_eq!(out[2].script_pubkey, spk(5));
+        // Segwit v0 inputs also carry non_witness_utxo (BIP174 / hardware-signer compatibility).
+        assert!(psbt.inputs[0].non_witness_utxo.is_some());
+        assert!(psbt.inputs[1].non_witness_utxo.is_some());
         // Unsigned: no witness or script_sig on any input.
         assert!(psbt
             .unsigned_tx
             .input
             .iter()
             .all(|i| i.witness.is_empty() && i.script_sig.is_empty()));
+    }
+
+    #[test]
+    fn build_sets_utxo_fields_per_input_type() {
+        use bitcoin::hashes::Hash as _;
+        use std::str::FromStr;
+        let p2pkh = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([9u8; 20]));
+        let p2tr = {
+            let mut v = vec![0x51u8, 0x20];
+            v.extend_from_slice(&[0xabu8; 32]);
+            ScriptBuf::from(v)
+        };
+        assert!(p2tr.is_p2tr() && !p2pkh.is_witness_program());
+        let inputs = [
+            prepared_spk(0x14, p2pkh, CoinKind::ShaCoin, 1_000_000), // legacy user coin
+            prepared_spk(0x20, p2tr, CoinKind::Blake2bCoin, 10_000), // taproot marker
+        ];
+        let b64 = build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), 500).unwrap();
+        let psbt = Psbt::from_str(&b64).unwrap();
+        // Legacy input: non_witness_utxo only.
+        assert!(psbt.inputs[0].non_witness_utxo.is_some());
+        assert!(psbt.inputs[0].witness_utxo.is_none());
+        // Taproot input: witness_utxo only.
+        assert!(psbt.inputs[1].witness_utxo.is_some());
+        assert!(psbt.inputs[1].non_witness_utxo.is_none());
     }
 
     #[test]

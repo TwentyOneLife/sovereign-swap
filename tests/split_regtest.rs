@@ -24,7 +24,7 @@ use common::{ForkedPair, Node};
 use sovereign_swap::rpc::Client;
 use sovereign_swap::split::{
     build_split_psbt, classify, exists_on_node, prepare_input, require_txindex, survey_wallet,
-    verify_separation, CoinKind, NodeTxSource, WalletUtxo, DEFAULT_MAX_LOOKUPS,
+    verify_marker, verify_separation, CoinKind, NodeTxSource, WalletUtxo, DEFAULT_MAX_LOOKUPS,
 };
 
 const FORK: u32 = 110;
@@ -162,8 +162,17 @@ fn split_core_against_real_forked_nodes() {
     // marker is a Knots-owned Blake2b-Coin we LEND. The move is on Blake2b, so both prevouts are read
     // from the xbtc node (`core_sha` exists there via the mirror). The user signs their input FIRST,
     // then we co-sign the marker LAST - the real /split/build + /split/submit order. ---
-    let user_sha = prepare_input(&xbtc.rpc, &core_sha, 0, CoinKind::ShaCoin).unwrap();
-    let marker = prepare_input(&xbtc.rpc, &blake, 0, CoinKind::Blake2bCoin).unwrap();
+    // The marker must be genuinely Blake2b-only on the SHA256 node; a mirrored SHA-Coin is refused.
+    assert!(
+        verify_marker(&btc.rpc, &core_sha).is_err(),
+        "a mirrored SHA-Coin is not a valid marker"
+    );
+    verify_marker(&btc.rpc, &blake).expect("the Blake2b-Coin is a valid marker (absent on SHA256)");
+    // Kind is DERIVED on-chain (no caller tag).
+    let user_sha = prepare_input(&xbtc.rpc, FORK, &core_sha, 0).unwrap();
+    assert_eq!(user_sha.input.kind, CoinKind::ShaCoin);
+    let marker = prepare_input(&xbtc.rpc, FORK, &blake, 0).unwrap();
+    assert_eq!(marker.input.kind, CoinKind::Blake2bCoin);
     let parse = |s: String| bitcoin::Address::from_str(&s).unwrap().assume_checked();
     let dest = parse(xbtc.new_bech32_address());
     let fee_addr = parse(xbtc.new_bech32_address());
