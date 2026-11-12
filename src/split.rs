@@ -680,6 +680,12 @@ impl MarkerPool {
         Some(m)
     }
 
+    /// The marker currently reserved for `job_id`, if any (so `/split/submit` can learn which input is
+    /// ours without trusting the caller).
+    pub fn reserved_marker(&self, job_id: &str) -> Option<Marker> {
+        self.reserved.get(job_id).map(|(m, _)| m.clone())
+    }
+
     /// Release reservations older than `timeout` back to the pool; returns the freed job ids (so a
     /// caller tracking per-job state can drop them too).
     pub fn expire(&mut self, now: u64, timeout: u64) -> Vec<String> {

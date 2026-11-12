@@ -96,6 +96,59 @@ fn split_classify_is_token_gated_and_validates_its_body() {
 }
 
 #[test]
+fn split_build_and_submit_are_token_gated_and_validate_their_body() {
+    // Coin-split build/submit endpoints (P5): auth-gated, and the body is validated before any node I/O
+    // (build) or state lookup (submit), so these cases never touch a node.
+    let (addr, token) = daemon();
+    // /split/build
+    assert_eq!(request(&addr, "POST", "/split/build", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/build", Some(&token), "not json").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/build", Some(&token), "{}").0,
+        422,
+        "missing dest is 422"
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/split/build",
+            Some(&token),
+            r#"{"dest":"x"}"#
+        )
+        .0,
+        422,
+        "missing sha_coins is 422"
+    );
+    // /split/submit
+    assert_eq!(request(&addr, "POST", "/split/submit", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/submit", Some(&token), "nope").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/submit", Some(&token), "{}").0,
+        422,
+        "missing job_id/psbt is 422"
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/split/submit",
+            Some(&token),
+            r#"{"job_id":"nope","psbt":"x"}"#
+        )
+        .0,
+        410,
+        "an unknown job is 410, before any node I/O"
+    );
+}
+
+#[test]
 fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
     // Input validation runs regardless of engine state: below dust, out-of-band price, min above
