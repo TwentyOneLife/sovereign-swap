@@ -13,6 +13,11 @@
 //! Safety invariant (from the proven runbook): a separating transaction MUST have at least one
 //! Blake2b-Coin input, or it is replayable. The builder enforces that; the classifier is how we check.
 
+use bitcoin::transaction::Version;
+use bitcoin::{
+    absolute, Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
+};
 use serde_json::json;
 
 use crate::rpc::{Client, RpcError};
@@ -253,43 +258,129 @@ pub fn validate_split_inputs(inputs: &[SplitInput]) -> Result<SplitPlan, SplitEr
     })
 }
 
-/// Build the unsigned separating PSBT on the Blake2b node: spend exactly the given inputs (no others:
-/// `add_inputs=false`, so the invariant set is preserved), paying the separated value to `dest`
-/// (the user's clean Blake2b address) and the project fee to `fee_addr`, letting the wallet place change
-/// and the network fee. The caller has already classified the inputs; this re-validates the invariant
-/// before building, so a bad call cannot produce a replayable transaction. Returns the base64 PSBT for
-/// the user to sign out of band (the non-custodial, any-signer path, like interactive funding 0017).
-pub fn build_split_psbt(
-    wallet_rpc: &Client,
-    inputs: &[SplitInput],
-    dest: &str,
-    fee_addr: &str,
-) -> Result<String, SplitError> {
-    let plan = validate_split_inputs(inputs)?;
-    let ins: Vec<_> = inputs
-        .iter()
-        .map(|i| json!({"txid": i.txid, "vout": i.vout}))
-        .collect();
-    // The separated value goes to the user's destination; the project fee to our address. The wallet
-    // subtracts the network fee from the destination and returns change (itself a Blake2b-Coin).
-    let dest_btc = sat_to_btc(plan.sha_value_sat.saturating_sub(plan.fee_sat));
-    let fee_btc = sat_to_btc(plan.fee_sat);
-    let outs = json!([{ dest: dest_btc }, { fee_addr: fee_btc }]);
-    // subtractfeefromoutputs=[0]: the network fee comes out of the user's own output, never the project
-    // fee. add_inputs=false: never pull in another coin that could break the invariant set.
-    let opts = json!({"add_inputs": false, "subtractFeeFromOutputs": [0]});
-    let res = wallet_rpc
-        .call("walletcreatefundedpsbt", json!([ins, outs, 0, opts]))
-        .map_err(SplitError::Rpc)?;
-    res["psbt"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| SplitError::Malformed("walletcreatefundedpsbt: no psbt".to_owned()))
+/// An input paired with its prevout scriptPubKey, so the PSBT can carry `witness_utxo` for it (segwit
+/// and taproot signers commit to every input's amount and scriptPubKey). Built by [`prepare_input`].
+#[derive(Debug, Clone)]
+pub struct PreparedInput {
+    pub input: SplitInput,
+    pub script_pubkey: ScriptBuf,
 }
 
-/// Sats to a BTC-denominated JSON number string, as bitcoind RPC expects for amounts.
-fn sat_to_btc(sat: u64) -> f64 {
-    bitcoin::Amount::from_sat(sat).to_btc()
+/// Fetch an input's prevout (value + scriptPubKey) from the node and pair it with its classified kind,
+/// so [`build_split_psbt`] can set `witness_utxo` without a funding wallet. Uses `gettxout`, so the
+/// input must be unspent (it is, at build time). The value comes from the chain, not the caller.
+pub fn prepare_input(
+    rpc: &Client,
+    txid: &str,
+    vout: u32,
+    kind: CoinKind,
+) -> Result<PreparedInput, SplitError> {
+    let v = rpc
+        .call("gettxout", json!([txid, vout]))
+        .map_err(SplitError::Rpc)?;
+    if v.is_null() {
+        return Err(SplitError::Malformed(format!(
+            "{txid}:{vout} not found or already spent"
+        )));
+    }
+    let value_sat = v["value"]
+        .as_f64()
+        .map(|b| (b * 1e8).round() as u64)
+        .ok_or_else(|| SplitError::Malformed(format!("{txid}:{vout}: no value")))?;
+    let hex = v["scriptPubKey"]["hex"]
+        .as_str()
+        .ok_or_else(|| SplitError::Malformed(format!("{txid}:{vout}: no scriptPubKey")))?;
+    let script_pubkey = ScriptBuf::from_hex(hex)
+        .map_err(|e| SplitError::Malformed(format!("scriptPubKey: {e}")))?;
+    Ok(PreparedInput {
+        input: SplitInput {
+            txid: txid.to_owned(),
+            vout,
+            kind,
+            value_sat,
+        },
+        script_pubkey,
+    })
+}
+
+/// Build the UNSIGNED separating PSBT for the lent-marker move. Constructed directly (NOT via a funding
+/// wallet), so it can mix inputs from two owners - the user's SHA-Coin(s) and our lent Blake2b-Coin
+/// marker - which `walletcreatefundedpsbt` on one wallet cannot. Every input carries `witness_utxo`.
+/// Three outputs, in order: (a) the user's separated value to `dest`, the SHA value minus the project
+/// fee and the network fee; (b) the project fee (0.5% of the SHA value, charged in XBT on the Blake2b
+/// side) to `fee_addr`, ours; (c) the marker FULLY recovered to `marker_change`, ours - the marker is
+/// lent, never given away.
+/// The user pays the network fee out of their own output. The invariant (>=1 Blake2b-Coin, >=1 SHA-Coin)
+/// is re-checked, so a bad call cannot produce a replayable transaction. The user signs their input
+/// first; we co-sign only the marker last (daemon `/split/submit`). Returns the base64 PSBT.
+pub fn build_split_psbt(
+    inputs: &[PreparedInput],
+    dest: &Address,
+    fee_addr: &Address,
+    marker_change: &Address,
+    network_fee_sat: u64,
+) -> Result<String, SplitError> {
+    let plan = validate_split_inputs(&inputs.iter().map(|i| i.input.clone()).collect::<Vec<_>>())?;
+    let marker_sum: u64 = inputs
+        .iter()
+        .filter(|i| i.input.kind == CoinKind::Blake2bCoin)
+        .map(|i| i.input.value_sat)
+        .sum();
+    let dest_value = plan
+        .sha_value_sat
+        .checked_sub(plan.fee_sat)
+        .and_then(|v| v.checked_sub(network_fee_sat))
+        .ok_or_else(|| {
+            SplitError::Malformed(
+                "the project fee and network fee exceed the separated value".to_owned(),
+            )
+        })?;
+    let input = inputs
+        .iter()
+        .map(|i| {
+            let txid =
+                i.input.txid.parse::<Txid>().map_err(|e| {
+                    SplitError::Malformed(format!("bad txid {}: {e}", i.input.txid))
+                })?;
+            Ok(TxIn {
+                previous_output: OutPoint {
+                    txid,
+                    vout: i.input.vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, SplitError>>()?;
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input,
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(dest_value),
+                script_pubkey: dest.script_pubkey(),
+            },
+            TxOut {
+                value: Amount::from_sat(plan.fee_sat),
+                script_pubkey: fee_addr.script_pubkey(),
+            },
+            TxOut {
+                value: Amount::from_sat(marker_sum),
+                script_pubkey: marker_change.script_pubkey(),
+            },
+        ],
+    };
+    let mut psbt =
+        Psbt::from_unsigned_tx(tx).map_err(|e| SplitError::Malformed(format!("psbt: {e}")))?;
+    for (slot, inp) in psbt.inputs.iter_mut().zip(inputs) {
+        slot.witness_utxo = Some(TxOut {
+            value: Amount::from_sat(inp.input.value_sat),
+            script_pubkey: inp.script_pubkey.clone(),
+        });
+    }
+    Ok(psbt.to_string())
 }
 
 // ---- P5c: verify a separation --------------------------------------------------------------------
@@ -586,6 +677,80 @@ mod tests {
         assert_eq!(plan.total_sat, 1_020_353);
         assert_eq!(plan.sha_value_sat, 1_010_115); // fee is on the separated value, not the ingredient
         assert_eq!(plan.fee_sat, project_fee_sat(1_010_115, FEE_BPS)); // 0.5%
+    }
+
+    // ---- P2: the unsigned builder (pure, no node) ----
+
+    fn spk(n: u8) -> ScriptBuf {
+        use bitcoin::hashes::Hash as _;
+        ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([n; 20]))
+    }
+    fn addr(n: u8) -> Address {
+        Address::from_script(&spk(n), bitcoin::Network::Regtest).unwrap()
+    }
+    fn prepared(n: u8, kind: CoinKind, value_sat: u64) -> PreparedInput {
+        PreparedInput {
+            input: SplitInput {
+                txid: format!("{n:064x}"),
+                vout: 0,
+                kind,
+                value_sat,
+            },
+            script_pubkey: spk(n),
+        }
+    }
+
+    #[test]
+    fn build_lays_out_dest_fee_and_recovered_marker() {
+        use std::str::FromStr;
+        let inputs = [
+            prepared(1, CoinKind::ShaCoin, 1_000_000),
+            prepared(2, CoinKind::Blake2bCoin, 10_000),
+        ];
+        let net_fee = 500;
+        let b64 = build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), net_fee).unwrap();
+        let psbt = Psbt::from_str(&b64).unwrap();
+        // Every input carries witness_utxo (so an out-of-band signer can sign).
+        assert_eq!(psbt.inputs.len(), 2);
+        assert_eq!(
+            psbt.inputs[0].witness_utxo.as_ref().unwrap().value,
+            Amount::from_sat(1_000_000)
+        );
+        assert_eq!(
+            psbt.inputs[1].witness_utxo.as_ref().unwrap().value,
+            Amount::from_sat(10_000)
+        );
+        // dest = sha - fee - network_fee; fee to us; marker recovered IN FULL.
+        let fee = project_fee_sat(1_000_000, FEE_BPS);
+        let out = &psbt.unsigned_tx.output;
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].value, Amount::from_sat(1_000_000 - fee - net_fee));
+        assert_eq!(out[0].script_pubkey, spk(3));
+        assert_eq!(out[1].value, Amount::from_sat(fee));
+        assert_eq!(out[1].script_pubkey, spk(4));
+        assert_eq!(out[2].value, Amount::from_sat(10_000));
+        assert_eq!(out[2].script_pubkey, spk(5));
+        // Unsigned: no witness or script_sig on any input.
+        assert!(psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .all(|i| i.witness.is_empty() && i.script_sig.is_empty()));
+    }
+
+    #[test]
+    fn build_refuses_without_a_marker() {
+        let inputs = [prepared(1, CoinKind::ShaCoin, 1_000_000)];
+        assert!(build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), 500).is_err());
+    }
+
+    #[test]
+    fn build_refuses_when_fees_exceed_the_separated_value() {
+        let inputs = [
+            prepared(1, CoinKind::ShaCoin, 1_000),
+            prepared(2, CoinKind::Blake2bCoin, 10_000),
+        ];
+        assert!(build_split_psbt(&inputs, &addr(3), &addr(4), &addr(5), 10_000).is_err());
     }
 
     // ---- P3: wallet survey ----

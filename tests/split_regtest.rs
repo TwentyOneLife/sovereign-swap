@@ -18,11 +18,13 @@ use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::Transaction;
 use serde_json::{json, Map, Value};
 
+use std::str::FromStr;
+
 use common::{ForkedPair, Node};
 use sovereign_swap::rpc::Client;
 use sovereign_swap::split::{
-    build_split_psbt, classify, exists_on_node, require_txindex, survey_wallet, verify_separation,
-    CoinKind, NodeTxSource, SplitInput, WalletUtxo, DEFAULT_MAX_LOOKUPS,
+    build_split_psbt, classify, exists_on_node, prepare_input, require_txindex, survey_wallet,
+    verify_separation, CoinKind, NodeTxSource, WalletUtxo, DEFAULT_MAX_LOOKUPS,
 };
 
 const FORK: u32 = 110;
@@ -155,25 +157,25 @@ fn split_core_against_real_forked_nodes() {
         "expected a script-verify consensus failure (fork sighash invalid on SHA256), got: {consensus}"
     );
 
-    // --- P2 build + the real non-replayability proof (Knots-owned SHA-Coin + Blake2b-Coin marker) ---
-    let inputs = vec![
-        SplitInput {
-            txid: knots_sha.clone(),
-            vout: 0,
-            kind: CoinKind::ShaCoin,
-            value_sat: ForkedPair::value_sat(xbtc, &knots_sha, 0),
-        },
-        SplitInput {
-            txid: blake.clone(),
-            vout: 0,
-            kind: CoinKind::Blake2bCoin,
-            value_sat: ForkedPair::value_sat(xbtc, &blake, 0),
-        },
-    ];
-    let dest = xbtc.new_bech32_address();
-    let fee_addr = xbtc.new_bech32_address();
-    let psbt = build_split_psbt(&xbtc.wallet(), &inputs, &dest, &fee_addr).unwrap();
-    let split_tx = finalize(&xbtc.wallet(), &psbt);
+    // --- P2 build + the real non-replayability proof. TWO owners: the user is CORE's wallet (a stock
+    // legacy signer, the primary audience, whose pre-fork spend is replayable) holding `core_sha`; the
+    // marker is a Knots-owned Blake2b-Coin we LEND. The move is on Blake2b, so both prevouts are read
+    // from the xbtc node (`core_sha` exists there via the mirror). The user signs their input FIRST,
+    // then we co-sign the marker LAST - the real /split/build + /split/submit order. ---
+    let user_sha = prepare_input(&xbtc.rpc, &core_sha, 0, CoinKind::ShaCoin).unwrap();
+    let marker = prepare_input(&xbtc.rpc, &blake, 0, CoinKind::Blake2bCoin).unwrap();
+    let parse = |s: String| bitcoin::Address::from_str(&s).unwrap().assume_checked();
+    let dest = parse(xbtc.new_bech32_address());
+    let fee_addr = parse(xbtc.new_bech32_address());
+    let marker_change = parse(xbtc.new_bech32_address());
+    let psbt =
+        build_split_psbt(&[user_sha, marker], &dest, &fee_addr, &marker_change, 2_000).unwrap();
+    // User (Core wallet) signs their SHA-Coin input; then we (Knots wallet) co-sign the marker + finalize.
+    let user_signed = btc
+        .wallet()
+        .call("walletprocesspsbt", json!([psbt]))
+        .unwrap();
+    let split_tx = finalize(&xbtc.wallet(), user_signed["psbt"].as_str().unwrap());
 
     assert!(
         xbtc.accept(&split_tx).is_ok(),
