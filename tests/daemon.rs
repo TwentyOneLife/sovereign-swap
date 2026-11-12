@@ -209,6 +209,45 @@ fn the_gui_is_served_with_the_token_injected() {
 }
 
 #[test]
+fn the_gui_is_served_with_security_headers() {
+    // Blind spot 6: the embedded GUI document must carry clickjacking and resource-origin headers so a
+    // hostile page cannot frame it or make it load/exfiltrate across origins. `request()` drops the
+    // header block, so read the raw response.
+    let (addr, _token) = daemon();
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < deadline {
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let headers = text.split("\r\n\r\n").next().unwrap_or("");
+    for needle in [
+        "Content-Security-Policy:",
+        "default-src 'self'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "X-Frame-Options: DENY",
+        "X-Content-Type-Options: nosniff",
+    ] {
+        assert!(
+            headers.contains(needle),
+            "GUI response missing `{needle}` in:\n{headers}"
+        );
+    }
+}
+
+#[test]
 fn reference_rate_is_token_guarded_and_off_by_default() {
     let (addr, token) = daemon();
     assert_eq!(request(&addr, "GET", "/reference-rate", None, "").0, 401);

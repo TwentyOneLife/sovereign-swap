@@ -67,6 +67,14 @@ const INDEX_HTML: &str = include_str!("../gui/index.html");
 const APP_CSS: &str = include_str!("../gui/app.css");
 const APP_JS: &str = include_str!("../gui/app.js");
 
+/// Response headers that harden the embedded GUI: `frame-ancestors`/`X-Frame-Options` block framing
+/// (clickjacking), the CSP pins every resource to this origin, and `base-uri`/`form-action` close the
+/// base-tag and cross-origin-form vectors. `script-src`/`style-src` still allow `'unsafe-inline'`
+/// because `index.html` bootstraps the API token in an inline `<script>` and the GUI uses a few inline
+/// event handlers; removing both (tracked follow-up) would let `script-src` drop to `'self'` only.
+/// Each line ends in CRLF so it slots straight into the response header block.
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\n";
+
 /// Fuzz entry: run the HTTP request reader over arbitrary bytes (a `Cursor` stands in for the socket).
 /// Exposed only under the `fuzzing` feature so the normal build keeps the parser crate-private. The
 /// reader takes fully untrusted client input, so a panic here is a remote DoS; the fuzzer hunts them.
@@ -349,13 +357,7 @@ impl Daemon {
     /// Sends a command to the engine thread and waits for its reply. `Err` if the engine is not
     /// running or the thread is gone.
     fn engine_call<R>(&self, make: impl FnOnce(Sender<R>) -> EngineCmd) -> Result<R, String> {
-        let guard = self.engine.lock().unwrap();
-        let tx = guard.as_ref().ok_or("engine not running")?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.send(make(reply_tx)).map_err(|_| "engine stopped")?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "engine timed out".to_owned())
+        engine_call_on(&self.engine, make)
     }
 
     fn engine_running(&self) -> bool {
@@ -556,7 +558,7 @@ impl Daemon {
     fn write_asset(&self, stream: &mut TcpStream, content_type: &str, body: &[u8]) {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-             Connection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+             Connection: close\r\nX-Content-Type-Options: nosniff\r\n{SECURITY_HEADERS}\r\n",
             body.len()
         );
         let _ = stream.write_all(header.as_bytes());
@@ -965,6 +967,28 @@ impl Daemon {
     }
 }
 
+/// Sends one command to the engine thread and waits for its reply, holding the engine lock only for
+/// the moment it takes to clone the command sender, never across the reply wait. The engine is a
+/// single thread, so commands still serialize there; what this buys is that a slow or wedged reply
+/// (up to the 10 s timeout) no longer holds the mutex. Lock-only checks (`engine_running`, the
+/// publish pre-check) stay responsive, and N stalled calls each time out in parallel at ~10 s
+/// instead of compounding. Free function (not a method) so it is unit-testable without a `Daemon`.
+fn engine_call_on<R>(
+    engine: &Mutex<Option<Sender<EngineCmd>>>,
+    make: impl FnOnce(Sender<R>) -> EngineCmd,
+) -> Result<R, String> {
+    let tx = {
+        let guard = engine.lock().unwrap();
+        guard.as_ref().ok_or("engine not running")?.clone()
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(make(reply_tx)).map_err(|_| "engine stopped")?;
+    drop(tx); // release our clone before the wait; the engine keeps its own sender
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "engine timed out".to_owned())
+}
+
 /// The Tor SOCKS proxy to dial through: `SWAP_TOR_SOCKS` wins when set and non-empty (StartOS
 /// injects the proxy bridge address there, as its container has no Tor at a fixed address),
 /// otherwise the `tor_socks` setting. Pure (the env value is passed in) so it is testable without
@@ -1015,7 +1039,50 @@ fn serve_guard(bind: &str, has_basic_auth: bool) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_is_loopback, resolve_tor_socks, serve_guard};
+    use super::{bind_is_loopback, engine_call_on, resolve_tor_socks, serve_guard, EngineCmd};
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn engine_call_does_not_hold_the_lock_across_the_reply_wait() {
+        // Regression: engine_call_on must clone the command sender and release the engine lock
+        // before it blocks waiting for the reply. If it held the guard across the wait (the old
+        // behaviour), a slow engine reply would freeze every lock-only check (engine_running, the
+        // publish pre-check) and serialize unrelated API calls. We prove the lock is free while a
+        // call is parked in recv_timeout.
+        let (eng_tx, eng_rx) = mpsc::channel::<EngineCmd>();
+        let engine: Arc<Mutex<Option<Sender<EngineCmd>>>> = Arc::new(Mutex::new(Some(eng_tx)));
+
+        let eng = Arc::clone(&engine);
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            // Any variant carrying a reply Sender; Offers replies with a plain Vec.
+            let r = engine_call_on(&eng, |reply| {
+                sent_tx.send(()).unwrap(); // signal: command built, about to send then wait
+                EngineCmd::Offers(reply)
+            });
+            r.unwrap()
+        });
+
+        // The caller has handed us its command and is now parked in recv_timeout.
+        sent_rx.recv().unwrap();
+        let cmd = eng_rx.recv().unwrap();
+
+        // The mutex must be free while the caller waits. Under the old code the caller still holds
+        // the guard here and this try_lock returns WouldBlock, failing the test.
+        assert!(
+            engine.try_lock().is_ok(),
+            "engine lock held across the reply wait"
+        );
+
+        // Reply so the caller returns promptly, then join.
+        match cmd {
+            EngineCmd::Offers(reply) => reply.send(Vec::new()).unwrap(),
+            _ => panic!("expected Offers"),
+        }
+        let got = caller.join().unwrap();
+        assert!(got.is_empty());
+    }
 
     #[test]
     fn loopback_binds_are_recognised() {
