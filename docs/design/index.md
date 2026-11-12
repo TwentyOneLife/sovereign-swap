@@ -15,6 +15,8 @@ The notes below are listed in order. Each links to the full text.
   state is persisted and resumed.
 - [0015 - Safe swap lifecycle](/design/0015-safe-swap-lifecycle) - the rules that guarantee a swap can
   always reach claim-or-refund: maker deadline, offer teardown, replay handling.
+- [0024 - Coin-split / replay-protection service](/design/0024-coin-split-replay-protection) - separating
+  a pre-fork coin so it can never be replayed between the two chains, for any signer.
 
 ## Transport, client, and cryptography
 
