@@ -5,6 +5,12 @@ const TOKEN = document.body.dataset.token;
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
+// A swap is terminal once it can no longer change: it settled (done), timed out to a refund, or was
+// abandoned before locking. The Swaps tab shows only live swaps; the History ledger shows only
+// terminal ones. (Phases: Waiting/Locking/Locked/Claiming/Refunding are live.)
+const TERMINAL_PHASES = ["done", "refunded", "abandoned"];
+const isTerminal = (s) => TERMINAL_PHASES.includes(s.phase);
+
 // Select-all-on-click for read-only copy fields. A single delegated listener replaces the per-element
 // inline `onclick` handlers, which CSP (script-src 'self', no 'unsafe-inline') would otherwise block.
 document.addEventListener("click", (e) => {
@@ -412,7 +418,9 @@ if (donateBtn) donateBtn.onclick = () => openSheet(donateSheet());
 // --- swaps ---
 let lastSwaps = [];
 async function loadSwaps() {
-  lastSwaps = await api("GET", "/swaps").catch(() => []);
+  // Live swaps only; terminal ones belong in History (they would otherwise show in both tabs).
+  const all = await api("GET", "/swaps").catch(() => []);
+  lastSwaps = all.filter((s) => !isTerminal(s));
   $("#swaps-empty").style.display = lastSwaps.length ? "none" : "block";
   mountTable($("#swaps-table"), {
     rows: lastSwaps,
@@ -424,7 +432,7 @@ async function loadSwaps() {
       { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
       { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
-      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => fillSwapDetail(s.id, box),
   });
@@ -454,7 +462,9 @@ function explorerTx(chain, lock) {
 // voluntary fee paid, so the detail needs no extra fetch (unlike the live Swaps detail).
 async function loadHistory() {
   const h = await api("GET", "/history").catch(() => null);
-  const entries = (h && h.swaps) || [];
+  // The ledger lists only terminal swaps; any still in flight show in the Swaps tab (and are counted
+  // as "in flight" in the totals line below).
+  const entries = ((h && h.swaps) || []).filter(isTerminal);
   const t = h && h.totals;
   $("#history-empty").style.display = entries.length ? "none" : "block";
   $("#history-totals").innerHTML = t
@@ -475,7 +485,7 @@ async function loadHistory() {
       { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${s.maker_chain.toUpperCase()}→${s.taker_chain.toUpperCase()}` },
       { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
       { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
-      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = ["done", "refunded", "abandoned"].includes(s.phase) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => {
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
