@@ -676,7 +676,7 @@ function loadSplit() {
     try {
       const r = await api("POST", "/split/classify", { txid: c.txid, vout: c.vout });
       if (r.needs_split) {
-        step1.textContent = "✓ Pre-fork coin — it needs separating. Now click “Build the split”.";
+        step1.textContent = "✓ Pre-fork coin, it needs protecting. Now click \"Build the split\".";
         build.disabled = false;
       } else {
         step1.textContent = "This coin is already chain-specific; it does not need separating.";
@@ -719,8 +719,8 @@ function loadSplit() {
       $("#sp-step3").textContent = r.final
         ? "✓ FINAL: replay not possible. Your BTC (SHA256) coin is now safe to spend."
         : r.separated
-          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations — wait a little longer."
-          : "Not separated yet — check the transaction confirmed on BTC (Blake2b).";
+          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations, wait a little longer."
+          : "Not separated yet. Check the transaction confirmed on BTC (Blake2b).";
     } catch (e) { $("#sp-step3").textContent = "✗ " + splitErr(e); }
   });
 }

@@ -73,56 +73,58 @@
 
   <!-- SPLIT -->
   <section id="split" class="view">
-    <h1>Separate a pre-fork coin</h1>
+    <h1>Protect your BTC (Blake2b) coins</h1>
     <div class="card">
-      <p>A coin you held before the fork (block 961,632, 30 Aug 2026) exists on <strong>both</strong>
-      chains &mdash; <strong>BTC (SHA256)</strong> and <strong>BTC (Blake2b)</strong> &mdash; under the
-      same key. A spend of it on one chain can be copied ("replayed") onto the other and move the twin
-      without your intent. This tool moves the coin once, on the BTC (Blake2b) chain, in a way that can
-      exist on <em>that chain only</em> &mdash; so the two copies become independent and safe.</p>
-      <p><strong>Do you even need this?</strong> If you sign with a BTC (Blake2b) wallet
-      (<a href="https://github.com/TwentyOneLife/shrike-startos" target="_blank" rel="noopener noreferrer">Shrike</a>),
-      your spends are <em>already</em> safe &mdash; just spend the coin normally, for free. This tool is
-      for a coin you can only move with a <strong>regular Bitcoin wallet, hardware wallet, Sparrow or
-      Electrum</strong>: those sign the old way, which is valid on both chains, so you need the marker.</p>
-      <p class="muted">We lend a BTC (Blake2b)-only "marker" coin and recover it; you sign on your own
-      device (non-custodial), we only co-sign the marker. Fee 0.5% of the coin, taken in BTC (Blake2b).
-      <a href="https://twentyonelife.github.io/sovereign-swap/guides/separating-coins" target="_blank" rel="noopener noreferrer">How it works &rarr;</a></p>
+      <p>Do you hold Bitcoin from before the fork (block 961,632, on 30 Aug 2026)? Each of those coins
+      also exists on the <strong>BTC (Blake2b)</strong> chain under the same key. Until you separate the
+      two, a spend on one chain can be copied ("replayed") onto the other. This service separates them
+      safely, so your BTC (Blake2b) coins become yours alone and can never be replayed.</p>
+      <p><strong>What you need.</strong> A BTC (Blake2b) wallet to receive the separated coins: use
+      <strong>Shrike</strong>
+      (<a href="https://github.com/privkeyio/shrike" target="_blank" rel="noopener noreferrer">desktop app</a>,
+      or <a href="https://github.com/TwentyOneLife/shrike-startos" target="_blank" rel="noopener noreferrer">on StartOS</a>).
+      Your existing BTC (SHA256) wallet, for example <strong>Sparrow</strong>, holds the pre-fork coin and
+      signs the move. Your BTC (SHA256) coin itself is never moved: it stays exactly where it is and
+      simply becomes safe to spend.</p>
+      <p class="muted">We lend a BTC (Blake2b) "marker" coin and take it back, so the move cannot exist on
+      the BTC (SHA256) chain. You sign on your own device (non-custodial); we only co-sign the marker.
+      Fee 0.5% of the coin, taken in BTC (Blake2b).
+      <a href="https://twentyonelife.github.io/sovereign-swap/guides/protect-your-coins" target="_blank" rel="noopener noreferrer">Learn how it works</a>.</p>
     </div>
     <div class="card">
-      <h2>1. Your coin and where it should go</h2>
-      <label title="The pre-fork coin you want to separate, written as its transaction id and output number (txid:vout). This is a coin, not an address &mdash; find it in your wallet's coins / UTXO list.">
-        The coin to separate &mdash; transaction id and output number (txid:vout)
-        <input id="sp-coin" placeholder="e.g. 9f86d0…b0ff:0"
-          title="The pre-fork coin's outpoint, txid:vout. Find it in your wallet's coins / UTXO list. Not an address.">
+      <h2>1. Your coin, and where to send it</h2>
+      <label title="The pre-fork coin you want to protect. In Sparrow, open the UTXOs tab, right-click the coin and copy its transaction id, then add its output number (usually 0), like abcd...:0. This picks one exact coin, not a whole address.">
+        Your BTC (SHA256) coin to protect, from Sparrow (transaction id and output number)
+        <input id="sp-coin" placeholder="e.g. 9f86d0b0ff...:0"
+          title="Sparrow UTXOs tab: right-click a coin, copy its transaction id, then add its output number (e.g. :0).">
       </label>
-      <label title="A fresh address you control on the BTC (Blake2b) chain. The separated coin is sent here. You do NOT give a BTC (SHA256) address: that twin is left exactly where it is and simply becomes safe to spend once this is done.">
-        Destination &mdash; a <strong>BTC (Blake2b)</strong> address you control
-        <input id="sp-dest" placeholder="bc1… (on the Blake2b chain)"
-          title="A fresh address you control on the BTC (Blake2b) chain; the separated coin lands here. Your BTC (SHA256) twin stays untouched and becomes safe to spend.">
+      <label title="A fresh receive address from your Shrike (BTC Blake2b) wallet. The separated coin lands here and is yours alone from then on.">
+        Your BTC (Blake2b) destination address, from Shrike
+        <input id="sp-dest" placeholder="a receive address from Shrike"
+          title="A fresh receive address from your Shrike (BTC Blake2b) wallet; the separated coin lands here.">
       </label>
-      <p class="muted">Only one address is needed. Your BTC (SHA256) coin is <em>not</em> moved &mdash; it
-      stays put and becomes safe to spend afterwards.</p>
+      <p class="muted">You only need one new address, the BTC (Blake2b) destination. Your BTC (SHA256)
+      coin is not moved; it stays put and is safe to spend afterwards.</p>
       <div class="row">
-        <button id="sp-classify" class="ghost" title="Asks the node whether this coin is a pre-fork coin that still needs separating. Run this first.">1. Check this coin</button>
-        <button id="sp-build" class="primary" disabled title="Enabled only after the check confirms the coin needs separating.">2. Build the split</button>
+        <button id="sp-classify" class="ghost" title="Asks the node whether this coin is a pre-fork coin that still needs protecting. Run this first.">1. Check this coin</button>
+        <button id="sp-build" class="primary" disabled title="Enabled only after the check confirms the coin needs protecting.">2. Build the split</button>
       </div>
       <p id="sp-step1" class="muted"></p>
     </div>
     <div class="card hidden" id="sp-sign-card">
       <h2>3. Sign it on your own device</h2>
-      <p class="muted">Copy this unsigned transaction, sign it in your wallet / signer, then paste the
+      <p class="muted">Open this unsigned transaction in Sparrow (or your signer), sign it, and paste the
       signed result back below. We never see your keys.</p>
-      <label title="The unsigned transaction we built. Copy it and load it into your signer (Sparrow, a hardware wallet, etc.) to sign.">
-        Unsigned PSBT (copy this into your signer)
-        <textarea id="sp-psbt" class="copyable" readonly rows="3" title="Click to select, then copy into your signer."></textarea>
+      <label title="The unsigned transaction we built. Load it into Sparrow (File, Open Transaction, or paste) and sign it.">
+        Unsigned transaction, open this in Sparrow
+        <textarea id="sp-psbt" class="copyable" readonly rows="3" title="Click to select, then copy it into Sparrow."></textarea>
       </label>
-      <label title="Paste the fully-signed PSBT your signer produced. We check it is exactly the transaction we built, then co-sign our marker and broadcast it.">
-        Signed PSBT (paste it back here)
-        <textarea id="sp-signed" rows="3" placeholder="paste the signed PSBT from your signer"
-          title="The fully-signed PSBT from your signer."></textarea>
+      <label title="Paste the fully-signed transaction Sparrow produced. We check it is exactly the one we built, co-sign our marker, and broadcast it.">
+        Signed transaction, paste it back here
+        <textarea id="sp-signed" rows="3" placeholder="paste the signed transaction from Sparrow"
+          title="The fully-signed transaction from your signer."></textarea>
       </label>
-      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker, and broadcast it on BTC (Blake2b).">Co-sign &amp; broadcast</button>
+      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker, and broadcast it on BTC (Blake2b).">Co-sign and broadcast</button>
       <p id="sp-step2" class="muted"></p>
     </div>
     <div class="card hidden" id="sp-verify-card">
@@ -135,7 +137,7 @@
     <div class="card">
       <h2>Safety</h2>
       <ul class="muted">
-        <li>Never move or consolidate the coin on the BTC (SHA256) side first &mdash; that move is replayable.</li>
+        <li>Never move or consolidate the coin on the BTC (SHA256) side first; that move is replayable.</li>
         <li>The separating move always includes our BTC (Blake2b) marker (the builder enforces it).</li>
         <li>Wait at least 12 BTC (Blake2b) confirmations before trusting it (this low-hashrate chain reorgs).</li>
         <li>Only when verify says FINAL is it safe to spend the BTC (SHA256) side.</li>
