@@ -162,9 +162,11 @@ fn split_build_and_submit_are_token_gated_and_validate_their_body() {
 #[test]
 fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
-    // Input validation runs regardless of engine state: below dust, out-of-band price, min above
-    // amount are each rejected with reasons (422).
-    let bad = r#"{"sell_chain":"xbtc","amount_sat":100,"price":9.9,"min_amount_sat":999999999}"#;
+    // Input validation runs regardless of engine state: below dust, a non-positive price, and min
+    // above amount are each rejected with reasons (422). The price band is now market-relative
+    // (design 0025) and checked in post_offer against the reference, so a plain structural price check
+    // here only rejects a non-positive price.
+    let bad = r#"{"sell_chain":"xbtc","amount_sat":100,"price":-1,"min_amount_sat":999999999}"#;
     let (code, body) = request(&addr, "POST", "/offers", Some(&token), bad);
     assert_eq!(code, 422, "bad offer not rejected: {body}");
     assert!(
