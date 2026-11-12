@@ -227,6 +227,54 @@ pub(crate) fn reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
+mod fuzz {
+    use super::{read_request, MAX_REQUEST_BYTES};
+    use std::io::Cursor;
+
+    /// The HTTP request parser reads attacker-controlled bytes off the socket; it must never panic and
+    /// must refuse an oversized Content-Length rather than allocate it.
+    #[test]
+    fn read_request_never_panics_on_random_or_malformed_input() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..20_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let n = (s % 4096) as usize;
+            let mut bytes = Vec::with_capacity(n);
+            for _ in 0..n {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                bytes.push((s & 0xff) as u8);
+            }
+            let _ = read_request(&mut Cursor::new(bytes), None);
+        }
+        for c in [
+            "",
+            "GET",
+            "GET /\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 999999999999\r\n\r\nx",
+            "GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
+            "\r\n\r\n",
+            "GET / HTTP/1.1\r\nContent-Length: -5\r\n\r\n",
+            "PUT / HTTP/1.1\r\n: v\r\nX:\r\n\r\n",
+        ] {
+            let _ = read_request(&mut Cursor::new(c.as_bytes().to_vec()), None);
+        }
+        // An oversized Content-Length is rejected (413), never allocated.
+        let big = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_REQUEST_BYTES + 1
+        );
+        assert!(matches!(
+            read_request(&mut Cursor::new(big.into_bytes()), None),
+            Err(413)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
