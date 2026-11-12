@@ -287,6 +287,63 @@ fn sat_to_btc(sat: u64) -> f64 {
     bitcoin::Amount::from_sat(sat).to_btc()
 }
 
+// ---- P5c: verify a separation --------------------------------------------------------------------
+
+/// Confirmations a separating transaction must have on the Blake2b chain before it is trusted. The
+/// low-hashrate Blake2b chain has frequent short reorgs, so the runbook waits this many (not 1 or 2).
+pub const MIN_SEPARATION_CONFIRMATIONS: u32 = 12;
+
+/// The result of verifying a separating transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Separation {
+    /// At least one input does not exist on the SHA256 chain, so the transaction can never be replayed
+    /// there - the coin is separated.
+    pub separated: bool,
+    /// The input (funding txid) that exists only on the Blake2b chain, if any.
+    pub sha256_only_input: Option<String>,
+    /// Confirmations on the Blake2b chain.
+    pub confirmations: u32,
+    /// Whether it is confirmed deep enough to be safe from a reorg.
+    pub deep_enough: bool,
+}
+
+impl Separation {
+    /// Fully done: separated AND confirmed deep enough. This is the gate before an operator declares a
+    /// coin split and before it is safe to spend the SHA256 side.
+    pub fn is_final(&self) -> bool {
+        self.separated && self.deep_enough
+    }
+}
+
+/// Verify that a Blake2b separating transaction has actually separated the coin. It is separated iff at
+/// least one of its `inputs` does **not** exist on the SHA256 chain (so the whole transaction is invalid
+/// there and can never be replayed). `exists_on_sha256(funding_txid)` checks whether an input's funding
+/// transaction exists on the SHA256 node; the first input that does not is the proof. `confirmations` is
+/// the transaction's depth on the Blake2b chain. Pure (the chain lookups are passed in) so it is
+/// unit-testable without a node.
+pub fn verify_separation<F, E>(
+    inputs: &[(String, u32)],
+    confirmations: u32,
+    mut exists_on_sha256: F,
+) -> Result<Separation, E>
+where
+    F: FnMut(&str) -> Result<bool, E>,
+{
+    let mut sha256_only_input = None;
+    for (funding_txid, _vout) in inputs {
+        if !exists_on_sha256(funding_txid)? {
+            sha256_only_input = Some(funding_txid.clone());
+            break;
+        }
+    }
+    Ok(Separation {
+        separated: sha256_only_input.is_some(),
+        sha256_only_input,
+        confirmations,
+        deep_enough: confirmations >= MIN_SEPARATION_CONFIRMATIONS,
+    })
+}
+
 // ---- P3: survey a wallet (what needs splitting, what can split it) -------------------------------
 
 /// One wallet UTXO to be surveyed.
@@ -537,5 +594,37 @@ mod tests {
         assert_eq!(s.to_split.len(), 1);
         assert!(s.ingredients.is_empty());
         assert!(!s.can_split()); // has a SHA-Coin but no Blake2b-Coin to separate it with
+    }
+
+    // ---- P5c: verify_separation ----
+
+    #[test]
+    fn separation_holds_when_an_input_is_absent_on_sha256() {
+        // Two inputs: the SHA-Coin (exists on SHA256) and the Blake2b-Coin (does NOT).
+        let inputs = [("shacoin".to_owned(), 0), ("blake2bcoin".to_owned(), 3)];
+        let sep = verify_separation::<_, ()>(&inputs, 14, |t| Ok(t != "blake2bcoin")).unwrap();
+        assert!(sep.separated);
+        assert_eq!(sep.sha256_only_input.as_deref(), Some("blake2bcoin"));
+        assert!(sep.deep_enough); // 14 >= 12
+        assert!(sep.is_final());
+    }
+
+    #[test]
+    fn separation_fails_when_every_input_exists_on_sha256() {
+        // A would-be "split" with no Blake2b-Coin: all inputs exist on SHA256 -> replayable.
+        let inputs = [("a".to_owned(), 0), ("b".to_owned(), 1)];
+        let sep = verify_separation::<_, ()>(&inputs, 20, |_| Ok(true)).unwrap();
+        assert!(!sep.separated);
+        assert!(sep.sha256_only_input.is_none());
+        assert!(!sep.is_final());
+    }
+
+    #[test]
+    fn separation_is_not_final_until_confirmed_deep_enough() {
+        let inputs = [("blake2bcoin".to_owned(), 0)];
+        let sep = verify_separation::<_, ()>(&inputs, 3, |_| Ok(false)).unwrap();
+        assert!(sep.separated); // the input is Blake2b-only
+        assert!(!sep.deep_enough); // only 3 confirmations, needs 12
+        assert!(!sep.is_final()); // separated but not yet safe from a reorg
     }
 }

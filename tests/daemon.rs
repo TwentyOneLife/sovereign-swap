@@ -83,6 +83,16 @@ fn split_classify_is_token_gated_and_validates_its_body() {
         422,
         "missing txid is 422"
     );
+    // /split/verify: same gating + validation.
+    assert_eq!(request(&addr, "POST", "/split/verify", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/verify", Some(&token), "nope").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/verify", Some(&token), "{}").0,
+        422
+    );
 }
 
 #[test]

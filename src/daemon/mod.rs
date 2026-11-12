@@ -630,6 +630,7 @@ impl Daemon {
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
             ("POST", "/split/classify") => self.split_classify(&req.body),
+            ("POST", "/split/verify") => self.split_verify(&req.body),
             ("POST", p)
                 if p.starts_with("/offers/")
                     && p.ends_with("/take")
@@ -859,6 +860,97 @@ impl Daemon {
                 }),
             ),
             Err(e) => (502, json!({"error": e.to_string()})),
+        }
+    }
+
+    /// Coin-split service (P5), read-only: verify that a Blake2b **separating** transaction has
+    /// actually separated the coin - it is confirmed deep enough on the Blake2b chain AND at least one
+    /// of its inputs does not exist on the SHA256 chain, so the transaction can never be replayed there.
+    /// Only a genuine "not found" (RPC code -5) on the SHA256 node counts an input as absent; any
+    /// transport error is surfaced as "could not verify", NEVER as "separated" (a false "separated"
+    /// would wrongly tell the operator the SHA256 side is safe to spend). Body: `{"txid": "..."}`.
+    fn split_verify(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(txid) = req["txid"].as_str() else {
+            return (422, json!({"error": "txid required"}));
+        };
+        // Snapshot both nodes' config, then release the state lock before network I/O.
+        let (xn, xu, xp, xca, bn, bu, bp, bca, tor) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                s.btc_node.clone(),
+                s.btc_rpc_user.clone(),
+                s.btc_rpc_pass.clone(),
+                s.btc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+            )
+        };
+        let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let tx = match xbtc.call("getrawtransaction", json!([txid, true])) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    502,
+                    json!({"error": format!("Blake2b getrawtransaction: {e:?}")}),
+                )
+            }
+        };
+        let confirmations = tx["confirmations"].as_u64().unwrap_or(0) as u32;
+        let inputs: Vec<(String, u32)> = tx["vin"]
+            .as_array()
+            .map(|vin| {
+                vin.iter()
+                    .filter_map(|i| {
+                        Some((i["txid"].as_str()?.to_owned(), i["vout"].as_u64()? as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if inputs.is_empty() {
+            return (
+                422,
+                json!({"error": "not a spendable transaction (no inputs)"}),
+            );
+        }
+        let btc = match connect_client(&bn, &bu, &bp, &bca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("SHA256 node: {e}")})),
+        };
+        // Exists on SHA256 iff getrawtransaction succeeds; a genuine -5 means absent; anything else is a
+        // real error we must not misread as absence.
+        let exists = |t: &str| -> Result<bool, crate::split::SplitError> {
+            match btc.call("getrawtransaction", json!([t, false])) {
+                Ok(_) => Ok(true),
+                Err(crate::rpc::RpcError::Rpc { code: -5, .. }) => Ok(false),
+                Err(e) => Err(crate::split::SplitError::Rpc(e)),
+            }
+        };
+        match crate::split::verify_separation(&inputs, confirmations, exists) {
+            Ok(sep) => (
+                200,
+                json!({
+                    "txid": txid,
+                    "separated": sep.separated,
+                    "confirmations": sep.confirmations,
+                    "deep_enough": sep.deep_enough,
+                    "final": sep.is_final(),
+                    "sha256_only_input": sep.sha256_only_input,
+                    "min_confirmations": crate::split::MIN_SEPARATION_CONFIRMATIONS,
+                }),
+            ),
+            Err(e) => (
+                502,
+                json!({"error": format!("could not verify on the SHA256 node: {e}")}),
+            ),
         }
     }
 
