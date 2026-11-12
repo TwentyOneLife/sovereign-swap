@@ -293,6 +293,40 @@ fn sat_to_btc(sat: u64) -> f64 {
 /// low-hashrate Blake2b chain has frequent short reorgs, so the runbook waits this many (not 1 or 2).
 pub const MIN_SEPARATION_CONFIRMATIONS: u32 = 12;
 
+/// Refuse to verify unless the SHA256 node has a fully synced `txindex`. This is safety-critical:
+/// `getrawtransaction` returns the "not found" code (-5) for ANY confirmed transaction that is not in
+/// the mempool when txindex is off, so without this guard a replayable SHA-Coin's own funding
+/// transaction would be read as **absent** and the move declared `separated` - telling the operator the
+/// SHA256 side is safe to spend when it is not. `getindexinfo "txindex"` returns `{}` when no index is
+/// configured, or `{"txindex":{"synced":bool,...}}`.
+pub fn require_txindex(rpc: &Client) -> Result<(), SplitError> {
+    let info = rpc
+        .call("getindexinfo", json!(["txindex"]))
+        .map_err(SplitError::Rpc)?;
+    if info["txindex"]["synced"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(SplitError::Malformed(
+            "the SHA256 node has no synced txindex; it cannot tell an absent input from an unindexed \
+             one (getrawtransaction returns -5 for both), so a separation cannot be verified safely"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Does `funding_txid` exist on the given node? Only a genuine "not found" (RPC code -5) counts as
+/// absent; any other RPC error is surfaced, never silently read as absence (a false "absent" on the
+/// SHA256 node would wrongly declare a move non-replayable). Call [`require_txindex`] on the node first,
+/// or a confirmed-but-unindexed transaction will look absent. Shared by the daemon handler and the
+/// regtest test so there is one existence check, not two.
+pub fn exists_on_node(rpc: &Client, funding_txid: &str) -> Result<bool, SplitError> {
+    match rpc.call("getrawtransaction", json!([funding_txid, false])) {
+        Ok(_) => Ok(true),
+        Err(RpcError::Rpc { code: -5, .. }) => Ok(false),
+        Err(e) => Err(SplitError::Rpc(e)),
+    }
+}
+
 /// The result of verifying a separating transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Separation {

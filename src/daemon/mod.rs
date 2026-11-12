@@ -925,15 +925,15 @@ impl Daemon {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("SHA256 node: {e}")})),
         };
+        // Safety gate: without a synced txindex the SHA256 node returns -5 for every confirmed tx not in
+        // its mempool, which would make a replayable input look absent and the move look separated. Refuse
+        // rather than risk a false "safe to spend".
+        if let Err(e) = crate::split::require_txindex(&btc) {
+            return (502, json!({"error": format!("cannot verify: {e}")}));
+        }
         // Exists on SHA256 iff getrawtransaction succeeds; a genuine -5 means absent; anything else is a
-        // real error we must not misread as absence.
-        let exists = |t: &str| -> Result<bool, crate::split::SplitError> {
-            match btc.call("getrawtransaction", json!([t, false])) {
-                Ok(_) => Ok(true),
-                Err(crate::rpc::RpcError::Rpc { code: -5, .. }) => Ok(false),
-                Err(e) => Err(crate::split::SplitError::Rpc(e)),
-            }
-        };
+        // real error we must not misread as absence. Shared with the regtest test.
+        let exists = |t: &str| crate::split::exists_on_node(&btc, t);
         match crate::split::verify_separation(&inputs, confirmations, exists) {
             Ok(sep) => (
                 200,
