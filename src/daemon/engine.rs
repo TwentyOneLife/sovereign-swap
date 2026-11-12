@@ -2,7 +2,7 @@
 //! channel, and builds the JSON views the API returns.
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::Amount;
@@ -20,6 +20,37 @@ use super::types::Settings;
 use super::wire::random16;
 
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long a daemon API call waits for the engine's reply (`engine_call_on`'s `recv_timeout`).
+pub(crate) const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A `Publish` or `Take` dequeued later than this after it was created is dropped unrun (#176): by then
+/// the caller has given up (or is about to, at `ENGINE_CALL_TIMEOUT`), and running a trade it abandoned
+/// would double-trade on its retry. Both commands mint a fresh random id per request, so a retry shares
+/// nothing with the original and the engine cannot dedupe it; not running the abandoned one is the only
+/// safe server-side guard. Kept strictly below `ENGINE_CALL_TIMEOUT` so a dropped command's reply
+/// channel disconnects before the caller's wait expires, turning the wait into a definite "not applied"
+/// rather than an ambiguous timeout. `Withdraw`/`Abort`/`SubmitSignedLock` are never dropped: running
+/// them late is what the operator wants, and a repeat is harmless (refused or idempotent).
+pub(crate) const ENGINE_CMD_DEADLINE: Duration = Duration::from_secs(7);
+
+/// A command plus the wall-clock point past which it must not run if it is a double-trade risk.
+pub(crate) struct Dispatch {
+    pub cmd: EngineCmd,
+    pub deadline: Instant,
+}
+
+/// Admit a dequeued command, or drop it. A `Publish`/`Take` whose deadline has passed is dropped (the
+/// caller gave up; running it would double-trade). Every other command runs regardless of its age:
+/// late reads are harmless, and late `Withdraw`/`Abort`/`SubmitSignedLock` are wanted and safe to
+/// repeat. Pure (clock passed in) so it is unit-testable.
+pub(crate) fn admit(d: Dispatch, now: Instant) -> Option<EngineCmd> {
+    if now >= d.deadline && d.cmd.is_double_trade_risk() {
+        None
+    } else {
+        Some(d.cmd)
+    }
+}
 
 /// Default per-leg timelocks for a new offer, in blocks (the engine clamps to policy regardless).
 pub(crate) const MAKER_LOCK_BLOCKS: u16 = 40;
@@ -57,6 +88,14 @@ pub(crate) enum EngineCmd {
         psbt: String,
         reply: Sender<Result<(), String>>,
     },
+}
+
+impl EngineCmd {
+    /// Commands whose late execution would double-trade: `Publish` (a duplicate offer) and `Take` (a
+    /// second swap against an offer). These are the ones `admit` drops once their caller has given up.
+    fn is_double_trade_risk(&self) -> bool {
+        matches!(self, EngineCmd::Publish(..) | EngineCmd::Take { .. })
+    }
 }
 
 /// The slice of a swap the API exposes: id, phase, our role, the direction and amounts, and whether
@@ -110,14 +149,19 @@ impl SwapView {
 /// sender (all senders gone => `Disconnected`).
 pub(crate) fn run_engine(
     mut engine: Engine<RelayTransport<WsConn>>,
-    rx: Receiver<EngineCmd>,
+    rx: Receiver<Dispatch>,
     events: Arc<Mutex<Vec<Sender<String>>>>,
 ) {
     let mut last_phase: std::collections::BTreeMap<[u8; 16], Phase> = Default::default();
     let mut last_offers = 0usize;
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
-            Ok(cmd) => handle_engine_cmd(cmd, &mut engine),
+            // Drop a Publish/Take whose caller has already given up (#176); run everything else.
+            Ok(d) => {
+                if let Some(cmd) = admit(d, Instant::now()) {
+                    handle_engine_cmd(cmd, &mut engine);
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -313,6 +357,86 @@ pub(crate) fn chain_str(c: SwapChain) -> &'static str {
 mod tests {
     use super::*;
     use bitcoin::OutPoint;
+    use std::sync::mpsc;
+
+    fn test_offer() -> SwapOffer {
+        SwapOffer {
+            id: [0u8; 16],
+            maker_chain: SwapChain::Btc,
+            maker_amount: Amount::from_sat(1000),
+            taker_amount: Amount::from_sat(1000),
+            min_maker_amount: Amount::from_sat(1000),
+            maker_lock_blocks: 40,
+            taker_lock_blocks: 20,
+            maker_lock_depth: 1,
+            taker_lock_depth: 1,
+            margin_blocks: 6,
+            fee: None,
+        }
+    }
+
+    #[test]
+    fn admit_drops_only_a_stale_publish_or_take() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let future = Instant::now() + Duration::from_secs(60);
+        let now = Instant::now();
+
+        // A stale Publish or Take is a double-trade risk: drop it.
+        let (tx, _rx) = mpsc::channel();
+        let publish = Dispatch {
+            cmd: EngineCmd::Publish(test_offer(), tx),
+            deadline: past,
+        };
+        assert!(
+            admit(publish, now).is_none(),
+            "stale Publish must be dropped"
+        );
+
+        let (tx, _rx) = mpsc::channel();
+        let take = Dispatch {
+            cmd: EngineCmd::Take {
+                offer_id: [0u8; 16],
+                maker_part: Amount::from_sat(0),
+                reply: tx,
+            },
+            deadline: past,
+        };
+        assert!(admit(take, now).is_none(), "stale Take must be dropped");
+
+        // A stale Withdraw/Abort/SubmitSignedLock still runs (operator brakes, funding window).
+        let (tx, _rx) = mpsc::channel();
+        let withdraw = Dispatch {
+            cmd: EngineCmd::Withdraw {
+                offer_id: [0u8; 16],
+                reply: tx,
+            },
+            deadline: past,
+        };
+        assert!(
+            admit(withdraw, now).is_some(),
+            "a stale Withdraw must still run"
+        );
+
+        // A stale read still runs (harmless; its reply goes to a receiver that may be gone).
+        let (tx, _rx) = mpsc::channel();
+        let offers = Dispatch {
+            cmd: EngineCmd::Offers(tx),
+            deadline: past,
+        };
+        assert!(admit(offers, now).is_some(), "a stale read must still run");
+
+        // A fresh Take (deadline not reached) runs.
+        let (tx, _rx) = mpsc::channel();
+        let fresh = Dispatch {
+            cmd: EngineCmd::Take {
+                offer_id: [0u8; 16],
+                maker_part: Amount::from_sat(0),
+                reply: tx,
+            },
+            deadline: future,
+        };
+        assert!(admit(fresh, now).is_some(), "a fresh Take must run");
+    }
 
     #[test]
     fn chain_detail_reports_confirmations_and_refund_countdown() {
