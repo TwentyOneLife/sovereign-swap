@@ -53,6 +53,14 @@ pub use types::{parse_btc_to_sats, Chain, FundingConfig, FundingMode, Settings, 
 /// stalled signer must never hang the engine thread.
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `scantxoutset` (the split address scan) walks the whole UTXO set. On the Blake2b chain, which
+/// inherited Bitcoin's full pre-fork set (~167M txouts), that is mainnet-sized and runs well past the
+/// default per-call `TIMEOUT` (120s), so the scan must get its own generous budget or it fails with a
+/// read timeout (WouldBlock) every time (#199). A live measurement through the node's RPC proxy took
+/// ~368s; 900s leaves margin for a loaded node. It is a read-only, operator-initiated call on one of
+/// 128 connection slots, so a long bound is safe.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(900);
+
 use engine::{
     engine_config, offer_to_json, run_engine, Dispatch, EngineCmd, ENGINE_CALL_TIMEOUT,
     ENGINE_CMD_DEADLINE,
@@ -1007,7 +1015,10 @@ impl Daemon {
                 json!({"error": "the Blake2b node needs a synced txindex to classify coins"}),
             );
         }
-        let scan = match xbtc.call(
+        // scantxoutset scans the whole (mainnet-sized) UTXO set, so give just this call a long budget
+        // (#199); the default 120s read timeout surfaces as WouldBlock on mainnet. Client is cheap to
+        // clone and the fast calls above keep the default timeout.
+        let scan = match xbtc.clone().with_timeout(SCAN_TIMEOUT).call(
             "scantxoutset",
             json!(["start", [{"desc": format!("addr({address})")}]]),
         ) {

@@ -693,7 +693,7 @@ function loadSplit() {
     }
     // Primary path: scan an address for its coins.
     if (!addrField) { step1.textContent = "Enter your BTC (SHA256) address (or a specific coin)."; return; }
-    step1.textContent = "Scanning the chain for coins at this address… this can take a minute.";
+    step1.textContent = "Scanning the chain for coins at this address… on mainnet this can take a few minutes.";
     try {
       const r = await api("POST", "/split/scan", { address: addrField });
       const coins = r.coins || [];
