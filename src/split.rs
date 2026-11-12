@@ -1,7 +1,8 @@
 //! Coin-split / replay-protection service (design: `_internal/designs/xbt-btc-replay-split-*`).
 //!
-//! Bitcoin and Bitcoin Blake2b share byte-identical history before the fork (mainnet block 961,640),
-//! so a coin that existed before the fork exists on BOTH chains under the same key and is **replayable**:
+//! Bitcoin and Bitcoin Blake2b share byte-identical history up to mainnet block 961,631 and first differ
+//! at 961,632 (the BIP-110 split; BLAKE2b PoW follows at 961,640), so a coin that existed before the
+//! split exists on BOTH chains under the same key and is **replayable**:
 //! a spend on one chain can be copied to the other. To separate the twins the coin must be moved once on
 //! the Blake2b chain in a transaction that cannot exist on the SHA256 chain, by spending it **together
 //! with** a "Blake2b-Coin" (a coin mined after the fork, which exists on Blake2b only). This module:
@@ -16,10 +17,14 @@ use serde_json::json;
 
 use crate::rpc::{Client, RpcError};
 
-/// Mainnet fork height: Bitcoin split into the SHA256 and Blake2b chains at this block (2026-08-30). A
-/// coinbase at or above this height, seen on the Blake2b chain, is a Blake2b-only coin. Regtest uses a
-/// low activation height (`-testactivationheight=blake2b@N`), passed in explicitly.
-pub const MAINNET_FORK_HEIGHT: u32 = 961_640;
+/// Mainnet fork height: the FIRST block that differs between the SHA256 and Blake2b chains, so a
+/// coinbase at or above it on the Blake2b chain is a Blake2b-only coin. This is the BIP-110 split at
+/// **961,632**, NOT the BLAKE2b-PoW activation at 961,640: the chains already mine different blocks from
+/// 961,632 (both still SHA256-difficulty until 961,640). Using 961,640 would misclassify a coin mined at
+/// 961,632-639 on the Blake2b chain as a replayable SHA-Coin. Verified live 2026-11-12 (btc-core vs
+/// btc-blake `getblockhash`): 961,631 identical on both, 961,632 diverges. Regtest passes its own
+/// activation height (`-testactivationheight=blake2b@N`) explicitly.
+pub const MAINNET_FORK_HEIGHT: u32 = 961_632;
 
 /// Default bound on the number of ancestry lookups one classification may do, so a pathological input
 /// cannot make it trace the whole chain. Real coins are a few hops from a coinbase or from the fork.
