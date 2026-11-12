@@ -1,6 +1,6 @@
 # Development build and test image. Base pinned by digest: rust:1-slim-bookworm, rustc 1.99.1.
 # clippy and rustfmt are fetched unpinned at image build; a release build vendors and pins its inputs.
-FROM rust@sha256:ed2c95ca377d6571b124b05e75e01207973ded639dce7d5542eb7bcd797e32aa
+FROM rust@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07
 RUN rustup component add clippy rustfmt
 # Fulcrum (the regtest Electrum server for the E1 ChainBackend test) links libbz2 at runtime; the
 # slim base image does not ship it.
