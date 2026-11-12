@@ -151,6 +151,13 @@ pub struct Settings {
     /// engine's bid validation.
     #[serde(default = "default_min_swap_sat")]
     pub min_swap_sat: u64,
+    /// The coin-split classifier's fork height: the first block that differs between the SHA256 and
+    /// Blake2b chains. Defaults to mainnet (`split::MAINNET_FORK_HEIGHT` = 961,632); a regtest/test
+    /// deployment sets its `-testactivationheight=blake2b@N` value here so classify works there. It is a
+    /// consensus fact, not a preference; verify uses the -5 existence check regardless, so a wrong value
+    /// can only misclassify, never declare a replayable coin safe.
+    #[serde(default = "default_split_fork_height")]
+    pub split_fork_height: u32,
     /// Smallest trade the voluntary-fee path acts on, in sats. Defaults to the production
     /// `MIN_TRADE_SAT` (100_000), so existing configs are unchanged. Lower it only on a test
     /// deployment that wants the fee to apply to a small (real-rate dust) leg, where xBTC being far
@@ -283,6 +290,9 @@ pub(crate) const MAX_FEE_BPS: u16 = 100;
 fn default_min_swap_sat() -> u64 {
     DUST_SAT
 }
+fn default_split_fork_height() -> u32 {
+    crate::split::MAINNET_FORK_HEIGHT
+}
 fn default_min_trade_sat() -> u64 {
     crate::fee::MIN_TRADE_SAT
 }
@@ -314,6 +324,7 @@ impl Default for Settings {
             xbtc_conf: 2,
             margin_blocks: 2,
             min_swap_sat: default_min_swap_sat(),
+            split_fork_height: default_split_fork_height(),
             min_trade_sat: default_min_trade_sat(),
             max_swap_sat: default_max_swap_sat(),
             btc_rpc_user: String::new(),

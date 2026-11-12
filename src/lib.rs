@@ -22,6 +22,7 @@ pub mod signer;
 pub mod signer_server;
 pub mod silentpayments;
 pub mod socks;
+pub mod split;
 pub mod store;
 pub mod swap;
 pub mod transport;

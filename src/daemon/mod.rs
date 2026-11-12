@@ -116,6 +116,10 @@ pub struct Daemon {
     /// fields. Scan-only: these are counts and sats, never a key.
     scan_btc: Arc<Mutex<feescan::State>>,
     scan_xbtc: Arc<Mutex<feescan::State>>,
+    /// Coin-split service state (P5): the lent-marker pool + pending build jobs, persisted to
+    /// `split.json`. A reserved marker or a built-but-unsubmitted job must survive a restart, else a
+    /// restart could double-lend a marker.
+    split: Arc<Mutex<crate::split::SplitState>>,
     /// An exclusive OS lock on the data dir, held for the daemon's whole life (design 0004). Two
     /// daemons on one seed and state would reuse per-swap key indices and secrets and double-broadcast,
     /// losing funds; this makes a second daemon on the same data dir refuse to start. Never read after
@@ -185,6 +189,9 @@ impl Daemon {
             basic_auth,
             scan_btc: Arc::new(Mutex::new(feescan::State::default())),
             scan_xbtc: Arc::new(Mutex::new(feescan::State::default())),
+            split: Arc::new(Mutex::new(crate::split::SplitState::load(
+                &data_dir.join("split.json"),
+            ))),
             _state_lock: state_lock,
         };
         // If the saved settings are already complete, bring the engine up. A failure here is not fatal
@@ -629,6 +636,10 @@ impl Daemon {
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
+            ("POST", "/split/classify") => self.split_classify(&req.body),
+            ("POST", "/split/verify") => self.split_verify(&req.body),
+            ("POST", "/split/build") => self.split_build(&req.body),
+            ("POST", "/split/submit") => self.split_submit(&req.body),
             ("POST", p)
                 if p.starts_with("/offers/")
                     && p.ends_with("/take")
@@ -805,6 +816,415 @@ impl Daemon {
             Ok(v) => (200, v),
             Err(e) => (503, json!({ "error": e })),
         }
+    }
+
+    /// Coin-split service (P5), read-only: classify a UTXO on the Blake2b chain as a pre-fork
+    /// **SHA-Coin** (exists on both chains, replayable, needs splitting) or a post-fork
+    /// **Blake2b-Coin** (chain-specific). Moves nothing; it only reads the Blake2b node. Body:
+    /// `{"txid": "...", "vout": N}`. The money-moving steps (build the separating PSBT, verify
+    /// separation on the SHA256 node) are separate endpoints.
+    fn split_classify(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(txid) = req["txid"].as_str() else {
+            return (422, json!({"error": "txid required"}));
+        };
+        let vout = req["vout"].as_u64().unwrap_or(0);
+        // Snapshot the node config, then release the state lock before any network I/O.
+        let (node, user, pass, ca, tor_socks, fork_height) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                s.split_fork_height,
+            )
+        };
+        let client = match connect_client(&node, &user, &pass, &ca, &tor_socks) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let src = match crate::split::NodeTxSource::new(&client) {
+            Ok(s) => s,
+            Err(e) => return (502, json!({"error": e.to_string()})),
+        };
+        match crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS) {
+            Ok(kind) => (
+                200,
+                json!({
+                    "txid": txid,
+                    "vout": vout,
+                    "kind": match kind {
+                        crate::split::CoinKind::ShaCoin => "sha_coin",
+                        crate::split::CoinKind::Blake2bCoin => "blake2b_coin",
+                    },
+                    "needs_split": kind.needs_split(),
+                }),
+            ),
+            Err(e) => (502, json!({"error": e.to_string()})),
+        }
+    }
+
+    /// Coin-split service (P5), read-only: verify that a Blake2b **separating** transaction has
+    /// actually separated the coin - it is confirmed deep enough on the Blake2b chain AND at least one
+    /// of its inputs does not exist on the SHA256 chain, so the transaction can never be replayed there.
+    /// Only a genuine "not found" (RPC code -5) on the SHA256 node counts an input as absent; any
+    /// transport error is surfaced as "could not verify", NEVER as "separated" (a false "separated"
+    /// would wrongly tell the operator the SHA256 side is safe to spend). Body: `{"txid": "..."}`.
+    fn split_verify(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(txid) = req["txid"].as_str() else {
+            return (422, json!({"error": "txid required"}));
+        };
+        // Snapshot both nodes' config, then release the state lock before network I/O.
+        let (xn, xu, xp, xca, bn, bu, bp, bca, tor) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                s.btc_node.clone(),
+                s.btc_rpc_user.clone(),
+                s.btc_rpc_pass.clone(),
+                s.btc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+            )
+        };
+        let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let tx = match xbtc.call("getrawtransaction", json!([txid, true])) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    502,
+                    json!({"error": format!("Blake2b getrawtransaction: {e:?}")}),
+                )
+            }
+        };
+        let confirmations = tx["confirmations"].as_u64().unwrap_or(0) as u32;
+        let inputs: Vec<(String, u32)> = tx["vin"]
+            .as_array()
+            .map(|vin| {
+                vin.iter()
+                    .filter_map(|i| {
+                        Some((i["txid"].as_str()?.to_owned(), i["vout"].as_u64()? as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if inputs.is_empty() {
+            return (
+                422,
+                json!({"error": "not a spendable transaction (no inputs)"}),
+            );
+        }
+        let btc = match connect_client(&bn, &bu, &bp, &bca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("SHA256 node: {e}")})),
+        };
+        // Safety gate: without a synced txindex the SHA256 node returns -5 for every confirmed tx not in
+        // its mempool, which would make a replayable input look absent and the move look separated. Refuse
+        // rather than risk a false "safe to spend".
+        if let Err(e) = crate::split::require_txindex(&btc) {
+            return (502, json!({"error": format!("cannot verify: {e}")}));
+        }
+        // Exists on SHA256 iff getrawtransaction succeeds; a genuine -5 means absent; anything else is a
+        // real error we must not misread as absence. Shared with the regtest test.
+        let exists = |t: &str| crate::split::exists_on_node(&btc, t);
+        match crate::split::verify_separation(&inputs, confirmations, exists) {
+            Ok(sep) => (
+                200,
+                json!({
+                    "txid": txid,
+                    "separated": sep.separated,
+                    "confirmations": sep.confirmations,
+                    "deep_enough": sep.deep_enough,
+                    "final": sep.is_final(),
+                    "sha256_only_input": sep.sha256_only_input,
+                    "min_confirmations": crate::split::MIN_SEPARATION_CONFIRMATIONS,
+                }),
+            ),
+            Err(e) => (
+                502,
+                json!({"error": format!("could not verify on the SHA256 node: {e}")}),
+            ),
+        }
+    }
+
+    /// Coin-split service (P5): build the UNSIGNED separating PSBT for the lent-marker move. Body
+    /// `{"sha_coins":[{"txid","vout"}...],"dest":"<Blake2b address>"}`. Reserves a marker (auto-scanning
+    /// the swap wallet's Blake2b-Coins when the pool is empty), builds the PSBT with the user's
+    /// SHA-Coin(s) + our lent marker, persists the exact transaction as a job, and returns it to sign.
+    /// We co-sign the marker only at `/split/submit`, after checking the signed tx is the one we built.
+    fn split_build(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let Some(dest_str) = req["dest"].as_str() else {
+            return (422, json!({"error": "dest required"}));
+        };
+        let coins: Vec<(String, u32)> = req["sha_coins"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some((c["txid"].as_str()?.to_owned(), c["vout"].as_u64()? as u32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if coins.is_empty() {
+            return (422, json!({"error": "sha_coins required"}));
+        }
+        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, fork_height, wallet_name) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                s.btc_node.clone(),
+                s.btc_rpc_user.clone(),
+                s.btc_rpc_pass.clone(),
+                s.btc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                s.current_fee_address(Chain::Xbtc),
+                s.split_fork_height,
+                format!(
+                    "swap-{}",
+                    self.identity_seed[..4].to_hex_string(Case::Lower)
+                ),
+            )
+        };
+        let Some(fee_cfg) = fee_cfg else {
+            return (503, json!({"error": "no XBT fee address configured"}));
+        };
+        let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let btc = match connect_client(&bn, &bu, &bp, &bca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("SHA256 node: {e}")})),
+        };
+        if let Err(e) = crate::split::require_txindex(&btc) {
+            return (502, json!({"error": format!("SHA256 node: {e}")}));
+        }
+        let network = match net_of(&xbtc) {
+            Ok(n) => n,
+            Err(e) => return (502, json!({"error": e})),
+        };
+        let parse_addr = |s: &str| -> Option<bitcoin::Address> {
+            s.parse::<bitcoin::Address<_>>()
+                .ok()
+                .and_then(|a| a.require_network(network).ok())
+        };
+        let Some(dest) = parse_addr(dest_str) else {
+            return (
+                422,
+                json!({"error": "dest is not a valid address for this chain"}),
+            );
+        };
+        // The fee address must be a plain address: we cannot derive a silent-payment output without the
+        // keys of every input, and in a two-owner move we hold only the marker's.
+        let Some(fee_addr) = parse_addr(&fee_cfg) else {
+            return (
+                503,
+                json!({"error": "the XBT fee address must be a plain address, not a silent-payment address"}),
+            );
+        };
+        let wallet = xbtc.wallet(&wallet_name);
+        let now = unix_now();
+
+        // Reserve a marker, auto-scanning the wallet's Blake2b-Coins into the pool if none is free.
+        let (job_id, marker) = {
+            let mut st = self.split.lock().unwrap();
+            st.expire(now, crate::split::MARKER_RESERVATION_SECS);
+            let job_id = new_job_id();
+            if st.pool.reserve(&job_id, now).is_none() {
+                for u in list_unspent(&wallet) {
+                    if st.pool.available_count() > 0 {
+                        break;
+                    }
+                    let Ok(kind) = classify_on(&xbtc, fork_height, &u.0) else {
+                        continue;
+                    };
+                    if kind != crate::split::CoinKind::Blake2bCoin {
+                        continue;
+                    }
+                    if crate::split::verify_marker(&btc, &u.0).is_err() {
+                        continue;
+                    }
+                    let _ = st.pool.add_marker(crate::split::Marker {
+                        txid: u.0,
+                        vout: u.1,
+                        value_sat: u.2,
+                    });
+                }
+                if st.pool.reserve(&job_id, now).is_none() {
+                    return (
+                        503,
+                        json!({"error": "no lendable Blake2b-Coin marker available; fund the swap wallet"}),
+                    );
+                }
+            }
+            (job_id.clone(), st.pool.reserved_marker(&job_id).unwrap())
+        };
+
+        // Prepare inputs (kinds derived on-chain) and build. On any failure, release the reservation.
+        let build = (|| -> Result<(String, u64, String), (u16, Value)> {
+            let mut prepared = Vec::new();
+            for (txid, vout) in &coins {
+                let p = crate::split::prepare_input(&xbtc, fork_height, txid, *vout)
+                    .map_err(|e| (422, json!({"error": format!("input {txid}:{vout}: {e}")})))?;
+                prepared.push(p);
+            }
+            prepared.push(
+                crate::split::prepare_input(&xbtc, fork_height, &marker.txid, marker.vout)
+                    .map_err(|e| (502, json!({"error": format!("marker: {e}")})))?,
+            );
+            let change_str = wallet
+                .call("getnewaddress", json!(["", "bech32"]))
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or((502, json!({"error": "could not get a change address"})))?;
+            let change =
+                parse_addr(&change_str).ok_or((502, json!({"error": "bad change address"})))?;
+            let net_fee = estimate_network_fee(&wallet, prepared.len());
+            let psbt =
+                crate::split::build_split_psbt(&prepared, &dest, &fee_addr, &change, net_fee)
+                    .map_err(|e| (422, json!({"error": format!("{e}")})))?;
+            let unsigned_hex = psbt_unsigned_hex(&psbt)
+                .ok_or((500, json!({"error": "could not read built tx"})))?;
+            let fee_sat = crate::split::project_fee_sat(
+                prepared
+                    .iter()
+                    .filter(|p| p.input.kind == crate::split::CoinKind::ShaCoin)
+                    .map(|p| p.input.value_sat)
+                    .sum(),
+                crate::split::FEE_BPS,
+            );
+            Ok((psbt, fee_sat, unsigned_hex))
+        })();
+        let (psbt, fee_sat, unsigned_hex) = match build {
+            Ok(v) => v,
+            Err(err) => {
+                let mut st = self.split.lock().unwrap();
+                st.pool.release(&job_id);
+                let _ = st.save(&self.data_dir.join("split.json"));
+                return err;
+            }
+        };
+        {
+            let mut st = self.split.lock().unwrap();
+            st.set_job(&job_id, unsigned_hex);
+            let _ = st.save(&self.data_dir.join("split.json"));
+        }
+        (
+            200,
+            json!({
+                "job_id": job_id,
+                "psbt": psbt,
+                "fee_sat": fee_sat,
+                "marker": {"txid": marker.txid, "vout": marker.vout},
+            }),
+        )
+    }
+
+    /// Coin-split service (P5): co-sign our marker on a user-signed split PSBT and broadcast it. Body
+    /// `{"job_id":"...","psbt":"<base64>"}`. Validates the signed transaction is byte-for-byte the one we
+    /// built for this job and that the user's inputs use an ALL-family sighash (never ANYONECANPAY), then
+    /// co-signs ONLY the marker on the ORIGINAL base64 (so a 0x21 sighash byte is not rewritten),
+    /// finalizes and broadcasts, and taints the recovered-marker change so it is never lent again.
+    fn split_submit(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let (Some(job_id), Some(signed)) = (req["job_id"].as_str(), req["psbt"].as_str()) else {
+            return (422, json!({"error": "job_id and psbt required"}));
+        };
+        let (expected, marker) = {
+            let st = self.split.lock().unwrap();
+            let Some(expected) = st.job(job_id).map(str::to_owned) else {
+                return (410, json!({"error": "unknown or expired job"}));
+            };
+            let Some(marker) = st.pool.reserved_marker(job_id) else {
+                return (410, json!({"error": "no marker reserved for this job"}));
+            };
+            (expected, marker)
+        };
+        let marker_out = match marker.txid.parse() {
+            Ok(txid) => bitcoin::OutPoint {
+                txid,
+                vout: marker.vout,
+            },
+            Err(_) => return (500, json!({"error": "bad marker txid in state"})),
+        };
+        if let Err(e) = crate::split::validate_user_signed(&expected, signed, marker_out) {
+            return (400, json!({"error": format!("{e}")}));
+        }
+        let (xn, xu, xp, xca, tor, wallet_name) = {
+            let s = &self.state.lock().unwrap().settings;
+            (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                format!(
+                    "swap-{}",
+                    self.identity_seed[..4].to_hex_string(Case::Lower)
+                ),
+            )
+        };
+        let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        let wallet = xbtc.wallet(&wallet_name);
+        // Co-sign the marker on the ORIGINAL base64 (never a re-serialized PSBT).
+        let processed = match wallet.call("walletprocesspsbt", json!([signed])) {
+            Ok(v) => v,
+            Err(e) => return (502, json!({"error": format!("co-sign: {e:?}")})),
+        };
+        let Some(psbt2) = processed["psbt"].as_str() else {
+            return (502, json!({"error": "co-sign returned no psbt"}));
+        };
+        let finalized = match wallet.call("finalizepsbt", json!([psbt2])) {
+            Ok(v) => v,
+            Err(e) => return (502, json!({"error": format!("finalize: {e:?}")})),
+        };
+        if finalized["complete"] != true {
+            return (
+                400,
+                json!({"error": "not fully signed: sign your input before submitting"}),
+            );
+        }
+        let Some(hex) = finalized["hex"].as_str() else {
+            return (502, json!({"error": "finalize returned no tx"}));
+        };
+        let txid = match xbtc.call("sendrawtransaction", json!([hex])) {
+            Ok(v) => v.as_str().unwrap_or_default().to_owned(),
+            // Keep the job + reservation on a broadcast failure so the user can retry; it expires if
+            // abandoned. The marker is committed in this exact tx, so a retry re-broadcasts the same one.
+            Err(e) => return (502, json!({"error": format!("broadcast failed: {e:?}")})),
+        };
+        {
+            // Broadcast accepted: the marker is spent and its recovered change is output of THIS tx, so
+            // taint `txid` (finish_job) - the change can never be lent as a future marker.
+            let mut st = self.split.lock().unwrap();
+            st.finish_job(job_id, txid.clone());
+            let _ = st.save(&self.data_dir.join("split.json"));
+        }
+        (200, json!({"txid": txid}))
     }
 
     fn get_swap(&self, id_hex: &str) -> (u16, Value) {
@@ -1030,6 +1450,87 @@ fn connect_client(
     let socks = addr.contains(".onion").then_some(tor_socks);
     let ca = (!ca.trim().is_empty()).then_some(ca);
     Client::connect(addr, user, pass, ca, socks).map_err(|e| format!("{e:?}"))
+}
+
+/// Seconds since the Unix epoch (for marker-reservation timestamps).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A random split job id (8 bytes of /dev/urandom, hex).
+fn new_job_id() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    b.to_hex_string(Case::Lower)
+}
+
+/// The bitcoin `Network` a node serves, from `getblockchaininfo` (so addresses are parsed for the right
+/// network).
+fn net_of(rpc: &Client) -> Result<bitcoin::Network, String> {
+    let info = rpc
+        .call("getblockchaininfo", json!([]))
+        .map_err(|e| format!("getblockchaininfo: {e:?}"))?;
+    match info["chain"].as_str() {
+        Some("main") => Ok(bitcoin::Network::Bitcoin),
+        Some("test") => Ok(bitcoin::Network::Testnet),
+        Some("signet") => Ok(bitcoin::Network::Signet),
+        Some("regtest") => Ok(bitcoin::Network::Regtest),
+        other => Err(format!("unknown network {other:?}")),
+    }
+}
+
+/// A wallet's unspent outputs as (txid, vout, value_sat).
+fn list_unspent(wallet: &Client) -> Vec<(String, u32, u64)> {
+    wallet
+        .call("listunspent", json!([1]))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|u| {
+            Some((
+                u["txid"].as_str()?.to_owned(),
+                u["vout"].as_u64()? as u32,
+                (u["amount"].as_f64()? * 1e8).round() as u64,
+            ))
+        })
+        .collect()
+}
+
+/// Classify a coin by its funding txid on the Blake2b node (for the marker auto-scan).
+fn classify_on(
+    xbtc: &Client,
+    fork_height: u32,
+    txid: &str,
+) -> Result<crate::split::CoinKind, crate::split::SplitError> {
+    let src = crate::split::NodeTxSource::new(xbtc)?;
+    crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS)
+}
+
+/// A rough network fee for the split: sat/vB from `estimatesmartfee` (fallback 1 sat/vB on a chain that
+/// cannot estimate, e.g. regtest) times an estimated vsize, with a floor so a tiny estimate still clears.
+fn estimate_network_fee(wallet: &Client, n_inputs: usize) -> u64 {
+    let sat_vb = wallet
+        .call("estimatesmartfee", json!([6]))
+        .ok()
+        .and_then(|v| v["feerate"].as_f64())
+        .map(|btc_kvb| (btc_kvb * 1e8 / 1000.0).ceil() as u64)
+        .filter(|&r| r > 0)
+        .unwrap_or(1);
+    let vsize = (n_inputs as u64) * 110 + 3 * 34 + 11;
+    (sat_vb * vsize).max(1000)
+}
+
+/// The hex of a base64 PSBT's unsigned transaction (what `/split/submit` matches byte-for-byte).
+fn psbt_unsigned_hex(psbt_b64: &str) -> Option<String> {
+    use std::str::FromStr;
+    bitcoin::Psbt::from_str(psbt_b64)
+        .ok()
+        .map(|p| bitcoin::consensus::encode::serialize_hex(&p.unsigned_tx))
 }
 
 /// True if `bind`'s host is a loopback address (reachable only from the same machine). `0.0.0.0` and
