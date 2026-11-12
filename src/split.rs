@@ -167,6 +167,114 @@ impl TxSource for NodeTxSource<'_> {
     }
 }
 
+// ---- P2: the separating transaction -------------------------------------------------------------
+
+/// Basis points of the separated value taken as the project fee (0.5%).
+pub const FEE_BPS: u64 = 50;
+
+/// A UTXO offered as an input to a separating transaction, with its classified kind and value.
+#[derive(Debug, Clone)]
+pub struct SplitInput {
+    pub txid: String,
+    pub vout: u32,
+    pub kind: CoinKind,
+    pub value_sat: u64,
+}
+
+/// A validated separating plan: the chosen inputs are safe to build into one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlan {
+    /// Total input value across all inputs.
+    pub total_sat: u64,
+    /// Value in SHA-Coins being separated; the project fee is charged on this.
+    pub sha_value_sat: u64,
+    /// The project fee at [`FEE_BPS`] of `sha_value_sat`.
+    pub fee_sat: u64,
+}
+
+/// The project fee on a separated amount: `bps` basis points of `sha_value_sat`, rounded up so a tiny
+/// amount still pays at least one sat.
+pub fn project_fee_sat(sha_value_sat: u64, bps: u64) -> u64 {
+    if sha_value_sat == 0 || bps == 0 {
+        0
+    } else {
+        sha_value_sat.saturating_mul(bps).div_ceil(10_000).max(1)
+    }
+}
+
+/// Validate a proposed input set for a **separating** transaction and compute its plan. Two invariants,
+/// proven in the runbook, are safety-critical: (1) at least one input is a **Blake2b-Coin**, or the
+/// transaction is valid on the SHA256 chain too and is **replayable** (the whole point is a
+/// non-replayable move); and (2) at least one input is a **SHA-Coin**, or there is nothing to separate.
+/// Each input's kind comes from `classify`. Returns the plan (totals + fee).
+pub fn validate_split_inputs(inputs: &[SplitInput]) -> Result<SplitPlan, SplitError> {
+    if inputs.is_empty() {
+        return Err(SplitError::Malformed("no inputs".to_owned()));
+    }
+    let has_blake2b = inputs.iter().any(|i| i.kind == CoinKind::Blake2bCoin);
+    if !has_blake2b {
+        return Err(SplitError::Malformed(
+            "a separating transaction must include at least one Blake2b-Coin, or it is replayable"
+                .to_owned(),
+        ));
+    }
+    let sha_value_sat: u64 = inputs
+        .iter()
+        .filter(|i| i.kind == CoinKind::ShaCoin)
+        .map(|i| i.value_sat)
+        .sum();
+    if sha_value_sat == 0 {
+        return Err(SplitError::Malformed(
+            "no SHA-Coin among the inputs: nothing to separate".to_owned(),
+        ));
+    }
+    let total_sat: u64 = inputs.iter().map(|i| i.value_sat).sum();
+    Ok(SplitPlan {
+        total_sat,
+        sha_value_sat,
+        fee_sat: project_fee_sat(sha_value_sat, FEE_BPS),
+    })
+}
+
+/// Build the unsigned separating PSBT on the Blake2b node: spend exactly the given inputs (no others:
+/// `add_inputs=false`, so the invariant set is preserved), paying the separated value to `dest`
+/// (the user's clean Blake2b address) and the project fee to `fee_addr`, letting the wallet place change
+/// and the network fee. The caller has already classified the inputs; this re-validates the invariant
+/// before building, so a bad call cannot produce a replayable transaction. Returns the base64 PSBT for
+/// the user to sign out of band (the non-custodial, any-signer path, like interactive funding 0017).
+pub fn build_split_psbt(
+    wallet_rpc: &Client,
+    inputs: &[SplitInput],
+    dest: &str,
+    fee_addr: &str,
+) -> Result<String, SplitError> {
+    let plan = validate_split_inputs(inputs)?;
+    let ins: Vec<_> = inputs
+        .iter()
+        .map(|i| json!({"txid": i.txid, "vout": i.vout}))
+        .collect();
+    // The separated value goes to the user's destination; the project fee to our address. The wallet
+    // subtracts the network fee from the destination and returns change (itself a Blake2b-Coin).
+    let dest_btc = sat_to_btc(plan.sha_value_sat.saturating_sub(plan.fee_sat));
+    let fee_btc = sat_to_btc(plan.fee_sat);
+    let outs = json!([{ dest: dest_btc }, { fee_addr: fee_btc }]);
+    // subtractfeefromoutputs=[0]: the network fee comes out of the user's own output, never the project
+    // fee. add_inputs=false: never pull in another coin that could break the invariant set.
+    let opts = json!({"add_inputs": false, "subtractFeeFromOutputs": [0]});
+    let res = wallet_rpc
+        .call("walletcreatefundedpsbt", json!([ins, outs, 0, opts]))
+        .map_err(SplitError::Rpc)?;
+    res["psbt"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| SplitError::Malformed("walletcreatefundedpsbt: no psbt".to_owned()))
+}
+
+/// Sats to a BTC-denominated JSON number string, as bitcoind RPC expects for amounts.
+fn sat_to_btc(sat: u64) -> f64 {
+    sat as f64 / 100_000_000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +369,60 @@ mod tests {
             classify(&m, FORK, "t0", 2),
             Err(SplitError::TooDeep)
         ));
+    }
+
+    // ---- P2: separating-transaction invariants ----
+
+    fn si(kind: CoinKind, value_sat: u64) -> SplitInput {
+        SplitInput {
+            txid: "t".to_owned(),
+            vout: 0,
+            kind,
+            value_sat,
+        }
+    }
+
+    #[test]
+    fn project_fee_is_half_a_percent_rounded_up_and_at_least_one() {
+        assert_eq!(project_fee_sat(1_000_000, FEE_BPS), 5_000); // 0.5% of 1,000,000
+        assert_eq!(project_fee_sat(10_001, FEE_BPS), 51); // 50.005 -> ceil 51
+        assert_eq!(project_fee_sat(1, FEE_BPS), 1); // tiny amount still pays 1
+        assert_eq!(project_fee_sat(0, FEE_BPS), 0);
+        assert_eq!(project_fee_sat(1_000_000, 0), 0);
+    }
+
+    #[test]
+    fn a_split_without_a_blake2b_coin_is_refused_as_replayable() {
+        let inputs = [si(CoinKind::ShaCoin, 1_000_000), si(CoinKind::ShaCoin, 500)];
+        let err = validate_split_inputs(&inputs).unwrap_err();
+        assert!(matches!(err, SplitError::Malformed(m) if m.contains("replayable")));
+    }
+
+    #[test]
+    fn a_split_without_a_sha_coin_has_nothing_to_separate() {
+        let inputs = [si(CoinKind::Blake2bCoin, 10_000)];
+        let err = validate_split_inputs(&inputs).unwrap_err();
+        assert!(matches!(err, SplitError::Malformed(m) if m.contains("nothing to separate")));
+    }
+
+    #[test]
+    fn empty_inputs_are_refused() {
+        assert!(matches!(
+            validate_split_inputs(&[]),
+            Err(SplitError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_valid_split_charges_the_fee_on_the_sha_value_only() {
+        // One SHA-Coin (separated) + one Blake2b-Coin (the ingredient).
+        let inputs = [
+            si(CoinKind::ShaCoin, 1_010_115),
+            si(CoinKind::Blake2bCoin, 10_238),
+        ];
+        let plan = validate_split_inputs(&inputs).unwrap();
+        assert_eq!(plan.total_sat, 1_020_353);
+        assert_eq!(plan.sha_value_sat, 1_010_115); // fee is on the separated value, not the ingredient
+        assert_eq!(plan.fee_sat, project_fee_sat(1_010_115, FEE_BPS)); // 0.5%
     }
 }
