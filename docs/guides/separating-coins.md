@@ -1,5 +1,10 @@
 # Separating your BTC and xBTC coins yourself
 
+> Looking for the simple, guided way (no command line, no node of your own)? See
+> [Protect your BTC (Blake2b) coins](/guides/protect-your-coins). This page is the by-hand method for
+> people who run their own BTC (Blake2b) node.
+
+
 Coins you held at block 961,631 or earlier exist on both chains, BTC and xBTC (Bitcoin Blake2b),
 under the same keys. Until you separate them, a transaction you make on BTC can be copied onto xBTC
 by anyone and confirmed there too, moving your xBTC without your intent. The swap engine refuses to

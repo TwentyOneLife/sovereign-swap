@@ -100,6 +100,17 @@ fn split_build_and_submit_are_token_gated_and_validate_their_body() {
     // Coin-split build/submit endpoints (P5): auth-gated, and the body is validated before any node I/O
     // (build) or state lookup (submit), so these cases never touch a node.
     let (addr, token) = daemon();
+    // /split/scan (resolve an address to its coins)
+    assert_eq!(request(&addr, "POST", "/split/scan", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/scan", Some(&token), "not json").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/scan", Some(&token), "{}").0,
+        422,
+        "missing address is 422"
+    );
     // /split/build
     assert_eq!(request(&addr, "POST", "/split/build", None, "{}").0, 401);
     assert_eq!(

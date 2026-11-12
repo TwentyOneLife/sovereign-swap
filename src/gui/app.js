@@ -652,47 +652,82 @@ function refresh(tab) {
 // ---- Split tab: separate a pre-fork coin (classify -> build -> sign -> submit -> verify). The money
 // steps are the daemon's; this is the guided, non-custodial front end. Handlers are wired once (CSP
 // forbids inline onclick), and the per-step <p> shows progress/errors. ----
-let splitJob = null; // { job_id, txid }
+let splitJob = null; // { coin: {txid,vout}|null, job_id, txid }
 let splitWired = false;
 function splitErr(e) {
   return "error: " + ((e.data && e.data.error) || e.status || e.message || e);
 }
-function splitCoin() {
-  const [txid, vout] = (($("#sp-coin").value || "").trim().split(":"));
-  return { txid: (txid || "").trim(), vout: Number(vout || 0) };
+function shortTxid(t) {
+  return t.length > 14 ? t.slice(0, 8) + "…" + t.slice(-4) : t;
 }
 function loadSplit() {
   if (splitWired) return;
   splitWired = true;
-  splitJob = { job_id: null, txid: null };
-  const build = $("#sp-build"), step1 = $("#sp-step1");
-  // Build stays disabled until the check confirms the coin is a pre-fork coin that needs separating.
-  // Changing the coin invalidates a prior check, so disable Build again and clear the result.
-  $("#sp-coin").addEventListener("input", () => { build.disabled = true; step1.textContent = ""; });
+  splitJob = { coin: null, job_id: null, txid: null };
+  const build = $("#sp-build"), step1 = $("#sp-step1"), coinsBox = $("#sp-coins");
+  // Any change to the inputs clears a prior coin selection.
+  const reset = () => { splitJob.coin = null; build.disabled = true; coinsBox.innerHTML = ""; step1.textContent = ""; };
+  ["#sp-addr", "#sp-coin"].forEach((s) => $(s).addEventListener("input", reset));
+  const select = (txid, vout, note) => {
+    splitJob.coin = { txid, vout: Number(vout) };
+    build.disabled = false;
+    step1.textContent = "✓ " + note + ' Now click "Build the split".';
+  };
+  const postNote = (n) => (n ? " (" + n + " other coin(s) here are post-fork and already safe.)" : "");
+
   $("#sp-classify").addEventListener("click", async () => {
-    const c = splitCoin();
-    if (!c.txid) { step1.textContent = "Enter the coin as txid:vout first."; return; }
-    step1.textContent = "Checking the coin on the BTC (Blake2b) node…";
+    coinsBox.innerHTML = ""; splitJob.coin = null; build.disabled = true;
+    const coinField = ($("#sp-coin").value || "").trim();
+    const addrField = ($("#sp-addr").value || "").trim();
+    // Advanced path: a specific coin as txid:vout.
+    if (coinField) {
+      const [txid, voutS] = coinField.split(":");
+      if (!txid) { step1.textContent = "The coin must be txid:vout."; return; }
+      step1.textContent = "Checking the coin…";
+      try {
+        const r = await api("POST", "/split/classify", { txid: txid.trim(), vout: Number(voutS || 0) });
+        if (r.needs_split) select(txid.trim(), Number(voutS || 0), "Pre-fork coin, it needs protecting.");
+        else step1.textContent = "This coin is already chain-specific; it does not need protecting.";
+      } catch (e) { step1.textContent = "✗ " + splitErr(e); }
+      return;
+    }
+    // Primary path: scan an address for its coins.
+    if (!addrField) { step1.textContent = "Enter your BTC (SHA256) address (or a specific coin)."; return; }
+    step1.textContent = "Scanning the chain for coins at this address… this can take a minute.";
     try {
-      const r = await api("POST", "/split/classify", { txid: c.txid, vout: c.vout });
-      if (r.needs_split) {
-        step1.textContent = "✓ Pre-fork coin — it needs separating. Now click “Build the split”.";
-        build.disabled = false;
+      const r = await api("POST", "/split/scan", { address: addrField });
+      const coins = r.coins || [];
+      const pre = coins.filter((c) => c.needs_split);
+      const post = coins.length - pre.length;
+      if (pre.length === 0) {
+        step1.textContent = "No pre-fork coins to protect at this address." + postNote(post);
+      } else if (pre.length === 1) {
+        select(pre[0].txid, pre[0].vout, "Found 1 coin to protect, " + fmtSats(pre[0].value_sat) + " BTC." + postNote(post));
       } else {
-        step1.textContent = "This coin is already chain-specific; it does not need separating.";
-        build.disabled = true;
+        step1.textContent = "This address has " + pre.length + " coins to protect. Pick one:" + postNote(post);
+        pre.forEach((c) => {
+          const b = document.createElement("button");
+          b.className = "ghost";
+          b.style.margin = ".25rem .25rem 0 0";
+          b.textContent = fmtSats(c.value_sat) + " BTC  (" + shortTxid(c.txid) + ":" + c.vout + ")";
+          b.addEventListener("click", () => {
+            coinsBox.querySelectorAll("button").forEach((x) => (x.style.outline = ""));
+            b.style.outline = "2px solid var(--orange)";
+            select(c.txid, c.vout, "Selected " + fmtSats(c.value_sat) + " BTC.");
+          });
+          coinsBox.appendChild(b);
+        });
       }
-    } catch (e) { step1.textContent = "✗ " + splitErr(e); build.disabled = true; }
+    } catch (e) { step1.textContent = "✗ " + splitErr(e); }
   });
+
   $("#sp-build").addEventListener("click", async () => {
-    const c = splitCoin();
+    if (!splitJob.coin) { step1.textContent = "Find or pick a coin to protect first."; return; }
     const dest = $("#sp-dest").value.trim();
     if (!dest) { step1.textContent = "Enter your BTC (Blake2b) destination address first."; return; }
     step1.textContent = "Building the unsigned transaction…";
     try {
-      // The daemon validates the destination address here (right network, parseable) and confirms the
-      // coin is spendable; a bad address or coin comes back as a clear error, not a built tx.
-      const r = await api("POST", "/split/build", { sha_coins: [{ txid: c.txid, vout: c.vout }], dest });
+      const r = await api("POST", "/split/build", { sha_coins: [splitJob.coin], dest });
       splitJob.job_id = r.job_id;
       $("#sp-psbt").value = r.psbt;
       $("#sp-sign-card").classList.remove("hidden");
@@ -719,8 +754,8 @@ function loadSplit() {
       $("#sp-step3").textContent = r.final
         ? "✓ FINAL: replay not possible. Your BTC (SHA256) coin is now safe to spend."
         : r.separated
-          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations — wait a little longer."
-          : "Not separated yet — check the transaction confirmed on BTC (Blake2b).";
+          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations, wait a little longer."
+          : "Not separated yet. Check the transaction confirmed on BTC (Blake2b).";
     } catch (e) { $("#sp-step3").textContent = "✗ " + splitErr(e); }
   });
 }
