@@ -330,6 +330,10 @@ pub enum EngineError {
     /// was created at) but the pool has none: either never provisioned or already consumed. The
     /// engine cannot commit or settle the swap without the user's public claim/refund pubkey hashes.
     NoCommitment,
+    /// A signed spend was submitted whose signature does not verify against the parked sighash under
+    /// the submitted key (#240). The spend is left PARKED so the signer can retry with a correct
+    /// signature; nothing is broadcast or stored.
+    BadSignature,
 }
 
 impl From<NodeError> for EngineError {
@@ -941,6 +945,25 @@ impl<T: Transport> Engine<T> {
             return Err(EngineError::Node(NodeError::Unexpected(
                 "the swap changed while signing; re-request the spend signature".into(),
             )));
+        }
+        // Verify the submitted signature against the parked sighash under the submitted key before
+        // finalizing (#240). `finalize` checks only the pubkey hash and the preimage, not the
+        // signature. An honest backend already rejects an invalid-signature spend at broadcast (so the
+        // `?` below leaves the spend parked, not poisoned), but verifying locally first gives a precise
+        // retryable `BadSignature` instead of an opaque broadcast error, stops settlement relying on
+        // the backend to validate the script (an untrusted Electrum server in E1 mode), and rejects a
+        // high-S signature here. On failure leave the spend PARKED so the signer can retry: do not
+        // clear `pending_spend` or store a `spent_tx`.
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        if secp
+            .verify_ecdsa(
+                &bitcoin::secp256k1::Message::from_digest(unsigned.sighash),
+                &sig,
+                &pubkey.inner,
+            )
+            .is_err()
+        {
+            return Err(EngineError::BadSignature);
         }
         let tx = unsigned
             .finalize(sig, pubkey, preimage)
