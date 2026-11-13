@@ -38,6 +38,16 @@ key, no funding key, and no secret, by construction, and the daemon fails closed
   to be on, publish the node's relay in a directory for federation (0029), and surface the profile in
   the config UI. Those are additive.
 
+## Requires the hosted layer (not for a standalone node)
+
+`public_relay` forces `user_held_spends` on, so the engine signs no claim/refund itself: a browser (the
+hosted multi-tenant layer) must provision commitment bundles and sign. On a STANDALONE node with no such
+browser, every swap stalls, a taker bid is refused for want of a commitment, an incoming bid is dropped,
+and a parked spend is never signed. The daemon cannot tell from startup whether a hosted layer is in
+front, so it cannot fail closed; it logs a loud warning instead. Set `public_relay` only behind the
+hosted layer. A standalone operator who wants keys off the infra uses cold or interactive funding with
+`public_relay=false` (local claim/refund signing is correct there).
+
 ## Tests
 
 `engine_config` forces `user_held_spends` on under `public_relay` (unit, mutation-verified). The

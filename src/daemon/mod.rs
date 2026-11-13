@@ -269,6 +269,19 @@ impl Daemon {
                     ));
                 }
             }
+            // public_relay forces user_held_spends on (engine_config), so the engine signs no
+            // claim/refund itself: a BROWSER (the hosted layer) must provision commitment bundles and
+            // sign. On a STANDALONE node with no such browser, every swap stalls (a taker bid is
+            // refused for want of a commitment, an incoming bid is dropped, and a parked spend is never
+            // signed). We cannot detect from here whether a hosted layer is present, so warn loudly
+            // rather than fail: set public_relay only behind the hosted browser layer, not on a plain
+            // standalone node (use cold/interactive funding there instead).
+            eprintln!(
+                "WARNING: public_relay is on, so this node signs no claim/refund itself and needs the \
+                 hosted browser layer to provision commitments and sign. On a standalone node without \
+                 it, swaps will stall. If this is a standalone node, set public_relay=false and use \
+                 cold or interactive funding instead."
+            );
         }
         // A wallet name unique to this daemon's identity, so two daemons sharing one pair of nodes
         // (as in tests, or a shared node setup) do not collide on the same wallet.
