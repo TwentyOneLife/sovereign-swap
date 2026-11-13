@@ -1372,6 +1372,55 @@ impl Daemon {
         if !self.engine_running() {
             return Self::not_running();
         }
+        // Take-side market band check (design 0025: the "pre-take" half of the local checks). The
+        // publish-time band check (post_offer) does not protect a TAKER: an offer may have been
+        // published before #208, by a peer that does not enforce the band, or priced when the market
+        // sat elsewhere, yet it still shows in /offers and stays takeable. Re-validate the offer's
+        // implied price against THIS node's live reference and refuse an off-market take, so no swap
+        // ever executes outside the band regardless of how the offer was posted. Liveness over the
+        // feed: when the reference is off or unavailable, or the offer is not in view, we do not block
+        // the take (mirrors post_offer, which only hard-requires a reference on the market-derived
+        // publish path).
+        {
+            let (price_ref_on, band_pct, relays, tor_socks) = {
+                let s = &self.state.lock().unwrap().settings;
+                (
+                    s.price_reference,
+                    s.price_band_pct,
+                    s.relays.clone(),
+                    resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                )
+            };
+            if price_ref_on {
+                if let Ok(offers) = self.engine_call(EngineCmd::Offers) {
+                    if let Some((offer, _)) = offers.iter().find(|(o, _)| o.id == offer_id) {
+                        // The offer carries the swap-layer Chain; pricing takes the daemon Chain.
+                        let sell_chain = match offer.maker_chain {
+                            crate::swap::Chain::Btc => Chain::Btc,
+                            crate::swap::Chain::Xbtc => Chain::Xbtc,
+                        };
+                        let market = self
+                            .reference
+                            .get(&relays, &tor_socks)
+                            .ok()
+                            .and_then(|(r, _)| crate::pricing::market_price(sell_chain, r.rate));
+                        if let Some(m) = market {
+                            let price = offer.taker_amount.to_sat() as f64
+                                / offer.maker_amount.to_sat() as f64;
+                            if !crate::pricing::in_band(price, m, band_pct) {
+                                let (lo, hi) = crate::pricing::band_range(m, band_pct);
+                                return (
+                                    422,
+                                    json!({"error": format!(
+                                        "offer price {price:.8} is outside {band_pct}% of the market rate {m:.8} (allowed {lo:.8}..{hi:.8}); the offer may be stale - refusing an off-market take"
+                                    )}),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let maker_part = Amount::from_sat(take.amount_sat);
         match self.engine_call(move |reply| EngineCmd::Take {
             offer_id,
