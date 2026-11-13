@@ -1714,21 +1714,34 @@ impl<T: Transport> Engine<T> {
                 let spend_chain = own_chain.other();
                 if self.config.user_held_spends {
                     // 0027: do not sign; park the unsigned claim for the user to sign. Build once and
-                    // keep it (the parked sighash stays stable across ticks) at the floor fee; nothing
-                    // is broadcast until submit_signed_spend.
+                    // keep it (the parked sighash stays stable across ticks); nothing is broadcast until
+                    // submit_signed_spend. Fee it by the real signed vsize via the SAME rate_spend path
+                    // as the local claim, estimated with a dummy-witness probe since a user-held spend
+                    // cannot sign to measure.
                     if self.records[i].pending_spend.is_none() {
+                        let probe = |fee: Amount| {
+                            other_contract.claim_probe(&Spend {
+                                outpoint: lock,
+                                value: other_amount,
+                                destination: record.claim_to.clone(),
+                                fee,
+                            })
+                        };
+                        let (_, fee) = self
+                            .rate_spend(spend_chain, record.spend_fee_sat, probe)
+                            .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
                         let spend = Spend {
                             outpoint: lock,
                             value: other_amount,
                             destination: record.claim_to.clone(),
-                            fee: self.config.min_spend_fee,
+                            fee,
                         };
                         let unsigned = other_contract
                             .claim_unsigned(&spend, &preimage)
                             .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
                         self.records[i].pending_spend = Some(PendingSpend {
                             claim: true,
-                            fee_sat: spend.fee.to_sat(),
+                            fee_sat: fee.to_sat(),
                             sighash: unsigned.sighash,
                         });
                         self.save(&self.records[i])?;
@@ -1753,20 +1766,32 @@ impl<T: Transport> Engine<T> {
             }
             Action::Refund { lock, value } => {
                 if self.config.user_held_spends {
-                    // 0027: park the unsigned refund for the user to sign (see the claim arm).
+                    // 0027: park the unsigned refund for the user to sign (see the claim arm), fee'd by
+                    // the real signed vsize via rate_spend + a dummy-witness probe.
                     if self.records[i].pending_spend.is_none() {
+                        let probe = |fee: Amount| {
+                            own_contract.refund_probe(&Spend {
+                                outpoint: lock,
+                                value,
+                                destination: record.refund_to.clone(),
+                                fee,
+                            })
+                        };
+                        let (_, fee) = self
+                            .rate_spend(own_chain, record.spend_fee_sat, probe)
+                            .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
                         let spend = Spend {
                             outpoint: lock,
                             value,
                             destination: record.refund_to.clone(),
-                            fee: self.config.min_spend_fee,
+                            fee,
                         };
                         let unsigned = own_contract
                             .refund_unsigned(&spend)
                             .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
                         self.records[i].pending_spend = Some(PendingSpend {
                             claim: false,
-                            fee_sat: spend.fee.to_sat(),
+                            fee_sat: fee.to_sat(),
                             sighash: unsigned.sighash,
                         });
                         self.save(&self.records[i])?;

@@ -243,6 +243,42 @@ impl Contract {
             script: self.script(),
         })
     }
+
+    /// A claim spend with a DUMMY witness of the real signed size, for fee estimation only (0027
+    /// user-held spends, which cannot sign to measure vsize). NOT valid to broadcast; feed it to
+    /// `rate_spend` to fee the eventual user-signed claim by its real vsize.
+    pub fn claim_probe(&self, spend: &Spend) -> Result<Transaction, SpendError> {
+        self.probe(spend, Sequence::ENABLE_RBF_NO_LOCKTIME, true)
+    }
+
+    /// A refund spend with a dummy witness of the real signed size, for fee estimation (see
+    /// [`claim_probe`](Self::claim_probe)).
+    pub fn refund_probe(&self, spend: &Spend) -> Result<Transaction, SpendError> {
+        self.probe(spend, Sequence::from_height(self.lock_blocks), false)
+    }
+
+    fn probe(
+        &self,
+        spend: &Spend,
+        sequence: Sequence,
+        claim: bool,
+    ) -> Result<Transaction, SpendError> {
+        let mut tx = unsigned_spend(spend, sequence)?;
+        // Dummy items at the maximum real sizes: a 72-byte DER signature + the sighash-type byte (73),
+        // a 33-byte compressed pubkey, and for a claim the 32-byte preimage + the 1-byte branch
+        // selector. The script is real. A real signature is no larger, so the fee never underpays;
+        // `rate_spend` adds a further +1 vB for signature-length variance.
+        let mut items = vec![vec![0u8; 73], vec![0u8; 33]];
+        if claim {
+            items.push(vec![0u8; 32]);
+            items.push(vec![1u8]);
+        } else {
+            items.push(Vec::new());
+        }
+        items.push(self.script().into_bytes());
+        tx.input[0].witness = Witness::from_slice(&items);
+        Ok(tx)
+    }
 }
 
 /// The non-signature half of a claim/refund witness: a claim pushes the preimage and the branch
@@ -627,6 +663,35 @@ mod tests {
             unsigned2.finalize(sig2, wrong_pub),
             Err(SpendError::WrongKey)
         );
+    }
+
+    #[test]
+    fn the_fee_probe_matches_the_signed_spend_size() {
+        // 0027: the dummy-witness probe used to rate a user-held spend's fee must be at least the real
+        // signed size (so the fee never underpays) and within ~1 vB of it (so it does not overpay).
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = PublicKey::new(key.public_key(&secp));
+        let preimage = [9u8; 32];
+        let c = Contract {
+            secret_hash: sha256::Hash::hash(&preimage).to_byte_array(),
+            claim_pkh: pubkey.pubkey_hash(),
+            refund_pkh: pubkey.pubkey_hash(),
+            ..contract()
+        };
+        let signed_claim = c.claim(&secp, &spend(), &key, &preimage).unwrap();
+        let probe_claim = c.claim_probe(&spend()).unwrap();
+        assert!(
+            probe_claim.vsize() >= signed_claim.vsize(),
+            "claim probe {} must not underpay the real claim {}",
+            probe_claim.vsize(),
+            signed_claim.vsize()
+        );
+        assert!(probe_claim.vsize() <= signed_claim.vsize() + 1);
+        let signed_refund = c.refund(&secp, &spend(), &key).unwrap();
+        let probe_refund = c.refund_probe(&spend()).unwrap();
+        assert!(probe_refund.vsize() >= signed_refund.vsize());
+        assert!(probe_refund.vsize() <= signed_refund.vsize() + 1);
     }
 
     #[test]
