@@ -848,7 +848,32 @@ mod tests {
         }
     }
 
+    /// A source that reports the node's "no such transaction" (-5), exactly as a real Blake2b node
+    /// does for a txid that is not on its chain. Used to pin the error shape the daemon maps to the
+    /// plain-language #200 message.
+    struct NotFound;
+    impl TxSource for NotFound {
+        fn tx(&self, _txid: &str) -> Result<TxInfo, SplitError> {
+            Err(SplitError::Rpc(RpcError::Rpc {
+                code: -5,
+                message: "No such mempool or blockchain transaction".to_owned(),
+            }))
+        }
+    }
+
     const FORK: u32 = 100;
+
+    #[test]
+    fn a_coin_absent_from_the_chain_surfaces_as_rpc_minus5() {
+        // classify of a txid not on the Blake2b chain propagates the node's -5 as SplitError::Rpc, the
+        // shape split_classify matches to return a plain "not on the Blake2b chain" 422 (#200) instead
+        // of leaking the raw node error.
+        let err = classify(&NotFound, FORK, "ghost", 50).unwrap_err();
+        assert!(matches!(
+            err,
+            SplitError::Rpc(RpcError::Rpc { code: -5, .. })
+        ));
+    }
 
     #[test]
     fn a_prefork_coinbase_is_a_sha_coin() {

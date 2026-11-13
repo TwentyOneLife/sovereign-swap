@@ -895,6 +895,15 @@ impl Daemon {
                     "needs_split": kind.needs_split(),
                 }),
             ),
+            // A -5 "no such transaction" on the first fetch means the coin is not on the Blake2b chain
+            // at all (#200): the user pasted a post-fork chain-exclusive coin or a wrong txid. That is
+            // an ineligible input, not a node fault, so return a plain-language 422 instead of leaking
+            // the raw RPC error. (classify needs a synced txindex; if the coin is genuinely a pre-fork
+            // one, a -5 would instead mean the node's txindex is not caught up, noted in the message.)
+            Err(crate::split::SplitError::Rpc(crate::rpc::RpcError::Rpc { code: -5, .. })) => (
+                422,
+                json!({"error": "this transaction is not found on the Blake2b chain, so it has no pre-fork counterpart to protect: only a pre-fork coin (present on both chains) needs separating. If you expected it here, check the txid is a Blake2b-chain coin and that the node's txindex is synced."}),
+            ),
             Err(e) => (502, json!({"error": e.to_string()})),
         }
     }
