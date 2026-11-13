@@ -464,6 +464,14 @@ impl<T: Transport> Engine<T> {
             return;
         }
         self.last_reannounce = Instant::now();
+        // Maker-set expiry (design 0026, #212): stop re-announcing an expired own offer and drop it, so
+        // it is not kept alive by our own re-announce past its deadline.
+        let now = now_unix();
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| !o.is_expired(now));
+        if self.state.own_offers.len() != before {
+            let _ = self.save_state();
+        }
         for offer in &self.state.own_offers {
             self.transport.send(&Message::Offer(offer.clone()));
         }
@@ -584,9 +592,13 @@ impl<T: Transport> Engine<T> {
 
     /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
     pub fn seen_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
+        let now = now_unix();
         self.state
             .seen_offers
             .iter()
+            // Maker-set expiry (design 0026, #212): an expired offer is dropped from the market view so
+            // it is never shown or taken, independent of the re-announce TTL.
+            .filter(|o| !o.is_expired(now))
             .map(|o| {
                 let t = self
                     .state
@@ -816,6 +828,10 @@ impl<T: Transport> Engine<T> {
     ) -> Result<(), EngineError> {
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
+        }
+        // Maker-set expiry (design 0026, #212): never commit to an expired offer. Local refusal.
+        if offer.is_expired(now_unix()) {
+            return Err(EngineError::Bid(BidError::Expired));
         }
         let taker_part = offer
             .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
@@ -1685,6 +1701,7 @@ mod tests {
             taker_lock_depth: 2,
             margin_blocks: 3,
             fee: None,
+            valid_until: None,
         };
         let now = 1_000_000u64;
         let mut seen_offers = vec![offer(1), offer(2), offer(3)];
@@ -1730,6 +1747,7 @@ mod tests {
             taker_lock_depth: 2,
             margin_blocks: 3,
             fee: None,
+            valid_until: None,
         };
         let t0 = 1_000_000u64;
         let mut seen_offers = vec![offer(1), offer(2)];

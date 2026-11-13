@@ -62,6 +62,8 @@ pub(crate) const TAKER_LOCK_BLOCKS: u16 = 20;
 pub(crate) enum EngineCmd {
     Publish(SwapOffer, Sender<Result<(), String>>),
     Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
+    /// Our own live offers, for the "My offers" view so the maker can withdraw them (#211).
+    OwnOffers(Sender<Vec<SwapOffer>>),
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
@@ -200,6 +202,9 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
         EngineCmd::Offers(reply) => {
             let _ = reply.send(engine.seen_offers_with_time());
         }
+        EngineCmd::OwnOffers(reply) => {
+            let _ = reply.send(engine.own_offers().to_vec());
+        }
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
             let _ = reply.send(views);
@@ -304,6 +309,8 @@ pub(crate) fn offer_to_json(o: &SwapOffer, seen_at: Option<u64>) -> Value {
         "taker_lock_blocks": o.taker_lock_blocks,
         // When this node last saw the offer on its market (#88), for the time column.
         "seen_at": seen_at,
+        // Maker-set expiry (design 0026, #212): unix seconds, or null for no explicit expiry.
+        "valid_until": o.valid_until,
     })
 }
 
@@ -372,6 +379,7 @@ mod tests {
             taker_lock_depth: 1,
             margin_blocks: 6,
             fee: None,
+            valid_until: None,
         }
     }
 

@@ -641,6 +641,7 @@ impl Daemon {
             ("GET", "/status") => (200, self.status()),
             ("GET", "/reference-rate") => self.reference_rate(),
             ("GET", "/offers") => self.get_offers(),
+            ("GET", "/my-offers") => self.get_my_offers(),
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
@@ -798,6 +799,24 @@ impl Daemon {
                 json!(offers
                     .iter()
                     .map(|(o, seen_at)| offer_to_json(o, *seen_at))
+                    .collect::<Vec<_>>()),
+            ),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// The maker's own live offers (#211), so the UI can list them with a Withdraw button. Distinct
+    /// from GET /offers, which is the market (other peers' offers, with our own filtered out).
+    fn get_my_offers(&self) -> (u16, Value) {
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(EngineCmd::OwnOffers) {
+            Ok(offers) => (
+                200,
+                json!(offers
+                    .iter()
+                    .map(|o| offer_to_json(o, None))
                     .collect::<Vec<_>>()),
             ),
             Err(e) => (503, json!({ "error": e })),

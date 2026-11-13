@@ -139,6 +139,19 @@ pub struct Offer {
     /// from before the fee existed still deserialize.
     #[serde(default)]
     pub fee: Option<FeeTerms>,
+    /// Maker-set expiry (design 0026, #212): unix seconds after which the offer is no longer valid.
+    /// `None` is no explicit expiry (the client's re-announce TTL still ages it out). `serde(default)`
+    /// so older offers deserialize, and `Offer` carries no `deny_unknown_fields`, so an older peer
+    /// ignores it. Not part of the random offer id, so adding it is backward compatible on both sides.
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+}
+
+impl Offer {
+    /// Whether the maker-set expiry (if any) has passed at `now_secs` (design 0026, #212).
+    pub fn is_expired(&self, now_secs: u64) -> bool {
+        self.valid_until.is_some_and(|t| now_secs >= t)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -146,6 +159,8 @@ pub enum BidError {
     BelowMinimum,
     AboveOffer,
     OwnOffer,
+    /// The offer's maker-set expiry has passed (design 0026, #212). Local refusal.
+    Expired,
     /// The taker's own voluntary fee would exceed the per-trade sanity band (F3). Local refusal.
     FeeTooHigh,
     /// The swap's real-value (BTC) leg exceeds the local beta cap (#103). Local refusal, never part
@@ -561,6 +576,16 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::Txid;
 
+    #[test]
+    fn offer_expiry_is_honoured() {
+        let mut o = offer();
+        assert!(!o.is_expired(1_000), "no expiry set");
+        o.valid_until = Some(2_000);
+        assert!(!o.is_expired(1_999));
+        assert!(o.is_expired(2_000), "at the deadline it is expired");
+        assert!(o.is_expired(2_001));
+    }
+
     fn offer() -> Offer {
         Offer {
             id: [1; 16],
@@ -574,6 +599,7 @@ mod tests {
             taker_lock_depth: 2,
             margin_blocks: 3,
             fee: None,
+            valid_until: None,
         }
     }
 
