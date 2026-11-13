@@ -140,3 +140,100 @@ fn an_oversize_body_is_capped_and_the_daemon_keeps_serving() {
     // The daemon is unharmed and still answers a normal request.
     assert_eq!(request(&addr, "GET", "/status", Some(&token), "").0, 200);
 }
+
+fn signed_spend_path(id: &str) -> String {
+    format!("/swaps/{id}/signed-spend")
+}
+
+// A DER ECDSA signature (r=1, s=1) and the generator-point compressed pubkey: both parse, so the
+// handler reaches the running-engine gate rather than a parse error (0027, /signed-spend).
+const SIG_HEX: &str = "3006020101020101";
+const PUBKEY_HEX: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+#[test]
+fn the_signed_spend_route_needs_the_token() {
+    let (addr, token) = daemon();
+    let path = signed_spend_path(HEX32);
+    let body = format!(r#"{{"sig":"{SIG_HEX}","pubkey":"{PUBKEY_HEX}"}}"#);
+    assert_eq!(request(&addr, "POST", &path, None, &body).0, 401);
+    assert_eq!(
+        request(&addr, "POST", &path, Some("deadbeef"), &body).0,
+        401
+    );
+    // Valid inputs parse; with no engine the handler reaches the running-engine gate (503).
+    assert_eq!(request(&addr, "POST", &path, Some(&token), &body).0, 503);
+}
+
+#[test]
+fn signed_spend_rejects_a_bad_swap_id() {
+    let (addr, token) = daemon();
+    let body = format!(r#"{{"sig":"{SIG_HEX}","pubkey":"{PUBKEY_HEX}"}}"#);
+    let not_hex = "z".repeat(32);
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            &signed_spend_path(&not_hex),
+            Some(&token),
+            &body
+        )
+        .0,
+        400
+    );
+    for bad in ["aa_bb", &"a".repeat(100)] {
+        assert_eq!(
+            request(&addr, "POST", &signed_spend_path(bad), Some(&token), &body).0,
+            404
+        );
+    }
+}
+
+#[test]
+fn signed_spend_rejects_a_bad_body_sig_or_pubkey() {
+    let (addr, token) = daemon();
+    let path = signed_spend_path(HEX32);
+    // Not JSON, and missing a required field.
+    assert_eq!(
+        request(&addr, "POST", &path, Some(&token), "not json").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", &path, Some(&token), r#"{"sig":"00"}"#).0,
+        400
+    );
+    // Non-hex sig, and valid-hex but invalid DER sig.
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            &path,
+            Some(&token),
+            &format!(r#"{{"sig":"zz","pubkey":"{PUBKEY_HEX}"}}"#)
+        )
+        .0,
+        400
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            &path,
+            Some(&token),
+            &format!(r#"{{"sig":"00","pubkey":"{PUBKEY_HEX}"}}"#)
+        )
+        .0,
+        400
+    );
+    // Bad pubkey.
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            &path,
+            Some(&token),
+            &format!(r#"{{"sig":"{SIG_HEX}","pubkey":"00"}}"#)
+        )
+        .0,
+        400
+    );
+}

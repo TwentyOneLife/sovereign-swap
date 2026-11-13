@@ -152,6 +152,24 @@ pub struct Config {
     /// void. Kept per chain because the two chains share Bitcoin's address format.
     pub btc_payout: Option<String>,
     pub xbtc_payout: Option<String>,
+    /// User-held claim/refund signing (0027, the 2b non-custodial core). When true, the engine does NOT
+    /// sign claim or refund spends with its own keys: it builds the unsigned spend, parks it on the
+    /// record (`pending_spend`) for the user to sign, and `submit_signed_spend` finalizes + broadcasts.
+    /// Default `false` keeps today's behaviour (the engine signs locally), so the current product and
+    /// the self-hosted (2a) client, where the per-swap keys are legitimately the user's own, are
+    /// untouched. Gates only the SIGNATURE; the preimage is still engine-side until a later slice.
+    pub user_held_spends: bool,
+}
+
+/// A claim or refund that is built but awaiting the user's signature (0027, user-held spends): which
+/// spend it is, the fee it was built at (so `submit_signed_spend` rebuilds the byte-identical
+/// transaction), and the sighash the user signs with the claim/refund key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingSpend {
+    /// True for a claim, false for a refund.
+    pub claim: bool,
+    pub fee_sat: u64,
+    pub sighash: [u8; 32],
 }
 
 /// What a swap needs besides its state: where our coins go, and our lock once signed.
@@ -168,6 +186,11 @@ pub struct Record {
     /// older records, hence `serde(default)`.
     #[serde(default)]
     pub pending_lock_psbt: Option<String>,
+    /// A claim or refund built but awaiting the user's signature (0027, user-held spends). Set when
+    /// `Action::Claim`/`Action::Refund` is parked under `Config::user_held_spends`, cleared when
+    /// `submit_signed_spend` broadcasts. `serde(default)` so older records load.
+    #[serde(default)]
+    pub pending_spend: Option<PendingSpend>,
     /// E2 (design 0019): the txid of the funding lock we handed the user to sign, kept as a watch that
     /// outlives `pending_lock_psbt`. The prompt (`pending_lock_psbt`) is cleared the moment the swap
     /// stops awaiting a signature (adopted, settled, or abandoned), so the UI never asks the user to
@@ -746,6 +769,110 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// Resume a user-held claim/refund (0027): the user signed the parked spend's sighash, so assemble
+    /// it with their signature and broadcast. Mirrors `submit_signed_lock`'s guard: it re-decides
+    /// against a fresh chain view and only broadcasts if claim/refund is still the move. A terminal
+    /// swap drops the park and refuses for good (`NoLongerFundable`); any other non-spend result is a
+    /// retryable "not yet" (`NotYetFundable`). The spend is rebuilt at the parked fee, and its sighash
+    /// must match what the user signed, so a swap that changed underneath them is refused, not
+    /// broadcast with a signature that would not verify.
+    pub fn submit_signed_spend(
+        &mut self,
+        swap_id: [u8; 16],
+        sig: bitcoin::secp256k1::ecdsa::Signature,
+        pubkey: bitcoin::PublicKey,
+    ) -> Result<(), EngineError> {
+        let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) else {
+            return Err(EngineError::NoSuchSwap);
+        };
+        let Some(pending) = self.records[i].pending_spend.clone() else {
+            return Err(EngineError::Node(NodeError::Unexpected(
+                "swap is not awaiting a spend signature".into(),
+            )));
+        };
+        let view = self.view(&self.records[i])?;
+        let secret = (self.records[i].swap.role == Role::Maker)
+            .then(|| self.keys.secret(self.records[i].swap.key_index));
+        let action = self.records[i]
+            .swap
+            .decide(&view, secret)
+            .into_iter()
+            .find(|a| matches!(a, Action::Claim { .. } | Action::Refund { .. }));
+        let Some(action) = action else {
+            if matches!(
+                self.records[i].swap.phase,
+                Phase::Abandoned | Phase::Done | Phase::Refunded | Phase::Refunding
+            ) {
+                self.records[i].pending_spend = None;
+                self.save(&self.records[i])?;
+                return Err(EngineError::NoLongerFundable);
+            }
+            return Err(EngineError::NotYetFundable);
+        };
+        let swap = self.records[i].swap.clone();
+        let (own_chain, own_contract, other_contract, other_amount) = match swap.role {
+            Role::Maker => (
+                swap.offer.maker_chain,
+                &swap.maker_contract,
+                &swap.taker_contract,
+                swap.taker_part,
+            ),
+            Role::Taker => (
+                swap.offer.maker_chain.other(),
+                &swap.taker_contract,
+                &swap.maker_contract,
+                swap.maker_part,
+            ),
+        };
+        let fee = Amount::from_sat(pending.fee_sat);
+        let (chain, unsigned) = match action {
+            Action::Claim { lock, preimage } => {
+                let spend = Spend {
+                    outpoint: lock,
+                    value: other_amount,
+                    destination: self.records[i].claim_to.clone(),
+                    fee,
+                };
+                (
+                    own_chain.other(),
+                    other_contract
+                        .claim_unsigned(&spend, &preimage)
+                        .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?,
+                )
+            }
+            Action::Refund { lock, value } => {
+                let spend = Spend {
+                    outpoint: lock,
+                    value,
+                    destination: self.records[i].refund_to.clone(),
+                    fee,
+                };
+                (
+                    own_chain,
+                    own_contract
+                        .refund_unsigned(&spend)
+                        .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?,
+                )
+            }
+            _ => unreachable!("filtered to Claim/Refund above"),
+        };
+        if unsigned.sighash != pending.sighash {
+            self.records[i].pending_spend = None;
+            self.save(&self.records[i])?;
+            return Err(EngineError::Node(NodeError::Unexpected(
+                "the swap changed while signing; re-request the spend signature".into(),
+            )));
+        }
+        let tx = unsigned
+            .finalize(sig, pubkey)
+            .map_err(|e| NodeError::Unexpected(format!("finalize: {e:?}")))?;
+        self.backend(chain).broadcast(&tx)?;
+        self.records[i].pending_spend = None;
+        self.records[i].spend_fee_sat = Some(pending.fee_sat);
+        self.save(&self.records[i])?;
+        Ok(())
+    }
+
     /// The unsigned funding PSBT a swap is parked on, for the user to sign (E2, design 0017); `None`
     /// when the swap is not awaiting a funding signature.
     pub fn pending_lock_psbt(&self, id: [u8; 16]) -> Option<String> {
@@ -1121,6 +1248,7 @@ impl<T: Transport> Engine<T> {
             refund_to: self.destination(refund_chain)?,
             funding: None,
             pending_lock_psbt: None,
+            pending_spend: None,
             expected_lock_txid: None,
             watch_from_height: None,
             fee: None,
@@ -1584,6 +1712,29 @@ impl<T: Transport> Engine<T> {
             },
             Action::Claim { lock, preimage } => {
                 let spend_chain = own_chain.other();
+                if self.config.user_held_spends {
+                    // 0027: do not sign; park the unsigned claim for the user to sign. Build once and
+                    // keep it (the parked sighash stays stable across ticks) at the floor fee; nothing
+                    // is broadcast until submit_signed_spend.
+                    if self.records[i].pending_spend.is_none() {
+                        let spend = Spend {
+                            outpoint: lock,
+                            value: other_amount,
+                            destination: record.claim_to.clone(),
+                            fee: self.config.min_spend_fee,
+                        };
+                        let unsigned = other_contract
+                            .claim_unsigned(&spend, &preimage)
+                            .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
+                        self.records[i].pending_spend = Some(PendingSpend {
+                            claim: true,
+                            fee_sat: spend.fee.to_sat(),
+                            sighash: unsigned.sighash,
+                        });
+                        self.save(&self.records[i])?;
+                    }
+                    return Ok(());
+                }
                 let key = self.keys.key(swap.key_index, Use::Claim);
                 let secp = self.keys.secp();
                 let build = |fee| {
@@ -1601,6 +1752,27 @@ impl<T: Transport> Engine<T> {
                 (spend_chain, tx, Some(fee.to_sat()))
             }
             Action::Refund { lock, value } => {
+                if self.config.user_held_spends {
+                    // 0027: park the unsigned refund for the user to sign (see the claim arm).
+                    if self.records[i].pending_spend.is_none() {
+                        let spend = Spend {
+                            outpoint: lock,
+                            value,
+                            destination: record.refund_to.clone(),
+                            fee: self.config.min_spend_fee,
+                        };
+                        let unsigned = own_contract
+                            .refund_unsigned(&spend)
+                            .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
+                        self.records[i].pending_spend = Some(PendingSpend {
+                            claim: false,
+                            fee_sat: spend.fee.to_sat(),
+                            sighash: unsigned.sighash,
+                        });
+                        self.save(&self.records[i])?;
+                    }
+                    return Ok(());
+                }
                 let key = self.keys.key(swap.key_index, Use::Refund);
                 let secp = self.keys.secp();
                 let build = |fee| {

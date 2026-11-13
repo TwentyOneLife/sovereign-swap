@@ -29,6 +29,7 @@ fn config() -> Config {
         },
         btc_payout: None,
         xbtc_payout: None,
+        user_held_spends: false,
     }
 }
 
