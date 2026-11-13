@@ -5,15 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>sovereign-swap</title>
+<!-- Favicon: the StartOS package icon (logo-source.svg), inlined so it needs no served route. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiB2aWV3Qm94PSIwIDAgNTEyIDUxMiI+PGNpcmNsZSBjeD0iMjU2IiBjeT0iMjU2IiByPSIyMzYuMCIgZmlsbD0iIzFiMWIxYiIgc3Ryb2tlPSIjRjc5MzFBIiBzdHJva2Utd2lkdGg9IjE2LjAiLz48cGF0aCBkPSJNIDMxMCAxNzAgTCAxOTYgMTcwIEwgMTk2IDIzOCBMIDMxNiAyMzggTCAzMTYgMzQyIEwgMjAyIDM0MiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjRjc5MzFBIiBzdHJva2Utd2lkdGg9IjQwIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48cG9seWdvbiBwb2ludHM9IjM1Ni4wLDE3MC4wIDMxMC4wLDIwNC4wIDMxMC4wLDEzNi4wIiBmaWxsPSIjRjc5MzFBIi8+PHBvbHlnb24gcG9pbnRzPSIxNTYuMCwzNDIuMCAyMDIuMCwzMDguMCAyMDIuMCwzNzYuMCIgZmlsbD0iI0Y3OTMxQSIvPjwvc3ZnPg==">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body data-token="__TOKEN__">
 <header>
-  <div class="brand">⇄ <strong>sovereign-swap</strong></div>
+  <div class="brand"><img class="brandicon" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiB2aWV3Qm94PSIwIDAgNTEyIDUxMiI+PGNpcmNsZSBjeD0iMjU2IiBjeT0iMjU2IiByPSIyMzYuMCIgZmlsbD0iIzFiMWIxYiIgc3Ryb2tlPSIjRjc5MzFBIiBzdHJva2Utd2lkdGg9IjE2LjAiLz48cGF0aCBkPSJNIDMxMCAxNzAgTCAxOTYgMTcwIEwgMTk2IDIzOCBMIDMxNiAyMzggTCAzMTYgMzQyIEwgMjAyIDM0MiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjRjc5MzFBIiBzdHJva2Utd2lkdGg9IjQwIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48cG9seWdvbiBwb2ludHM9IjM1Ni4wLDE3MC4wIDMxMC4wLDIwNC4wIDMxMC4wLDEzNi4wIiBmaWxsPSIjRjc5MzFBIi8+PHBvbHlnb24gcG9pbnRzPSIxNTYuMCwzNDIuMCAyMDIuMCwzMDguMCAyMDIuMCwzNzYuMCIgZmlsbD0iI0Y3OTMxQSIvPjwvc3ZnPg==" alt=""> <strong>sovereign-swap</strong></div>
   <nav>
-    <button class="tab active" data-tab="market" title="Offers from other people">Market</button>
-    <button class="tab" data-tab="swaps" title="Swaps in progress right now">Swaps</button>
-    <button class="tab" data-tab="history" title="Settled swaps, with realized rate, fees and totals">History</button>
+    <button class="tab active" data-tab="market" title="Offers from other people"><span class="tico">☰</span> Market</button>
+    <button class="tab" data-tab="swaps" title="Swaps in progress right now"><span class="tico">⟳</span> Swaps</button>
+    <button class="tab" data-tab="split" title="Separate a pre-fork coin so it cannot be replayed"><span class="tico">✂︎</span> Split</button>
+    <button class="tab" data-tab="history" title="Settled swaps, with realized rate, fees and totals"><span class="tico">↺</span> History</button>
   </nav>
   <div id="status" class="status" title="Node and Tor connectivity">…</div>
 </header>
@@ -26,6 +29,11 @@
       <button id="new-offer" class="primary">+ Create offer</button>
     </div>
     <p class="muted">Offers are public. Identities are not - only a throwaway routing key.</p>
+    <div id="my-offers" class="card hidden">
+      <h2 title="Offers you have published. Withdraw one you can no longer back.">My offers</h2>
+      <div id="my-offers-list"></div>
+      <p id="my-offers-msg" class="muted"></p>
+    </div>
     <table id="offers">
       <thead><tr>
         <th title="The chain the maker is selling">Selling</th>
@@ -70,12 +78,97 @@
     <p id="history-empty" class="muted center">No settled swaps yet.</p>
   </section>
 
+  <!-- SPLIT -->
+  <section id="split" class="view">
+    <h1>Protect your BTC (Blake2b) coins</h1>
+    <div class="card">
+      <p>Do you hold Bitcoin from before the fork (block 961,632, on 30 Aug 2026)? Each of those coins
+      also exists on the <strong>BTC (Blake2b)</strong> chain under the same key. Until you separate the
+      two, a spend on one chain can be copied ("replayed") onto the other. This service separates them
+      safely, so your BTC (Blake2b) coins become yours alone and can never be replayed.</p>
+      <p><strong>What you need.</strong> A BTC (Blake2b) wallet to receive the separated coins: use
+      <strong>Shrike</strong>
+      (<a href="https://github.com/privkeyio/shrike" target="_blank" rel="noopener noreferrer">desktop app</a>,
+      or <a href="https://github.com/TwentyOneLife/shrike-startos" target="_blank" rel="noopener noreferrer">on StartOS</a>).
+      Your existing BTC (SHA256) wallet, for example <strong>Sparrow</strong>, holds the pre-fork coin and
+      signs the move. Your BTC (SHA256) coin itself is never moved: it stays exactly where it is and
+      simply becomes safe to spend.</p>
+      <p class="muted">We lend a BTC (Blake2b) "marker" coin and take it back, so the move cannot exist on
+      the BTC (SHA256) chain. You sign on your own device (non-custodial); we only co-sign the marker.
+      Fee 0.5% of the coin, taken in BTC (Blake2b).
+      <a href="https://twentyonelife.github.io/sovereign-swap/guides/protect-your-coins" target="_blank" rel="noopener noreferrer">Learn how it works</a>.</p>
+    </div>
+    <div class="card">
+      <h2>1. Your coin, and where to send it</h2>
+      <label title="Your BTC (SHA256) address that holds the pre-fork coin, from Sparrow. We look up the coins at this address for you, so you do not have to find a transaction id. Paste a receive address from Sparrow.">
+        Your BTC (SHA256) address to protect, from Sparrow
+        <input id="sp-addr" placeholder="a BTC (SHA256) address you control"
+          title="We scan this address for its coins. A receive address from Sparrow.">
+      </label>
+      <details id="sp-adv">
+        <summary class="muted" style="cursor:pointer">Advanced: use one specific coin instead of an address</summary>
+        <label title="A specific coin as txid:vout. In Sparrow, UTXOs tab, right-click a coin, copy its transaction id, then add its output number (usually 0), like abcd...:0.">
+          Specific coin (transaction id and output number)
+          <input id="sp-coin" placeholder="e.g. 9f86d0b0ff...:0"
+            title="Sparrow UTXOs tab: right-click a coin, copy its transaction id, then add its output number (e.g. :0).">
+        </label>
+      </details>
+      <label title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike. The separated coin lands here and is yours alone from then on.">
+        Your BTC (Blake2b) destination address
+        <input id="sp-dest" placeholder="a BTC (Blake2b) address you control"
+          title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike; the separated coin lands here.">
+      </label>
+      <p class="muted">You only need one new address, the BTC (Blake2b) destination. Your BTC (SHA256)
+      coin is not moved; it stays put and is safe to spend afterwards.</p>
+      <div class="row">
+        <button id="sp-classify" class="ghost" title="Look up the coins at your address (or check the specific coin). Run this first.">1. Find coins to protect</button>
+        <button id="sp-build" class="primary" disabled title="Enabled after a pre-fork coin is selected.">2. Build the split</button>
+      </div>
+      <div id="sp-coins"></div>
+      <p id="sp-step1" class="muted"></p>
+    </div>
+    <div class="card hidden" id="sp-sign-card">
+      <h2>3. Sign it on your own device</h2>
+      <p class="muted">Open this unsigned transaction in Sparrow (or your signer), sign it, and paste the
+      signed result back below. We never see your keys.</p>
+      <label title="The unsigned transaction we built. Load it into Sparrow (File, Open Transaction, or paste) and sign it.">
+        Unsigned transaction, open this in Sparrow
+        <textarea id="sp-psbt" class="copyable" readonly rows="3" title="Click to select, then copy it into Sparrow."></textarea>
+      </label>
+      <label title="Paste the fully-signed transaction Sparrow produced. We check it is exactly the one we built, co-sign our marker, and broadcast it.">
+        Signed transaction, paste it back here
+        <textarea id="sp-signed" rows="3" placeholder="paste the signed transaction from Sparrow"
+          title="The fully-signed transaction from your signer."></textarea>
+      </label>
+      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker, and broadcast it on BTC (Blake2b).">Co-sign and broadcast</button>
+      <p id="sp-step2" class="muted"></p>
+    </div>
+    <div class="card hidden" id="sp-verify-card">
+      <h2>4. Confirm it is safe</h2>
+      <p class="muted">Wait for 12 confirmations on BTC (Blake2b), then verify the coin can never be
+      replayed before you spend the BTC (SHA256) side.</p>
+      <button id="sp-verify" class="ghost" title="Checks on the BTC (SHA256) node that this transaction can never be replayed there, once it is 12 confirmations deep.">Verify "replay not possible"</button>
+      <p id="sp-step3" class="muted"></p>
+    </div>
+    <div class="card">
+      <h2>Safety</h2>
+      <ul class="muted">
+        <li>Never move or consolidate the coin on the BTC (SHA256) side first; that move is replayable.</li>
+        <li>The separating move always includes our BTC (Blake2b) marker (the builder enforces it).</li>
+        <li>Wait at least 12 BTC (Blake2b) confirmations before trusting it (this low-hashrate chain reorgs).</li>
+        <li>Only when verify says FINAL is it safe to spend the BTC (SHA256) side.</li>
+      </ul>
+    </div>
+  </section>
+
 </main>
 
 <footer>
   <span>non-custodial · your keys stay on your node</span>
   <span class="muted">
-    <a href="https://github.com/TwentyOneLife/sovereign-swap" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a href="https://bitcoin.org/en/" target="_blank" rel="noopener noreferrer" title="Bitcoin (SHA256)">Bitcoin</a>
+    · <a href="https://bitcoinknots.org/" target="_blank" rel="noopener noreferrer" title="Bitcoin Blake2b">Bitcoin Blake2b</a>
+    · <a href="https://github.com/TwentyOneLife/sovereign-swap" target="_blank" rel="noopener noreferrer">GitHub</a>
     · <button id="donate" class="link" title="Donate to TwentyOne.Life">Donate</button>
     · <span title="sovereign-swap daemon version">v__VERSION__</span>
     · no account · Tor-first

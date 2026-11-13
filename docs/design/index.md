@@ -15,6 +15,9 @@ The notes below are listed in order. Each links to the full text.
   state is persisted and resumed.
 - [0015 - Safe swap lifecycle](/design/0015-safe-swap-lifecycle) - the rules that guarantee a swap can
   always reach claim-or-refund: maker deadline, offer teardown, replay handling.
+- [0024 - Coin-split / replay-protection service](/design/0024-coin-split-replay-protection) - separating
+  a pre-fork coin so it can never be replayed between the two chains, for any signer.
+- [0026 - Offer lifecycle and maker reliability](/design/0026-offer-lifecycle-and-maker-reliability) - withdraw, maker-set expiry, and why penalizing a maker does not fit a non-custodial, no-identity system.
 
 ## Transport, client, and cryptography
 
@@ -42,6 +45,8 @@ The notes below are listed in order. Each links to the full text.
   keeping the normal fee address as the default.
 - [0019 - Adopt a user-broadcast funding lock](/design/0019-adopt-a-user-broadcast-funding-lock) -
   recognising a lock the user broadcast themselves.
+- [0027 - User-held claim/refund signing and watchtower broadcast](/design/0027-user-held-claim-refund-and-watchtower) -
+  moving claim, refund and the secret off a hosted engine, with an optional non-custodial watchtower.
 
 ## Fees
 
@@ -51,6 +56,12 @@ The notes below are listed in order. Each links to the full text.
   payment or normal address, with daemon-side scanning.
 - [0022 - Silent-payment fee and donation collection](/design/0022-sp1-fee-collection) - adopting sp1
   for the project's own collection.
+
+## Pricing
+
+- [0025 - Market-anchored offer pricing](/design/0025-market-anchored-offer-pricing) - the nonkyc
+  BTCB2/BTC rate is the default and the anchor, displayed to the maker, who alone sets a bounded margin;
+  automation never invents a rate.
 
 ## Security and abuse deterrence
 

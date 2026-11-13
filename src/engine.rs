@@ -1,15 +1,15 @@
 //! Drives every swap: reads both chains, lets `Swap::decide` choose, stores the result, acts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
+use bitcoin::{Amount, PubkeyHash, ScriptBuf, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
 use crate::fee::{self, FeeRates};
-use crate::htlc::{Contract, Spend};
+use crate::htlc::{Contract, Spend, UnsignedSpend, PREIMAGE_LEN};
 use crate::keys::{Keys, Use};
 use crate::node::{ChainBackend, ChainNode, FeeDest, NodeError};
 use crate::policy::{Policy, PolicyError};
@@ -51,6 +51,16 @@ fn now_unix() -> u64 {
 /// A short hex prefix of a 16-byte id, for log lines (F4): enough to correlate, not the whole id.
 fn short_id(id: &[u8; 16]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The stored signed spend to rebroadcast for an action on `lock` (0028): the transaction iff its sole
+/// input spends `lock`. `None`, or a mismatch (the stored spend is for a different outpoint, e.g. a dead
+/// refund when the current action is now a claim on the other chain), returns `None`, so the caller
+/// parks a fresh spend for the user instead of rebroadcasting a stale one. Pure, so it is unit-tested
+/// without nodes.
+fn reusable_spend(spent: Option<&Transaction>, lock: bitcoin::OutPoint) -> Option<&Transaction> {
+    let tx = spent?;
+    (tx.input.first().map(|i| i.previous_output) == Some(lock)).then_some(tx)
 }
 
 /// The txid of a base64 funding PSBT's unsigned transaction (design 0019). A segwit txid is fixed by
@@ -152,6 +162,38 @@ pub struct Config {
     /// void. Kept per chain because the two chains share Bitcoin's address format.
     pub btc_payout: Option<String>,
     pub xbtc_payout: Option<String>,
+    /// User-held claim/refund signing (0027, the 2b non-custodial core). When true, the engine does NOT
+    /// sign claim or refund spends with its own keys: it builds the unsigned spend, parks it on the
+    /// record (`pending_spend`) for the user to sign, and `submit_signed_spend` finalizes + broadcasts.
+    /// Default `false` keeps today's behaviour (the engine signs locally), so the current product and
+    /// the self-hosted (2a) client, where the per-swap keys are legitimately the user's own, are
+    /// untouched. Gates only the SIGNATURE; the preimage is still engine-side until a later slice.
+    pub user_held_spends: bool,
+}
+
+/// A per-swap PUBLIC commitment bundle the user's browser pre-provisions for an upcoming `take_index`
+/// (0027, the 2b non-custodial core). It holds only public data: the hash of the maker's secret and
+/// the user's own claim/refund pubkey hashes, all derived client-side from the user's OWN seed (the
+/// same `KeyStore` derivation the engine runs locally in 2a). The engine never holds the secret or the
+/// keys; it commits these into the contract at swap-start so the contract pays and is claimable only
+/// by the user, and the user signs/reveals at `submit_signed_spend`. One bundle is consumed per swap
+/// and never reused (reuse across takes of an offer is a theft vector, see design 0027 section 0).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Commitment {
+    pub secret_hash: [u8; 32],
+    pub claim_pkh: PubkeyHash,
+    pub refund_pkh: PubkeyHash,
+}
+
+/// A claim or refund that is built but awaiting the user's signature (0027, user-held spends): which
+/// spend it is, the fee it was built at (so `submit_signed_spend` rebuilds the byte-identical
+/// transaction), and the sighash the user signs with the claim/refund key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingSpend {
+    /// True for a claim, false for a refund.
+    pub claim: bool,
+    pub fee_sat: u64,
+    pub sighash: [u8; 32],
 }
 
 /// What a swap needs besides its state: where our coins go, and our lock once signed.
@@ -168,6 +210,11 @@ pub struct Record {
     /// older records, hence `serde(default)`.
     #[serde(default)]
     pub pending_lock_psbt: Option<String>,
+    /// A claim or refund built but awaiting the user's signature (0027, user-held spends). Set when
+    /// `Action::Claim`/`Action::Refund` is parked under `Config::user_held_spends`, cleared when
+    /// `submit_signed_spend` broadcasts. `serde(default)` so older records load.
+    #[serde(default)]
+    pub pending_spend: Option<PendingSpend>,
     /// E2 (design 0019): the txid of the funding lock we handed the user to sign, kept as a watch that
     /// outlives `pending_lock_psbt`. The prompt (`pending_lock_psbt`) is cleared the moment the swap
     /// stops awaiting a signature (adopted, settled, or abandoned), so the UI never asks the user to
@@ -198,6 +245,22 @@ pub struct Record {
     /// rules. Absent in older records, hence `serde(default)`.
     #[serde(default)]
     pub spend_fee_sat: Option<u64>,
+    /// Whether this swap is user-held (0027): its claim/refund keys and the maker's secret belong to
+    /// the user, not the engine, so the engine parks the claim/refund for the user to sign instead of
+    /// signing locally. FIXED when the swap is created (from `Config::user_held_spends` then), NOT
+    /// read live, so flipping the config never changes how an in-flight swap settles. Absent in older
+    /// records, hence `serde(default)` (false = today's local-signing behaviour).
+    #[serde(default)]
+    pub user_held: bool,
+    /// The user's signed claim or refund, once submitted (0028). Stored so a user-held swap whose spend
+    /// left the node's view before confirming (a restart losing the mempool, a reorg, an eviction) is
+    /// REBROADCAST instead of re-parking and demanding a second signature, which for a claim would be a
+    /// race once the secret is public. Rebroadcast only when it matches the current action's lock (see
+    /// `reusable_spend`); cleared on a lock mismatch or a terminal phase. Public data (a broadcast tx),
+    /// so it is non-custodial. Only ever set on the user-held path; the local path re-signs each tick.
+    /// Absent in older records, hence `serde(default)`.
+    #[serde(default)]
+    pub spent_tx: Option<Transaction>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -218,6 +281,20 @@ struct State {
     /// `serde(default)`.
     #[serde(default)]
     withdrawn: Vec<[u8; 16]>,
+    /// User-held commitment bundles (0027), keyed by the `take_index` the engine will assign. The
+    /// browser pre-provisions a window (a Nostr bid arrives while it may be offline), the engine
+    /// consumes one at swap-start and removes it, and refuses the bid/take when the index is absent.
+    /// Public data only. Absent in older state files, hence `serde(default)`.
+    #[serde(default)]
+    commitment_pool: BTreeMap<u32, Commitment>,
+    /// A user-held taker consumes its bundle at BID time (0027), because the pubkey hashes it puts on
+    /// the wire in `Message::Bid` must be exactly the ones it later commits at `Accept`. The bundle is
+    /// stashed here by swap id until the Accept arrives, so a later `provision_commitments` for the
+    /// same index cannot change what was already advertised. A `Vec` of pairs, not a map, because a
+    /// `[u8; 16]` key does not serialize as a JSON object key (same reason `bids` is a `Vec`). Absent
+    /// in older state files, hence `serde(default)`.
+    #[serde(default)]
+    bid_commitments: Vec<([u8; 16], Commitment)>,
 }
 
 #[derive(Debug)]
@@ -249,6 +326,14 @@ pub enum EngineError {
     /// funding, or a non-BIP352-aware cold signer; design 0018). Publishing it would advertise a swap
     /// the maker structurally cannot fund.
     FeeNotFundable,
+    /// A user-held swap (0027) reached a point that needs its commitment bundle (for the index it
+    /// was created at) but the pool has none: either never provisioned or already consumed. The
+    /// engine cannot commit or settle the swap without the user's public claim/refund pubkey hashes.
+    NoCommitment,
+    /// A signed spend was submitted whose signature does not verify against the parked sighash under
+    /// the submitted key (#240). The spend is left PARKED so the signer can retry with a correct
+    /// signature; nothing is broadcast or stored.
+    BadSignature,
 }
 
 impl From<NodeError> for EngineError {
@@ -261,6 +346,32 @@ impl From<std::io::Error> for EngineError {
     fn from(e: std::io::Error) -> EngineError {
         EngineError::Io(e)
     }
+}
+
+/// The spend a parked claim/refund rebuilds to, from `Engine::build_spend`: the chain to broadcast on,
+/// the unsigned transaction and its BIP143 sighash, the witness script, the input value it spends (not
+/// in the segwit tx), and the claim preimage the engine already knows (`None` for a refund or a
+/// user-held maker claim). Internal; `submit_signed_spend` finalizes it and `pending_spend_template`
+/// exposes the public parts.
+struct RebuiltSpend {
+    chain: Chain,
+    unsigned: UnsignedSpend,
+    witness_script: ScriptBuf,
+    input_value: Amount,
+    preimage: Option<[u8; PREIMAGE_LEN]>,
+}
+
+/// The public spend template a parked user-held swap is awaiting (0027), for the browser to recompute
+/// the BIP143 sighash itself and sign its OWN digest rather than trusting the engine's `sighash`. Holds
+/// no key and no preimage. The browser must still rebuild the witness script from its own verified
+/// contract and check the destination against a reference it owns; this only exposes what the engine
+/// would spend.
+pub struct SpendTemplate {
+    pub claim: bool,
+    pub unsigned_tx: Transaction,
+    pub witness_script: ScriptBuf,
+    pub input_value: Amount,
+    pub sighash: [u8; 32],
 }
 
 /// Tests only: how a cheating counterparty tampers with the voluntary fee output it funds, so the
@@ -464,6 +575,14 @@ impl<T: Transport> Engine<T> {
             return;
         }
         self.last_reannounce = Instant::now();
+        // Maker-set expiry (design 0026, #212): stop re-announcing an expired own offer and drop it, so
+        // it is not kept alive by our own re-announce past its deadline.
+        let now = now_unix();
+        let before = self.state.own_offers.len();
+        self.state.own_offers.retain(|o| !o.is_expired(now));
+        if self.state.own_offers.len() != before {
+            let _ = self.save_state();
+        }
         for offer in &self.state.own_offers {
             self.transport.send(&Message::Offer(offer.clone()));
         }
@@ -584,9 +703,13 @@ impl<T: Transport> Engine<T> {
 
     /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
     pub fn seen_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
+        let now = now_unix();
         self.state
             .seen_offers
             .iter()
+            // Maker-set expiry (design 0026, #212): an expired offer is dropped from the market view so
+            // it is never shown or taken, independent of the re-announce TTL.
+            .filter(|o| !o.is_expired(now))
             .map(|o| {
                 let t = self
                     .state
@@ -615,6 +738,12 @@ impl<T: Transport> Engine<T> {
     /// a spent offer.
     pub fn own_offers(&self) -> &[Offer] {
         &self.state.own_offers
+    }
+
+    /// Per-relay connection status (design 0029), for the client to show which relays (markets) it is
+    /// connected to. Delegates to the transport.
+    pub fn relay_status(&self) -> Vec<crate::routing::RelayStatus> {
+        self.transport.relay_status()
     }
 
     /// Takes one of our offers off the market: drops it locally so `/offers` stops serving it and it
@@ -681,7 +810,9 @@ impl<T: Transport> Engine<T> {
         // UI stops asking for a signature on a dead swap, and refuse. The user must also not broadcast
         // the signed PSBT from their own wallet; the engine refusing cannot stop that.
         let view = self.view(&self.records[i])?;
-        let secret = (self.records[i].swap.role == Role::Maker)
+        // A user-held maker's secret is the USER's, not the engine's (0027): pass `None` so the engine
+        // never fills the claim preimage from its own keys; the user reveals it at submit time.
+        let secret = (self.records[i].swap.role == Role::Maker && !self.records[i].user_held)
             .then(|| self.keys.secret(self.records[i].swap.key_index));
         let still_funding = self.records[i]
             .swap
@@ -734,6 +865,171 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// The role -> (contract, value, destination) construction for a decided claim/refund action,
+    /// built at `fee`, shared by `submit_signed_spend` (which verifies + finalizes it) and
+    /// `pending_spend_template` (which exposes it for the browser). Pure: no `decide`, no chain read,
+    /// no state change, and no park handling - the caller owns those, so the hardened terminal and
+    /// sighash-mismatch branches in `submit_signed_spend` stay exactly where they are.
+    fn build_spend(
+        &self,
+        i: usize,
+        action: &Action,
+        fee: Amount,
+        user_preimage: Option<[u8; PREIMAGE_LEN]>,
+    ) -> Result<RebuiltSpend, EngineError> {
+        let swap = &self.records[i].swap;
+        let (own_chain, own_contract, other_contract, other_amount) = match swap.role {
+            Role::Maker => (
+                swap.offer.maker_chain,
+                &swap.maker_contract,
+                &swap.taker_contract,
+                swap.taker_part,
+            ),
+            Role::Taker => (
+                swap.offer.maker_chain.other(),
+                &swap.taker_contract,
+                &swap.maker_contract,
+                swap.maker_part,
+            ),
+        };
+        match action {
+            Action::Claim { lock, preimage } => {
+                let spend = Spend {
+                    outpoint: *lock,
+                    value: other_amount,
+                    destination: self.records[i].claim_to.clone(),
+                    fee,
+                };
+                Ok(RebuiltSpend {
+                    chain: own_chain.other(),
+                    unsigned: other_contract
+                        .claim_unsigned(&spend)
+                        .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?,
+                    witness_script: other_contract.script(),
+                    input_value: other_amount,
+                    preimage: (*preimage).or(user_preimage),
+                })
+            }
+            Action::Refund { lock, value } => {
+                let spend = Spend {
+                    outpoint: *lock,
+                    value: *value,
+                    destination: self.records[i].refund_to.clone(),
+                    fee,
+                };
+                Ok(RebuiltSpend {
+                    chain: own_chain,
+                    unsigned: own_contract
+                        .refund_unsigned(&spend)
+                        .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?,
+                    witness_script: own_contract.script(),
+                    input_value: *value,
+                    preimage: None,
+                })
+            }
+            _ => unreachable!("caller filters to Claim/Refund"),
+        }
+    }
+
+    /// Resume a user-held claim/refund (0027): the user signed the parked spend's sighash, so assemble
+    /// it with their signature and broadcast. Mirrors `submit_signed_lock`'s guard: it re-decides
+    /// against a fresh chain view and only broadcasts if claim/refund is still the move. A terminal
+    /// swap drops the park and refuses for good (`NoLongerFundable`); any other non-spend result is a
+    /// retryable "not yet" (`NotYetFundable`). The spend is rebuilt at the parked fee, and its sighash
+    /// must match what the user signed, so a swap that changed underneath them is refused, not
+    /// broadcast with a signature that would not verify.
+    pub fn submit_signed_spend(
+        &mut self,
+        swap_id: [u8; 16],
+        sig: bitcoin::secp256k1::ecdsa::Signature,
+        pubkey: bitcoin::PublicKey,
+        // 0027: the maker's secret, supplied by the user with the claim signature. The user-held maker
+        // holds the secret, so `decide` does not fill the preimage; the user reveals it here, and
+        // `finalize` checks it against the committed `secret_hash`. `None` for a refund, and for a
+        // taker claim (the taker's secret is public on chain, so `decide` already carries it).
+        user_preimage: Option<[u8; PREIMAGE_LEN]>,
+    ) -> Result<(), EngineError> {
+        let Some(i) = self.records.iter().position(|r| r.swap.id == swap_id) else {
+            return Err(EngineError::NoSuchSwap);
+        };
+        let Some(pending) = self.records[i].pending_spend.clone() else {
+            return Err(EngineError::Node(NodeError::Unexpected(
+                "swap is not awaiting a spend signature".into(),
+            )));
+        };
+        let view = self.view(&self.records[i])?;
+        // A user-held maker's secret is the USER's, not the engine's (0027): pass `None` so the engine
+        // never fills the claim preimage from its own keys; the user reveals it at submit time.
+        let secret = (self.records[i].swap.role == Role::Maker && !self.records[i].user_held)
+            .then(|| self.keys.secret(self.records[i].swap.key_index));
+        let action = self.records[i]
+            .swap
+            .decide(&view, secret)
+            .into_iter()
+            .find(|a| matches!(a, Action::Claim { .. } | Action::Refund { .. }));
+        let Some(action) = action else {
+            if matches!(
+                self.records[i].swap.phase,
+                Phase::Abandoned | Phase::Done | Phase::Refunded | Phase::Refunding
+            ) {
+                self.records[i].pending_spend = None;
+                self.save(&self.records[i])?;
+                return Err(EngineError::NoLongerFundable);
+            }
+            return Err(EngineError::NotYetFundable);
+        };
+        let fee = Amount::from_sat(pending.fee_sat);
+        // Rebuild the spend at the parked fee. The claim preimage build_spend returns is whichever is
+        // present: the one the re-decided action carries (a taker's learned secret, or a local maker's
+        // own secret) or, for a user-held maker where `decide` leaves it `None`, the one the user
+        // supplied with the signature. `finalize` then checks it against the committed `secret_hash`.
+        let RebuiltSpend {
+            chain,
+            unsigned,
+            preimage,
+            ..
+        } = self.build_spend(i, &action, fee, user_preimage)?;
+        if unsigned.sighash != pending.sighash {
+            self.records[i].pending_spend = None;
+            self.save(&self.records[i])?;
+            return Err(EngineError::Node(NodeError::Unexpected(
+                "the swap changed while signing; re-request the spend signature".into(),
+            )));
+        }
+        // Verify the submitted signature against the parked sighash under the submitted key before
+        // finalizing (#240). `finalize` checks only the pubkey hash and the preimage, not the
+        // signature. An honest backend already rejects an invalid-signature spend at broadcast (so the
+        // `?` below leaves the spend parked, not poisoned), but verifying locally first gives a precise
+        // retryable `BadSignature` instead of an opaque broadcast error, stops settlement relying on
+        // the backend to validate the script (an untrusted Electrum server in E1 mode), and rejects a
+        // high-S signature here. On failure leave the spend PARKED so the signer can retry: do not
+        // clear `pending_spend` or store a `spent_tx`.
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        if secp
+            .verify_ecdsa(
+                &bitcoin::secp256k1::Message::from_digest(unsigned.sighash),
+                &sig,
+                &pubkey.inner,
+            )
+            .is_err()
+        {
+            return Err(EngineError::BadSignature);
+        }
+        let tx = unsigned
+            .finalize(sig, pubkey, preimage)
+            .map_err(|e| NodeError::Unexpected(format!("finalize: {e:?}")))?;
+        self.backend(chain).broadcast(&tx)?;
+        // 0028: keep the user's signed spend so a later tick rebroadcasts it (if its lock still
+        // matches) instead of re-parking and demanding a second signature. A swap is either awaiting a
+        // signature (`pending_spend`) or already signed (`spent_tx`), never both, exactly like
+        // `pending_lock_psbt` vs `funding`.
+        self.records[i].pending_spend = None;
+        self.records[i].spent_tx = Some(tx);
+        self.records[i].spend_fee_sat = Some(pending.fee_sat);
+        self.save(&self.records[i])?;
+        Ok(())
+    }
+
     /// The unsigned funding PSBT a swap is parked on, for the user to sign (E2, design 0017); `None`
     /// when the swap is not awaiting a funding signature.
     pub fn pending_lock_psbt(&self, id: [u8; 16]) -> Option<String> {
@@ -742,6 +1038,61 @@ impl<T: Transport> Engine<T> {
             .find(|r| r.swap.id == id)?
             .pending_lock_psbt
             .clone()
+    }
+
+    /// The parked claim/refund a user-held swap is awaiting a signature on (0027): whether it is a
+    /// claim (vs a refund) and the sighash the user signs with their claim/refund key. `None` when the
+    /// swap is not awaiting a spend signature. The user signs this sighash with the key they derived
+    /// for `key_index` (and, for a maker claim, reveals their secret), then posts it to
+    /// `submit_signed_spend`, which rebuilds the identical spend and checks the sighash before
+    /// broadcasting, so a stale or tampered value cannot settle.
+    pub fn pending_spend(&self, id: [u8; 16]) -> Option<(bool, [u8; 32])> {
+        let p = self
+            .records
+            .iter()
+            .find(|r| r.swap.id == id)?
+            .pending_spend
+            .as_ref()?;
+        Some((p.claim, p.sighash))
+    }
+
+    /// The full spend template a parked user-held swap is awaiting (0027), so the browser can recompute
+    /// the BIP143 sighash from first principles and sign its own digest. `None` if the swap is not
+    /// awaiting a spend signature, is no longer spendable, or has changed underneath the parked sighash.
+    /// Rebuilt read-only through the same `build_spend` the signature submission uses, so what it
+    /// exposes is exactly what the engine would spend. Decides with `secret = None` (the engine never
+    /// needs the user's secret to describe the spend) and carries no preimage.
+    ///
+    /// The rebuilt-vs-parked sighash check is a FRESHNESS guard, not a security one: a malicious engine
+    /// could serve any template with a matching sighash, so the browser must still rebuild the witness
+    /// script from its own verified contract and check the destination against a reference it owns.
+    pub fn pending_spend_template(&self, id: [u8; 16]) -> Option<SpendTemplate> {
+        let i = self.records.iter().position(|r| r.swap.id == id)?;
+        let sighash = self.records[i].pending_spend.as_ref()?.sighash;
+        let claim = self.records[i].pending_spend.as_ref()?.claim;
+        let fee = Amount::from_sat(self.records[i].pending_spend.as_ref()?.fee_sat);
+        let view = self.view(&self.records[i]).ok()?;
+        // `decide` takes `&mut self` and advances the swap phase; this accessor is read-only, so decide
+        // on a CLONE and discard the transition. The action is identical to the one the real swap would
+        // yield (same state), so the rebuilt spend matches what `submit_signed_spend` builds.
+        let action = self.records[i]
+            .swap
+            .clone()
+            .decide(&view, None)
+            .into_iter()
+            .find(|a| matches!(a, Action::Claim { .. } | Action::Refund { .. }))?;
+        let rebuilt = self.build_spend(i, &action, fee, None).ok()?;
+        // Freshness: if the swap changed underneath the parked sighash there is no stable template.
+        if rebuilt.unsigned.sighash != sighash {
+            return None;
+        }
+        Some(SpendTemplate {
+            claim,
+            unsigned_tx: rebuilt.unsigned.tx,
+            witness_script: rebuilt.witness_script,
+            input_value: rebuilt.input_value,
+            sighash,
+        })
     }
 
     pub fn node(&self, chain: Chain) -> &ChainNode {
@@ -785,6 +1136,44 @@ impl<T: Transport> Engine<T> {
         self.state.next_index - 1
     }
 
+    /// Pre-provision user-held commitment bundles (0027) for upcoming swap indices. Public data only,
+    /// derived client-side from the user's seed; the browser tops the pool up as swaps consume it. An
+    /// entry for an index not yet consumed is overwritten (re-provision is idempotent). Persists.
+    pub fn provision_commitments(
+        &mut self,
+        entries: Vec<(u32, Commitment)>,
+    ) -> Result<(), EngineError> {
+        for (index, c) in entries {
+            self.state.commitment_pool.insert(index, c);
+        }
+        self.save_state()?;
+        Ok(())
+    }
+
+    /// The next swap index that will be assigned, and the sorted indices the commitment pool already
+    /// holds, so a user-held browser knows which indices still need provisioning (it tops up from
+    /// `next_index` upward, skipping any already present). Public data only.
+    pub fn commitment_status(&self) -> (u32, Vec<u32>) {
+        (
+            self.state.next_index,
+            self.state.commitment_pool.keys().copied().collect(),
+        )
+    }
+
+    /// True if a user-held commitment bundle is provisioned for `index` (peek, does not consume).
+    fn has_commitment(&self, index: u32) -> bool {
+        self.state.commitment_pool.contains_key(&index)
+    }
+
+    /// Take and REMOVE the user-held commitment for `index` so it is never reused (0027). Errors when
+    /// absent, which refuses the swap rather than falling back to an engine-derived commitment.
+    fn take_commitment(&mut self, index: u32) -> Result<Commitment, EngineError> {
+        self.state
+            .commitment_pool
+            .remove(&index)
+            .ok_or(EngineError::NoCommitment)
+    }
+
     pub fn publish(&mut self, offer: Offer) -> Result<(), EngineError> {
         self.config
             .policy
@@ -816,6 +1205,10 @@ impl<T: Transport> Engine<T> {
     ) -> Result<(), EngineError> {
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
+        }
+        // Maker-set expiry (design 0026, #212): never commit to an expired offer. Local refusal.
+        if offer.is_expired(now_unix()) {
+            return Err(EngineError::Bid(BidError::Expired));
         }
         let taker_part = offer
             .taker_part_min(maker_part, Amount::from_sat(self.min_swap_sat))
@@ -874,7 +1267,29 @@ impl<T: Transport> Engine<T> {
             .policy
             .depths(offer, maker_part, taker_part)
             .map_err(EngineError::Policy)?;
+        // 0027: a user-held taker needs a provisioned commitment for the index it is about to use.
+        // Peek before consuming the index or sending a bid over the wire, so a missing bundle is a
+        // clean local refusal rather than a bid the taker cannot honour when the Accept arrives.
+        if self.config.user_held_spends && !self.has_commitment(self.state.next_index) {
+            return Err(EngineError::Bid(BidError::NoCommitment));
+        }
         let index = self.take_index();
+        // The pubkey hashes the taker advertises in the bid MUST be the ones it later commits at
+        // Accept, or the two sides build contracts at different addresses and never see each other's
+        // lock. For a user-held taker, consume its bundle now, send the bundle's pubkey hashes, and
+        // stash the bundle by swap id (so a later re-provision of this index cannot change what was
+        // advertised). Otherwise the engine's own keys go on the wire and are rebuilt at Accept.
+        let (taker_claim_pkh, taker_refund_pkh) = if self.config.user_held_spends {
+            let c = self.take_commitment(index)?;
+            let pkhs = (c.claim_pkh, c.refund_pkh);
+            self.state.bid_commitments.push((swap_id, c));
+            pkhs
+        } else {
+            (
+                self.keys.pkh(index, Use::Claim),
+                self.keys.pkh(index, Use::Refund),
+            )
+        };
         self.state
             .bids
             .push((swap_id, offer.clone(), maker_part, index));
@@ -883,8 +1298,8 @@ impl<T: Transport> Engine<T> {
             offer_id: offer.id,
             swap_id,
             maker_part,
-            taker_claim_pkh: self.keys.pkh(index, Use::Claim),
-            taker_refund_pkh: self.keys.pkh(index, Use::Refund),
+            taker_claim_pkh,
+            taker_refund_pkh,
         });
         Ok(())
     }
@@ -966,8 +1381,28 @@ impl<T: Transport> Engine<T> {
                     }
                 };
                 let index = self.take_index();
-                let secret_hash =
-                    bitcoin::hashes::sha256::Hash::hash(&self.keys.secret(index)).to_byte_array();
+                // 0027: a user-held maker commits the hash and pubkey hashes the USER derived from
+                // its own seed (the pre-provisioned bundle), not the engine's. Dropping the bid when
+                // no bundle is provisioned is the same failure mode as any other bid-drop above.
+                let (secret_hash, own_claim_pkh, own_refund_pkh) = if self.config.user_held_spends {
+                    match self.take_commitment(index) {
+                        Ok(c) => (c.secret_hash, c.claim_pkh, c.refund_pkh),
+                        Err(_) => {
+                            eprintln!(
+                                "bid dropped for offer {}: no user-held commitment for index {index}",
+                                short_id(&offer_id)
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    (
+                        bitcoin::hashes::sha256::Hash::hash(&self.keys.secret(index))
+                            .to_byte_array(),
+                        self.keys.pkh(index, Use::Claim),
+                        self.keys.pkh(index, Use::Refund),
+                    )
+                };
                 let swap = Swap {
                     id: swap_id,
                     role: Role::Maker,
@@ -977,12 +1412,12 @@ impl<T: Transport> Engine<T> {
                     maker_contract: Contract {
                         secret_hash,
                         claim_pkh: taker_claim_pkh,
-                        refund_pkh: self.keys.pkh(index, Use::Refund),
+                        refund_pkh: own_refund_pkh,
                         lock_blocks: offer.maker_lock_blocks,
                     },
                     taker_contract: Contract {
                         secret_hash,
-                        claim_pkh: self.keys.pkh(index, Use::Claim),
+                        claim_pkh: own_claim_pkh,
                         refund_pkh: taker_refund_pkh,
                         lock_blocks: offer.taker_lock_blocks,
                     },
@@ -1030,6 +1465,34 @@ impl<T: Transport> Engine<T> {
                     .policy
                     .depths(&offer, maker_part, taker_part)
                     .map_err(EngineError::Policy)?;
+                // 0027: a user-held taker commits exactly the pubkey hashes it advertised in the bid,
+                // taken from the stash keyed by swap id (consumed from the pool at bid time), so both
+                // sides build the same contract. The secret hash is the maker's, off the wire.
+                let (own_claim_pkh, own_refund_pkh) = if self.config.user_held_spends {
+                    match self
+                        .state
+                        .bid_commitments
+                        .iter()
+                        .position(|(id, _)| *id == swap_id)
+                    {
+                        Some(pos) => {
+                            let (_, c) = self.state.bid_commitments.remove(pos);
+                            (c.claim_pkh, c.refund_pkh)
+                        }
+                        None => {
+                            eprintln!(
+                                "accept dropped for swap {}: no stashed user-held commitment",
+                                short_id(&swap_id)
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    (
+                        self.keys.pkh(index, Use::Claim),
+                        self.keys.pkh(index, Use::Refund),
+                    )
+                };
                 let swap = Swap {
                     id: swap_id,
                     role: Role::Taker,
@@ -1038,14 +1501,14 @@ impl<T: Transport> Engine<T> {
                     taker_part,
                     maker_contract: Contract {
                         secret_hash,
-                        claim_pkh: self.keys.pkh(index, Use::Claim),
+                        claim_pkh: own_claim_pkh,
                         refund_pkh: maker_refund_pkh,
                         lock_blocks: offer.maker_lock_blocks,
                     },
                     taker_contract: Contract {
                         secret_hash,
                         claim_pkh: maker_claim_pkh,
-                        refund_pkh: self.keys.pkh(index, Use::Refund),
+                        refund_pkh: own_refund_pkh,
                         lock_blocks: offer.taker_lock_blocks,
                     },
                     depths,
@@ -1105,11 +1568,17 @@ impl<T: Transport> Engine<T> {
             refund_to: self.destination(refund_chain)?,
             funding: None,
             pending_lock_psbt: None,
+            pending_spend: None,
             expected_lock_txid: None,
             watch_from_height: None,
             fee: None,
             received_fee: None,
             spend_fee_sat: None,
+            // 0027: fixed at creation from the config, never read live, so a later gate flip does not
+            // change how this swap settles. The commitments were already sourced from the user's
+            // bundle (or the engine's keys) above, consistently with this flag.
+            user_held: self.config.user_held_spends,
+            spent_tx: None,
             swap,
         };
         let id: String = record.swap.id.iter().map(|b| format!("{b:02x}")).collect();
@@ -1408,7 +1877,9 @@ impl<T: Transport> Engine<T> {
             self.adopt_own_lock(i, &view)?;
         }
 
-        let secret = (self.records[i].swap.role == Role::Maker)
+        // A user-held maker's secret is the USER's, not the engine's (0027): pass `None` so the engine
+        // never fills the claim preimage from its own keys; the user reveals it at submit time.
+        let secret = (self.records[i].swap.role == Role::Maker && !self.records[i].user_held)
             .then(|| self.keys.secret(self.records[i].swap.key_index));
         let before = self.records[i].swap.phase;
         let actions = self.records[i].swap.decide(&view, secret);
@@ -1568,6 +2039,60 @@ impl<T: Transport> Engine<T> {
             },
             Action::Claim { lock, preimage } => {
                 let spend_chain = own_chain.other();
+                if record.user_held {
+                    // 0028: if the user already signed this claim and it still spends this lock,
+                    // rebroadcast it rather than re-parking for a second signature (a race once the
+                    // secret is public). A stale stored spend for a different outpoint (e.g. a dead
+                    // refund after a role switch) does not match, so it is dropped and a fresh claim is
+                    // parked below.
+                    if let Some(tx) = reusable_spend(record.spent_tx.as_ref(), lock) {
+                        self.backend(spend_chain).broadcast(tx)?;
+                        return Ok(());
+                    }
+                    if record.spent_tx.is_some() {
+                        self.records[i].spent_tx = None;
+                        self.save(&self.records[i])?;
+                    }
+                    // 0027: do not sign; park the unsigned claim for the user to sign. Build once and
+                    // keep it (the parked sighash stays stable across ticks); nothing is broadcast until
+                    // submit_signed_spend. Fee it by the real signed vsize via the SAME rate_spend path
+                    // as the local claim, estimated with a dummy-witness probe since a user-held spend
+                    // cannot sign to measure.
+                    if self.records[i].pending_spend.is_none() {
+                        let probe = |fee: Amount| {
+                            other_contract.claim_probe(&Spend {
+                                outpoint: lock,
+                                value: other_amount,
+                                destination: record.claim_to.clone(),
+                                fee,
+                            })
+                        };
+                        let (_, fee) = self
+                            .rate_spend(spend_chain, record.spend_fee_sat, probe)
+                            .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
+                        let spend = Spend {
+                            outpoint: lock,
+                            value: other_amount,
+                            destination: record.claim_to.clone(),
+                            fee,
+                        };
+                        let unsigned = other_contract
+                            .claim_unsigned(&spend)
+                            .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
+                        self.records[i].pending_spend = Some(PendingSpend {
+                            claim: true,
+                            fee_sat: fee.to_sat(),
+                            sighash: unsigned.sighash,
+                        });
+                        self.save(&self.records[i])?;
+                    }
+                    return Ok(());
+                }
+                // Local signing (not user-held): `decide` always supplies a preimage here, the maker's
+                // own secret or the taker's secret learned from chain, so `None` would be a logic bug.
+                let preimage = preimage.expect(
+                    "a local-signing claim carries a preimage (own secret or learned secret)",
+                );
                 let key = self.keys.key(swap.key_index, Use::Claim);
                 let secp = self.keys.secp();
                 let build = |fee| {
@@ -1585,6 +2110,49 @@ impl<T: Transport> Engine<T> {
                 (spend_chain, tx, Some(fee.to_sat()))
             }
             Action::Refund { lock, value } => {
+                if record.user_held {
+                    // 0028: rebroadcast the user's already-signed refund if it still spends this lock,
+                    // else drop a stale one (see the claim arm) and park a fresh refund below.
+                    if let Some(tx) = reusable_spend(record.spent_tx.as_ref(), lock) {
+                        self.backend(own_chain).broadcast(tx)?;
+                        return Ok(());
+                    }
+                    if record.spent_tx.is_some() {
+                        self.records[i].spent_tx = None;
+                        self.save(&self.records[i])?;
+                    }
+                    // 0027: park the unsigned refund for the user to sign (see the claim arm), fee'd by
+                    // the real signed vsize via rate_spend + a dummy-witness probe.
+                    if self.records[i].pending_spend.is_none() {
+                        let probe = |fee: Amount| {
+                            own_contract.refund_probe(&Spend {
+                                outpoint: lock,
+                                value,
+                                destination: record.refund_to.clone(),
+                                fee,
+                            })
+                        };
+                        let (_, fee) = self
+                            .rate_spend(own_chain, record.spend_fee_sat, probe)
+                            .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
+                        let spend = Spend {
+                            outpoint: lock,
+                            value,
+                            destination: record.refund_to.clone(),
+                            fee,
+                        };
+                        let unsigned = own_contract
+                            .refund_unsigned(&spend)
+                            .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?;
+                        self.records[i].pending_spend = Some(PendingSpend {
+                            claim: false,
+                            fee_sat: fee.to_sat(),
+                            sighash: unsigned.sighash,
+                        });
+                        self.save(&self.records[i])?;
+                    }
+                    return Ok(());
+                }
                 let key = self.keys.key(swap.key_index, Use::Refund);
                 let secp = self.keys.secp();
                 let build = |fee| {
@@ -1669,6 +2237,72 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_0027_engine_state_still_loads_and_commitments_round_trip() {
+        use super::Commitment;
+        use bitcoin::hashes::Hash;
+        use bitcoin::PubkeyHash;
+        // A state written before 0027 has no commitment_pool or bid_commitments; both default empty.
+        let old = r#"{"next_index":3,"own_offers":[],"seen_offers":[],"bids":[]}"#;
+        let state: State = serde_json::from_str(old).unwrap();
+        assert!(state.commitment_pool.is_empty());
+        assert!(state.bid_commitments.is_empty());
+        // A state carrying a commitment (keyed by index) round-trips through save/load.
+        let mut state = State {
+            next_index: 5,
+            ..Default::default()
+        };
+        state.commitment_pool.insert(
+            5,
+            Commitment {
+                secret_hash: [7u8; 32],
+                claim_pkh: PubkeyHash::from_byte_array([1u8; 20]),
+                refund_pkh: PubkeyHash::from_byte_array([2u8; 20]),
+            },
+        );
+        let back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.next_index, 5);
+        let c = back
+            .commitment_pool
+            .get(&5)
+            .expect("commitment round-trips");
+        assert_eq!(c.secret_hash, [7u8; 32]);
+        assert_eq!(c.claim_pkh, PubkeyHash::from_byte_array([1u8; 20]));
+    }
+
+    #[test]
+    fn reusable_spend_matches_only_the_actions_lock() {
+        use super::reusable_spend;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence, Transaction,
+            TxIn, Txid, Witness,
+        };
+        let outpoint = |b: u8, vout: u32| OutPoint {
+            txid: Txid::from_byte_array([b; 32]),
+            vout,
+        };
+        let spend = |o: OutPoint| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: o,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+        let lock = outpoint(1, 0);
+        // A stored spend of this lock is reusable; a spend of a different outpoint (e.g. a dead refund
+        // after a role switch to a claim on the other chain) is NOT; and None is never reusable.
+        let own = spend(lock);
+        assert!(reusable_spend(Some(&own), lock).is_some());
+        let stale = spend(outpoint(2, 1));
+        assert!(reusable_spend(Some(&stale), lock).is_none());
+        assert!(reusable_spend(None, lock).is_none());
+    }
+
+    #[test]
     fn prune_seen_ages_out_stale_and_stamps_legacy() {
         use super::{prune_seen, SEEN_OFFER_TTL_SECS};
         use crate::swap::{Chain, Offer};
@@ -1685,6 +2319,7 @@ mod tests {
             taker_lock_depth: 2,
             margin_blocks: 3,
             fee: None,
+            valid_until: None,
         };
         let now = 1_000_000u64;
         let mut seen_offers = vec![offer(1), offer(2), offer(3)];
@@ -1730,6 +2365,7 @@ mod tests {
             taker_lock_depth: 2,
             margin_blocks: 3,
             fee: None,
+            valid_until: None,
         };
         let t0 = 1_000_000u64;
         let mut seen_offers = vec![offer(1), offer(2)];

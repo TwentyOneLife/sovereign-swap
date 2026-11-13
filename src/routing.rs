@@ -3,7 +3,7 @@
 //! offers and bids that arrive, so two parties who never met can complete a swap through an
 //! untrusted relay. See `docs/design/0006-nostr-client-and-relay.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,12 +19,69 @@ use crate::transport::Transport;
 /// A peer as this party has learned it: its relay routing key and its envelope identity.
 type Peer = (XOnlyPublicKey, PublicIdentity);
 
+/// One relay's connection status, for display ("connected sovereign-relays").
+#[derive(Clone, Debug)]
+pub struct RelayStatus {
+    pub url: String,
+    pub connected: bool,
+}
+
 /// A connection to one or more relays. An in-process `Relay` and a real WebSocket relay both
 /// implement it, so the routing below is written once and runs over either.
 pub trait RelayConn {
     fn publish(&self, event: Event);
     /// Events newly arrived for `subscriber` (addressed to it or broadcast, never its own), deduped.
     fn poll(&self, subscriber: &XOnlyPublicKey) -> Vec<Event>;
+    /// Per-relay connection status, for the client to show which relays (markets) it is connected to.
+    /// Default empty (an in-process or statusless conn reports nothing); `WsConn` and `MultiConn`
+    /// report real entries.
+    fn status(&self) -> Vec<RelayStatus> {
+        Vec::new()
+    }
+}
+
+/// Connects to SEVERAL relays at once and presents them as one (design 0029, client-side federation):
+/// an offer published by anyone on ANY connected relay is discoverable here, so separate
+/// sovereign-relays become one combined market. Publishes to every relay; polls all and dedups by
+/// event id (the same event seen on two relays is delivered once). The swap itself is unchanged and
+/// trustless, so pooling discovery across relays you do not trust cannot cost funds (see 0029).
+pub struct MultiConn<C: RelayConn> {
+    conns: Vec<C>,
+    seen: Mutex<HashSet<[u8; 32]>>,
+}
+
+impl<C: RelayConn> MultiConn<C> {
+    pub fn new(conns: Vec<C>) -> MultiConn<C> {
+        MultiConn {
+            conns,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl<C: RelayConn> RelayConn for MultiConn<C> {
+    fn publish(&self, event: Event) {
+        for c in &self.conns {
+            c.publish(event.clone());
+        }
+    }
+
+    fn poll(&self, subscriber: &XOnlyPublicKey) -> Vec<Event> {
+        let mut seen = self.seen.lock().unwrap();
+        let mut out = Vec::new();
+        for c in &self.conns {
+            for e in c.poll(subscriber) {
+                if seen.insert(e.id) {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+
+    fn status(&self) -> Vec<RelayStatus> {
+        self.conns.iter().flat_map(|c| c.status()).collect()
+    }
 }
 
 pub struct RelayTransport<C: RelayConn> {
@@ -80,6 +137,10 @@ impl<C: RelayConn> RelayTransport<C> {
 }
 
 impl<C: RelayConn> Transport for RelayTransport<C> {
+    fn relay_status(&self) -> Vec<RelayStatus> {
+        self.conn.status()
+    }
+
     fn send(&self, message: &Message) {
         let payload = serde_json::to_vec(message).expect("a Message serializes");
         let (tags, envelope) = match message {
@@ -203,5 +264,80 @@ impl<C: RelayConn> Transport for RelayTransport<C> {
             out.push(message);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nostr::Event;
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+
+    fn a_key() -> XOnlyPublicKey {
+        let secp = Secp256k1::new();
+        Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7u8; 32]).unwrap())
+            .x_only_public_key()
+            .0
+    }
+
+    fn ev(id: u8) -> Event {
+        Event {
+            id: [id; 32],
+            pubkey: a_key(),
+            created_at: 0,
+            kind: 4859,
+            tags: vec![],
+            content: String::new(),
+            sig: [0u8; 64],
+        }
+    }
+
+    /// A relay that returns a fixed set of events (the per-relay poll + subscriber filter are the real
+    /// conns' job; this isolates `MultiConn`'s union + dedup).
+    struct Fixed(Vec<Event>);
+    impl RelayConn for Fixed {
+        fn publish(&self, _: Event) {}
+        fn poll(&self, _: &XOnlyPublicKey) -> Vec<Event> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn multiconn_unions_offers_and_dedups_across_relays() {
+        // Relay A carries events {1,2}, relay B carries {2,3}: the combined market is {1,2,3} with the
+        // event seen on both relays delivered once (design 0029).
+        let mc = MultiConn::new(vec![Fixed(vec![ev(1), ev(2)]), Fixed(vec![ev(2), ev(3)])]);
+        let ids: Vec<u8> = mc.poll(&a_key()).iter().map(|e| e.id[0]).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "union across relays, deduped by event id"
+        );
+        assert!(
+            mc.poll(&a_key()).is_empty(),
+            "an event already delivered from any relay is not returned again"
+        );
+    }
+
+    #[test]
+    fn multiconn_status_concatenates_each_relay() {
+        struct One(&'static str);
+        impl RelayConn for One {
+            fn publish(&self, _: Event) {}
+            fn poll(&self, _: &XOnlyPublicKey) -> Vec<Event> {
+                vec![]
+            }
+            fn status(&self) -> Vec<RelayStatus> {
+                vec![RelayStatus {
+                    url: self.0.into(),
+                    connected: true,
+                }]
+            }
+        }
+        let mc = MultiConn::new(vec![One("ws://a"), One("ws://b")]);
+        let s = mc.status();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].url, "ws://a");
+        assert_eq!(s[1].url, "ws://b");
     }
 }
