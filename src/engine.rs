@@ -53,6 +53,16 @@ fn short_id(id: &[u8; 16]) -> String {
     id.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The stored signed spend to rebroadcast for an action on `lock` (0028): the transaction iff its sole
+/// input spends `lock`. `None`, or a mismatch (the stored spend is for a different outpoint, e.g. a dead
+/// refund when the current action is now a claim on the other chain), returns `None`, so the caller
+/// parks a fresh spend for the user instead of rebroadcasting a stale one. Pure, so it is unit-tested
+/// without nodes.
+fn reusable_spend(spent: Option<&Transaction>, lock: bitcoin::OutPoint) -> Option<&Transaction> {
+    let tx = spent?;
+    (tx.input.first().map(|i| i.previous_output) == Some(lock)).then_some(tx)
+}
+
 /// The txid of a base64 funding PSBT's unsigned transaction (design 0019). A segwit txid is fixed by
 /// the unsigned tx, so this matches the signed lock that lands on chain; stored as the watch marker
 /// when a swap parks on a handed-out PSBT.
@@ -242,6 +252,15 @@ pub struct Record {
     /// records, hence `serde(default)` (false = today's local-signing behaviour).
     #[serde(default)]
     pub user_held: bool,
+    /// The user's signed claim or refund, once submitted (0028). Stored so a user-held swap whose spend
+    /// left the node's view before confirming (a restart losing the mempool, a reorg, an eviction) is
+    /// REBROADCAST instead of re-parking and demanding a second signature, which for a claim would be a
+    /// race once the secret is public. Rebroadcast only when it matches the current action's lock (see
+    /// `reusable_spend`); cleared on a lock mismatch or a terminal phase. Public data (a broadcast tx),
+    /// so it is non-custodial. Only ever set on the user-held path; the local path re-signs each tick.
+    /// Absent in older records, hence `serde(default)`.
+    #[serde(default)]
+    pub spent_tx: Option<Transaction>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -921,7 +940,12 @@ impl<T: Transport> Engine<T> {
             .finalize(sig, pubkey, preimage)
             .map_err(|e| NodeError::Unexpected(format!("finalize: {e:?}")))?;
         self.backend(chain).broadcast(&tx)?;
+        // 0028: keep the user's signed spend so a later tick rebroadcasts it (if its lock still
+        // matches) instead of re-parking and demanding a second signature. A swap is either awaiting a
+        // signature (`pending_spend`) or already signed (`spent_tx`), never both, exactly like
+        // `pending_lock_psbt` vs `funding`.
         self.records[i].pending_spend = None;
+        self.records[i].spent_tx = Some(tx);
         self.records[i].spend_fee_sat = Some(pending.fee_sat);
         self.save(&self.records[i])?;
         Ok(())
@@ -1436,6 +1460,7 @@ impl<T: Transport> Engine<T> {
             // change how this swap settles. The commitments were already sourced from the user's
             // bundle (or the engine's keys) above, consistently with this flag.
             user_held: self.config.user_held_spends,
+            spent_tx: None,
             swap,
         };
         let id: String = record.swap.id.iter().map(|b| format!("{b:02x}")).collect();
@@ -1897,6 +1922,19 @@ impl<T: Transport> Engine<T> {
             Action::Claim { lock, preimage } => {
                 let spend_chain = own_chain.other();
                 if record.user_held {
+                    // 0028: if the user already signed this claim and it still spends this lock,
+                    // rebroadcast it rather than re-parking for a second signature (a race once the
+                    // secret is public). A stale stored spend for a different outpoint (e.g. a dead
+                    // refund after a role switch) does not match, so it is dropped and a fresh claim is
+                    // parked below.
+                    if let Some(tx) = reusable_spend(record.spent_tx.as_ref(), lock) {
+                        self.backend(spend_chain).broadcast(tx)?;
+                        return Ok(());
+                    }
+                    if record.spent_tx.is_some() {
+                        self.records[i].spent_tx = None;
+                        self.save(&self.records[i])?;
+                    }
                     // 0027: do not sign; park the unsigned claim for the user to sign. Build once and
                     // keep it (the parked sighash stays stable across ticks); nothing is broadcast until
                     // submit_signed_spend. Fee it by the real signed vsize via the SAME rate_spend path
@@ -1955,6 +1993,16 @@ impl<T: Transport> Engine<T> {
             }
             Action::Refund { lock, value } => {
                 if record.user_held {
+                    // 0028: rebroadcast the user's already-signed refund if it still spends this lock,
+                    // else drop a stale one (see the claim arm) and park a fresh refund below.
+                    if let Some(tx) = reusable_spend(record.spent_tx.as_ref(), lock) {
+                        self.backend(own_chain).broadcast(tx)?;
+                        return Ok(());
+                    }
+                    if record.spent_tx.is_some() {
+                        self.records[i].spent_tx = None;
+                        self.save(&self.records[i])?;
+                    }
                     // 0027: park the unsigned refund for the user to sign (see the claim arm), fee'd by
                     // the real signed vsize via rate_spend + a dummy-witness probe.
                     if self.records[i].pending_spend.is_none() {
@@ -2101,6 +2149,39 @@ mod tests {
             .expect("commitment round-trips");
         assert_eq!(c.secret_hash, [7u8; 32]);
         assert_eq!(c.claim_pkh, PubkeyHash::from_byte_array([1u8; 20]));
+    }
+
+    #[test]
+    fn reusable_spend_matches_only_the_actions_lock() {
+        use super::reusable_spend;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence, Transaction,
+            TxIn, Txid, Witness,
+        };
+        let outpoint = |b: u8, vout: u32| OutPoint {
+            txid: Txid::from_byte_array([b; 32]),
+            vout,
+        };
+        let spend = |o: OutPoint| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: o,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+        let lock = outpoint(1, 0);
+        // A stored spend of this lock is reusable; a spend of a different outpoint (e.g. a dead refund
+        // after a role switch to a claim on the other chain) is NOT; and None is never reusable.
+        let own = spend(lock);
+        assert!(reusable_spend(Some(&own), lock).is_some());
+        let stale = spend(outpoint(2, 1));
+        assert!(reusable_spend(Some(&stale), lock).is_none());
+        assert!(reusable_spend(None, lock).is_none());
     }
 
     #[test]
