@@ -220,9 +220,28 @@ fn a_user_held_maker_settles_with_the_users_own_key_not_the_engines() {
         "a rejected submission leaves the claim parked for the real user"
     );
 
-    // The USER signs the parked sighash with its own claim key and reveals its own secret.
+    // The user's OWN key but a signature that does NOT sign the parked sighash (here over the zero
+    // digest) must be refused with `BadSignature`, the claim left PARKED for a retry (#240). The
+    // pubkey hashes to the committed claim key, so `finalize`'s key check passes; the engine-side
+    // signature verify is what rejects it. An honest node would also reject this at broadcast (so the
+    // spend would stay parked either way), but the specific `BadSignature` here proves the engine
+    // verified locally rather than relying on the backend; the match is what gives the test teeth.
     let ukey = user.key(index, Use::Claim);
     let upub = PublicKey::new(ukey.public_key(&secp));
+    let bad = secp.sign_ecdsa(&Message::from_digest([0u8; 32]), &ukey);
+    assert!(
+        matches!(
+            maker.submit_signed_spend(swap_id, bad, upub, Some(user.secret(index))),
+            Err(EngineError::BadSignature)
+        ),
+        "a signature that does not sign the parked sighash must be refused with BadSignature"
+    );
+    assert!(
+        maker.pending_spend(swap_id).is_some(),
+        "a rejected bad signature leaves the claim parked for a retry"
+    );
+
+    // The USER signs the parked sighash with its own claim key and reveals its own secret.
     let usig = secp.sign_ecdsa(&Message::from_digest(sighash), &ukey);
     maker
         .submit_signed_spend(swap_id, usig, upub, Some(user.secret(index)))
