@@ -584,6 +584,10 @@ pub(crate) struct NewOffer {
     /// against the nonkyc reference. Default `0` (exactly the market).
     #[serde(default)]
     pub(crate) margin_pct: Option<i32>,
+    /// Maker-set expiry in whole days (design 0026, #212): the offer is valid this many days from
+    /// publish. `None` or 0 means no explicit expiry (the re-announce TTL still ages it out).
+    #[serde(default)]
+    pub(crate) valid_days: Option<u32>,
     pub(crate) min_amount_sat: u64,
 }
 
@@ -700,6 +704,14 @@ impl NewOffer {
             btc_address: s.current_fee_address(Chain::Btc),
             xbtc_address: s.current_fee_address(Chain::Xbtc),
         });
+        // Maker-set expiry (design 0026, #212): publish time + N days, or None for no explicit expiry.
+        let valid_until = self.valid_days.filter(|&d| d > 0).map(|d| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_secs())
+                .unwrap_or(0);
+            now + d as u64 * 86_400
+        });
         SwapOffer {
             id: random16(),
             maker_chain,
@@ -712,6 +724,7 @@ impl NewOffer {
             taker_lock_depth: 1,
             margin_blocks: margin,
             fee,
+            valid_until,
         }
     }
 }
@@ -814,6 +827,7 @@ mod tests {
             price: Some(1.0),
             counter_amount_sat: None,
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 50_000_000,
         }
     }
@@ -1054,6 +1068,7 @@ mod tests {
             price: None,
             counter_amount_sat: Some(287_000_000),
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(
@@ -1075,6 +1090,7 @@ mod tests {
             price: None,
             counter_amount_sat: Some(2_000_000),
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(partial
@@ -1083,6 +1099,7 @@ mod tests {
             .any(|m| m.contains("min_amount_sat")));
         let atomic = NewOffer {
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 2_000_000,
             ..partial
         };
@@ -1098,6 +1115,7 @@ mod tests {
             price: Some(1.0),
             counter_amount_sat: Some(1_000_000),
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(both
@@ -1112,6 +1130,7 @@ mod tests {
             price: None,
             counter_amount_sat: None,
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(
@@ -1125,6 +1144,7 @@ mod tests {
             price: Some(1.0),
             counter_amount_sat: None,
             margin_pct: Some(2),
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(margin_and_price
@@ -1167,6 +1187,7 @@ mod tests {
             price: Some(1.0),
             counter_amount_sat: None,
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 4_000,
         };
         assert!(
@@ -1184,6 +1205,7 @@ mod tests {
             price: None,
             counter_amount_sat: Some(4_000),
             margin_pct: None,
+            valid_days: None,
             min_amount_sat: 4_000,
         };
         assert!(

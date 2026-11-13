@@ -712,6 +712,7 @@ fn an_offer(id: [u8; 16]) -> Offer {
         taker_lock_depth: 2,
         margin_blocks: 3,
         fee: None,
+        valid_until: None,
     }
 }
 

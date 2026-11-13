@@ -309,6 +309,8 @@ pub(crate) fn offer_to_json(o: &SwapOffer, seen_at: Option<u64>) -> Value {
         "taker_lock_blocks": o.taker_lock_blocks,
         // When this node last saw the offer on its market (#88), for the time column.
         "seen_at": seen_at,
+        // Maker-set expiry (design 0026, #212): unix seconds, or null for no explicit expiry.
+        "valid_until": o.valid_until,
     })
 }
 
@@ -377,6 +379,7 @@ mod tests {
             taker_lock_depth: 1,
             margin_blocks: 6,
             fee: None,
+            valid_until: None,
         }
     }
 
