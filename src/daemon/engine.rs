@@ -237,6 +237,7 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     s.own_side(),
                     s.offer.maker_lock_blocks,
                     s.offer.taker_lock_blocks,
+                    s.key_index,
                 )
             });
             // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
@@ -245,7 +246,7 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
             // 0027: if a user-held swap is parked awaiting the user's claim/refund signature, surface
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
-            let detail = base.map(|(mut j, side, mlb, tlb)| {
+            let detail = base.map(|(mut j, side, mlb, tlb, key_index)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
@@ -254,6 +255,9 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                         "claim": claim,
                         "sighash": sighash.to_lower_hex_string(),
                     });
+                    // 0027: the swap's key index, so a user-held browser knows which key derived from
+                    // its seed to sign the parked spend with. Public data (an index, not a key).
+                    j["key_index"] = json!(key_index);
                 }
                 match engine.chain_view(id) {
                     Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
