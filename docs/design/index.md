@@ -45,6 +45,8 @@ The notes below are listed in order. Each links to the full text.
   keeping the normal fee address as the default.
 - [0019 - Adopt a user-broadcast funding lock](/design/0019-adopt-a-user-broadcast-funding-lock) -
   recognising a lock the user broadcast themselves.
+- [0027 - User-held claim/refund signing and watchtower broadcast](/design/0027-user-held-claim-refund-and-watchtower) -
+  moving claim, refund and the secret off a hosted engine, with an optional non-custodial watchtower.
 
 ## Fees
 
