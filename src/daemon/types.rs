@@ -19,10 +19,10 @@ pub(crate) const DUST_SAT: u64 = 10_000;
 /// dust-sized swaps. A setting below this is rejected at config load.
 pub(crate) const MIN_SWAP_FLOOR_SAT: u64 = 3_000;
 
-/// A sane band for a swap price, so a fat-fingered or hostile rate is caught before it is published.
-pub(crate) const MIN_PRICE: f64 = 0.5;
-
-pub(crate) const MAX_PRICE: f64 = 2.0;
+/// Default for `price_band_pct` (design 0025): how far, in whole percent, an offer's price may sit from
+/// the nonkyc reference. Replaces the old absolute `MIN_PRICE`/`MAX_PRICE` band, which was meaningless
+/// for a lopsided pair. Operator-configurable; this is only the default.
+pub(crate) const DEFAULT_PRICE_BAND_PCT: u32 = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -151,6 +151,13 @@ pub struct Settings {
     /// engine's bid validation.
     #[serde(default = "default_min_swap_sat")]
     pub min_swap_sat: u64,
+    /// The coin-split classifier's fork height: the first block that differs between the SHA256 and
+    /// Blake2b chains. Defaults to mainnet (`split::MAINNET_FORK_HEIGHT` = 961,632); a regtest/test
+    /// deployment sets its `-testactivationheight=blake2b@N` value here so classify works there. It is a
+    /// consensus fact, not a preference; verify uses the -5 existence check regardless, so a wrong value
+    /// can only misclassify, never declare a replayable coin safe.
+    #[serde(default = "default_split_fork_height")]
+    pub split_fork_height: u32,
     /// Smallest trade the voluntary-fee path acts on, in sats. Defaults to the production
     /// `MIN_TRADE_SAT` (100_000), so existing configs are unchanged. Lower it only on a test
     /// deployment that wants the fee to apply to a small (real-rate dust) leg, where xBTC being far
@@ -181,6 +188,11 @@ pub struct Settings {
     /// Opt-in external price reference (nonkyc BTCB2/BTC, fetched over Tor). A hint only; off by default.
     #[serde(default)]
     pub price_reference: bool,
+    /// Market-anchored pricing band (design 0025): how far, in whole percent, an offer's price may sit
+    /// from the nonkyc reference before publish rejects it. Operator-configurable; `.catch` keeps an
+    /// existing config on the default when the key is absent.
+    #[serde(default = "default_price_band_pct")]
+    pub price_band_pct: u32,
     /// Voluntary fee (design 0010). On by default for a fresh install, paying the project's per-chain
     /// addresses; an operator can turn it off in the Fee config action. `serde(default)` is `false`, so
     /// an existing config that never had the key stays off (no silent migration); only a truly fresh
@@ -224,6 +236,25 @@ pub struct Settings {
     pub btc_explorer_url: String,
     #[serde(default)]
     pub xbtc_explorer_url: String,
+    /// User-held claim/refund signing (0027, the 2b non-custodial hosted core). When true, the engine
+    /// does NOT sign claim/refund spends: it parks them for the user to sign in their own browser and
+    /// `submit_signed_spend` broadcasts. Default false keeps today's local-signing behaviour, so a
+    /// standalone node and the current product are unchanged. Enable it only on a hosted deployment
+    /// whose browser holds the keys and verifies the swap's contracts against its own commitment bundle
+    /// before signing the funding PSBT (the 2b custody chain, see issue #226); flipping it on without
+    /// that browser-side check leaves the funding contract trusted to the operator. Absent in older
+    /// config, hence `serde(default)`.
+    #[serde(default)]
+    pub user_held_spends: bool,
+    /// Public-relay profile (design 0030): set this on a node that serves OTHER people (a public,
+    /// non-custodial deployment), as opposed to a private/standalone node. When true it turns on the
+    /// non-custodial safety bundle so the operator cannot accidentally run a public service with keys on
+    /// the infra: `user_held_spends` is forced on (claim/refund are the user's, signed in their browser),
+    /// and the daemon REFUSES to start with hot funding on either chain (funding must be cold or
+    /// interactive, so no spendable funding key lives on the host). Default false = a private node, which
+    /// keeps today's behaviour. Absent in older config, hence `serde(default)`.
+    #[serde(default)]
+    pub public_relay: bool,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -283,6 +314,9 @@ pub(crate) const MAX_FEE_BPS: u16 = 100;
 fn default_min_swap_sat() -> u64 {
     DUST_SAT
 }
+fn default_split_fork_height() -> u32 {
+    crate::split::MAINNET_FORK_HEIGHT
+}
 fn default_min_trade_sat() -> u64 {
     crate::fee::MIN_TRADE_SAT
 }
@@ -290,6 +324,10 @@ fn default_min_trade_sat() -> u64 {
 /// amount you can lose, large enough that the real-rate dust swaps we run (a few thousand sat on the
 /// BTC side) are well within it. An operator raises `max_swap_sat` to allow larger swaps.
 pub(crate) const DEFAULT_MAX_SWAP_SAT: u64 = 100_000;
+fn default_price_band_pct() -> u32 {
+    DEFAULT_PRICE_BAND_PCT
+}
+
 fn default_max_swap_sat() -> u64 {
     DEFAULT_MAX_SWAP_SAT
 }
@@ -314,6 +352,7 @@ impl Default for Settings {
             xbtc_conf: 2,
             margin_blocks: 2,
             min_swap_sat: default_min_swap_sat(),
+            split_fork_height: default_split_fork_height(),
             min_trade_sat: default_min_trade_sat(),
             max_swap_sat: default_max_swap_sat(),
             btc_rpc_user: String::new(),
@@ -321,6 +360,7 @@ impl Default for Settings {
             xbtc_rpc_user: String::new(),
             xbtc_rpc_pass: String::new(),
             price_reference: false,
+            price_band_pct: default_price_band_pct(),
             // On by default for a fresh install (design 0010, revised): this reverses the earlier
             // "off until a legal opinion". Shipped WITH the project fee addresses so the default still
             // validates (an enabled fee requires an address). An existing config that lacks the key
@@ -336,6 +376,8 @@ impl Default for Settings {
             xbtc_payout_address: String::new(),
             btc_explorer_url: String::new(),
             xbtc_explorer_url: String::new(),
+            user_held_spends: false,
+            public_relay: false,
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -557,6 +599,16 @@ pub(crate) struct NewOffer {
     /// amount removes both problems, so the band check is skipped and the amount is taken verbatim.
     #[serde(default)]
     pub(crate) counter_amount_sat: Option<u64>,
+    /// A human maker's margin off the market rate, in whole percent (design 0025, 1% steps): positive
+    /// earns the maker more, negative undercuts. Only meaningful on the market-derived path, i.e. when
+    /// neither `price` nor `counter_amount_sat` is given; the resolved price is band-checked at publish
+    /// against the nonkyc reference. Default `0` (exactly the market).
+    #[serde(default)]
+    pub(crate) margin_pct: Option<i32>,
+    /// Maker-set expiry in whole days (design 0026, #212): the offer is valid this many days from
+    /// publish. `None` or 0 means no explicit expiry (the re-announce TTL still ages it out).
+    #[serde(default)]
+    pub(crate) valid_days: Option<u32>,
     pub(crate) min_amount_sat: u64,
 }
 
@@ -592,18 +644,17 @@ impl NewOffer {
         if self.amount_sat > 21_000_000 * 100_000_000 {
             e.push("amount_sat: above the supply cap".to_owned());
         }
-        // Exactly one of `price` or `counter_amount_sat`. The band check guards only the float price
-        // path; an exact counter amount is a plain minimum-leg-and-cap check, with no band.
+        // Pricing is market-anchored (design 0025): the structural rules here are shape-only; the
+        // price-vs-market band check needs the live nonkyc reference and runs in `post_offer`, not here.
+        // At most one explicit rate source (`price` or `counter_amount_sat`). `margin_pct` is only for
+        // the market-derived path, so it may not be combined with an explicit source.
         match (self.price, self.counter_amount_sat) {
             (Some(_), Some(_)) => {
-                e.push("price and counter_amount_sat: set exactly one, not both".to_owned());
-            }
-            (None, None) => {
-                e.push("price or counter_amount_sat: one is required".to_owned());
+                e.push("price and counter_amount_sat: set at most one, not both".to_owned());
             }
             (Some(price), None) => {
-                if !(price.is_finite() && (MIN_PRICE..=MAX_PRICE).contains(&price)) {
-                    e.push(format!("price: expected {MIN_PRICE}..={MAX_PRICE}"));
+                if !(price.is_finite() && price > 0.0) {
+                    e.push("price: must be a positive number".to_owned());
                 }
             }
             (None, Some(counter)) => {
@@ -616,6 +667,16 @@ impl NewOffer {
                     e.push("counter_amount_sat: above the supply cap".to_owned());
                 }
             }
+            // Neither given: the market-derived path (price = market * (1 + margin_pct/100)), resolved
+            // in `post_offer`. Valid; nothing to check structurally here.
+            (None, None) => {}
+        }
+        if self.margin_pct.is_some() && (self.price.is_some() || self.counter_amount_sat.is_some())
+        {
+            e.push(
+                "margin_pct: only on the market-derived path; omit price and counter_amount_sat"
+                    .to_owned(),
+            );
         }
         // Offers are atomic: the whole amount is taken at once. Partial or pro-rata fills are not
         // supported yet (they need offer decrement, re-broadcast, and take-time concurrency), so the
@@ -664,6 +725,14 @@ impl NewOffer {
             btc_address: s.current_fee_address(Chain::Btc),
             xbtc_address: s.current_fee_address(Chain::Xbtc),
         });
+        // Maker-set expiry (design 0026, #212): publish time + N days, or None for no explicit expiry.
+        let valid_until = self.valid_days.filter(|&d| d > 0).map(|d| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_secs())
+                .unwrap_or(0);
+            now + d as u64 * 86_400
+        });
         SwapOffer {
             id: random16(),
             maker_chain,
@@ -676,6 +745,7 @@ impl NewOffer {
             taker_lock_depth: 1,
             margin_blocks: margin,
             fee,
+            valid_until,
         }
     }
 }
@@ -777,6 +847,8 @@ mod tests {
             amount_sat: 50_000_000,
             price: Some(1.0),
             counter_amount_sat: None,
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 50_000_000,
         }
     }
@@ -836,6 +908,44 @@ mod tests {
         assert_eq!((terms.maker_bps, terms.taker_bps), (20, 30));
         assert_eq!(terms.btc_address.as_deref(), Some(sp_addr().as_str()));
         assert_eq!(terms.xbtc_address.as_deref(), Some(sp_addr().as_str()));
+    }
+
+    #[test]
+    fn user_held_spends_defaults_off_and_wires_through_to_the_engine() {
+        use super::super::engine::engine_config;
+        // A config written before 0027 has no user_held_spends; it loads off (serde default), so a
+        // standalone node keeps local-signing, and the engine config reflects that.
+        let old: Settings = serde_json::from_str(
+            r#"{"btc_node":"x","xbtc_node":"y","relays":[],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2}"#,
+        )
+        .unwrap();
+        assert!(!old.user_held_spends);
+        assert!(!engine_config(&old).user_held_spends);
+        // A 2b deployment opts in via config, and it reaches the engine.
+        let on = Settings {
+            user_held_spends: true,
+            ..Settings::default()
+        };
+        assert!(engine_config(&on).user_held_spends);
+    }
+
+    #[test]
+    fn public_relay_profile_forces_user_held_signing() {
+        use super::super::engine::engine_config;
+        // The public-relay profile makes the node non-custodial: even with the raw flag off, the
+        // engine signs nothing locally. (The hot-funding refusal is enforced at start().)
+        let s = Settings {
+            public_relay: true,
+            ..Settings::default()
+        };
+        assert!(
+            !s.user_held_spends,
+            "the raw flag is independent and stays off"
+        );
+        assert!(
+            engine_config(&s).user_held_spends,
+            "public_relay forces user-held claim/refund signing on"
+        );
     }
 
     #[test]
@@ -1016,6 +1126,8 @@ mod tests {
             amount_sat: 1_000_000,
             price: None,
             counter_amount_sat: Some(287_000_000),
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(
@@ -1036,6 +1148,8 @@ mod tests {
             amount_sat: 2_000_000,
             price: None,
             counter_amount_sat: Some(2_000_000),
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(partial
@@ -1043,6 +1157,8 @@ mod tests {
             .iter()
             .any(|m| m.contains("min_amount_sat")));
         let atomic = NewOffer {
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 2_000_000,
             ..partial
         };
@@ -1050,31 +1166,50 @@ mod tests {
     }
 
     #[test]
-    fn price_and_counter_amount_are_mutually_exclusive() {
-        // Both set: refused.
+    fn price_counter_and_margin_are_shaped_right() {
+        // Both price and counter set: refused (at most one explicit source).
         let both = NewOffer {
             sell_chain: Chain::Btc,
             amount_sat: 1_000_000,
             price: Some(1.0),
             counter_amount_sat: Some(1_000_000),
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
         assert!(both
             .validate(DUST_SAT, u64::MAX)
             .iter()
-            .any(|m| m.contains("exactly one")));
-        // Neither set: refused.
+            .any(|m| m.contains("not both")));
+        // Neither set: now VALID structurally - the market-derived path (design 0025). The market
+        // requirement is enforced in post_offer against the reference, not here.
         let neither = NewOffer {
             sell_chain: Chain::Btc,
             amount_sat: 1_000_000,
             price: None,
             counter_amount_sat: None,
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 1_000_000,
         };
-        assert!(neither
+        assert!(
+            neither.validate(DUST_SAT, u64::MAX).is_empty(),
+            "neither price nor counter is the valid market-derived path"
+        );
+        // margin_pct alongside an explicit source: refused (margin is only for the market path).
+        let margin_and_price = NewOffer {
+            sell_chain: Chain::Btc,
+            amount_sat: 1_000_000,
+            price: Some(1.0),
+            counter_amount_sat: None,
+            margin_pct: Some(2),
+            valid_days: None,
+            min_amount_sat: 1_000_000,
+        };
+        assert!(margin_and_price
             .validate(DUST_SAT, u64::MAX)
             .iter()
-            .any(|m| m.contains("one is required")));
+            .any(|m| m.contains("margin_pct")));
     }
 
     #[test]
@@ -1110,6 +1245,8 @@ mod tests {
             amount_sat: 4_000,
             price: Some(1.0),
             counter_amount_sat: None,
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 4_000,
         };
         assert!(
@@ -1126,6 +1263,8 @@ mod tests {
             amount_sat: 4_000,
             price: None,
             counter_amount_sat: Some(4_000),
+            margin_pct: None,
+            valid_days: None,
             min_amount_sat: 4_000,
         };
         assert!(

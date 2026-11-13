@@ -64,11 +64,109 @@ fn every_route_needs_the_token() {
 }
 
 #[test]
+fn split_classify_is_token_gated_and_validates_its_body() {
+    // Coin-split classify endpoint (P5): auth-gated like every route, and its body is validated before
+    // any node I/O, so these cases never touch the Blake2b node.
+    let (addr, token) = daemon();
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", None, "{}").0,
+        401,
+        "classify needs the token"
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", Some(&token), "not json").0,
+        400,
+        "non-JSON body is 400"
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/classify", Some(&token), "{}").0,
+        422,
+        "missing txid is 422"
+    );
+    // /split/verify: same gating + validation.
+    assert_eq!(request(&addr, "POST", "/split/verify", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/verify", Some(&token), "nope").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/verify", Some(&token), "{}").0,
+        422
+    );
+}
+
+#[test]
+fn split_build_and_submit_are_token_gated_and_validate_their_body() {
+    // Coin-split build/submit endpoints (P5): auth-gated, and the body is validated before any node I/O
+    // (build) or state lookup (submit), so these cases never touch a node.
+    let (addr, token) = daemon();
+    // /split/scan (resolve an address to its coins)
+    assert_eq!(request(&addr, "POST", "/split/scan", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/scan", Some(&token), "not json").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/scan", Some(&token), "{}").0,
+        422,
+        "missing address is 422"
+    );
+    // /split/build
+    assert_eq!(request(&addr, "POST", "/split/build", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/build", Some(&token), "not json").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/build", Some(&token), "{}").0,
+        422,
+        "missing dest is 422"
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/split/build",
+            Some(&token),
+            r#"{"dest":"x"}"#
+        )
+        .0,
+        422,
+        "missing sha_coins is 422"
+    );
+    // /split/submit
+    assert_eq!(request(&addr, "POST", "/split/submit", None, "{}").0, 401);
+    assert_eq!(
+        request(&addr, "POST", "/split/submit", Some(&token), "nope").0,
+        400
+    );
+    assert_eq!(
+        request(&addr, "POST", "/split/submit", Some(&token), "{}").0,
+        422,
+        "missing job_id/psbt is 422"
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/split/submit",
+            Some(&token),
+            r#"{"job_id":"nope","psbt":"x"}"#
+        )
+        .0,
+        410,
+        "an unknown job is 410, before any node I/O"
+    );
+}
+
+#[test]
 fn offers_are_validated_and_need_a_running_engine() {
     let (addr, token) = daemon();
-    // Input validation runs regardless of engine state: below dust, out-of-band price, min above
-    // amount are each rejected with reasons (422).
-    let bad = r#"{"sell_chain":"xbtc","amount_sat":100,"price":9.9,"min_amount_sat":999999999}"#;
+    // Input validation runs regardless of engine state: below dust, a non-positive price, and min
+    // above amount are each rejected with reasons (422). The price band is now market-relative
+    // (design 0025) and checked in post_offer against the reference, so a plain structural price check
+    // here only rejects a non-positive price.
+    let bad = r#"{"sell_chain":"xbtc","amount_sat":100,"price":-1,"min_amount_sat":999999999}"#;
     let (code, body) = request(&addr, "POST", "/offers", Some(&token), bad);
     assert_eq!(code, 422, "bad offer not rejected: {body}");
     assert!(
@@ -84,7 +182,7 @@ fn offers_are_validated_and_need_a_running_engine() {
     assert!(body.contains("engine not running"), "wrong reason: {body}");
 
     // Listing offers or swaps with no engine says so plainly; it never returns empty or fake data.
-    for path in ["/offers", "/swaps"] {
+    for path in ["/offers", "/my-offers", "/swaps"] {
         let (code, body) = request(&addr, "GET", path, Some(&token), "");
         assert_eq!(code, 503, "{path} should need a running engine: {body}");
     }

@@ -4,13 +4,16 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::Amount;
 use serde_json::{json, Value};
 
-use crate::engine::{Config as EngineConfig, Engine};
+use crate::engine::{Commitment, Config as EngineConfig, Engine};
+use crate::htlc::PREIMAGE_LEN;
 use crate::policy::Policy;
-use crate::routing::RelayTransport;
+use crate::routing::{MultiConn, RelayTransport};
 use crate::swap::{
     Chain as SwapChain, ChainView, LockView, Offer as SwapOffer, Phase, Role, Side, Swap,
 };
@@ -62,6 +65,8 @@ pub(crate) const TAKER_LOCK_BLOCKS: u16 = 20;
 pub(crate) enum EngineCmd {
     Publish(SwapOffer, Sender<Result<(), String>>),
     Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
+    /// Our own live offers, for the "My offers" view so the maker can withdraw them (#211).
+    OwnOffers(Sender<Vec<SwapOffer>>),
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
@@ -88,6 +93,27 @@ pub(crate) enum EngineCmd {
         psbt: String,
         reply: Sender<Result<(), String>>,
     },
+    /// 0027: the user submits the signature over a parked claim/refund's sighash for a user-held swap.
+    /// `preimage` carries the maker's secret for a user-held maker claim (the user holds it); `None`
+    /// for a refund or a taker claim.
+    SubmitSignedSpend {
+        swap_id: [u8; 16],
+        sig: bitcoin::secp256k1::ecdsa::Signature,
+        pubkey: bitcoin::PublicKey,
+        preimage: Option<[u8; PREIMAGE_LEN]>,
+        reply: Sender<Result<(), String>>,
+    },
+    /// 0027: the user's browser pre-provisions public commitment bundles for upcoming swap indices
+    /// (user-held mode). Public data only; the engine commits one per swap and never reuses it.
+    ProvisionCommitments {
+        entries: Vec<(u32, Commitment)>,
+        reply: Sender<Result<(), String>>,
+    },
+    /// 0027: the next swap index and the pool's provisioned indices, so the browser knows what to top
+    /// up. Read-only, public data.
+    CommitmentStatus(Sender<Value>),
+    /// 0029: per-relay connection status (url + connected), for the connected-relays display.
+    RelayStatus(Sender<Value>),
 }
 
 impl EngineCmd {
@@ -148,7 +174,7 @@ impl SwapView {
 /// Owns the engine, drives it forward on a timer, and serves commands. Ends when the daemon drops its
 /// sender (all senders gone => `Disconnected`).
 pub(crate) fn run_engine(
-    mut engine: Engine<RelayTransport<WsConn>>,
+    mut engine: Engine<RelayTransport<MultiConn<WsConn>>>,
     rx: Receiver<Dispatch>,
     events: Arc<Mutex<Vec<Sender<String>>>>,
 ) {
@@ -192,13 +218,19 @@ pub(crate) fn broadcast(events: &Arc<Mutex<Vec<Sender<String>>>>, line: &str) {
         .retain(|tx| tx.send(line.to_owned()).is_ok());
 }
 
-pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTransport<WsConn>>) {
+pub(crate) fn handle_engine_cmd(
+    cmd: EngineCmd,
+    engine: &mut Engine<RelayTransport<MultiConn<WsConn>>>,
+) {
     match cmd {
         EngineCmd::Publish(offer, reply) => {
             let _ = reply.send(engine.publish(offer).map_err(|e| format!("{e:?}")));
         }
         EngineCmd::Offers(reply) => {
             let _ = reply.send(engine.seen_offers_with_time());
+        }
+        EngineCmd::OwnOffers(reply) => {
+            let _ = reply.send(engine.own_offers().to_vec());
         }
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
@@ -212,14 +244,62 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     s.own_side(),
                     s.offer.maker_lock_blocks,
                     s.offer.taker_lock_blocks,
+                    s.key_index,
+                    json!({
+                        "maker": contract_json(&s.maker_contract),
+                        "taker": contract_json(&s.taker_contract),
+                    }),
                 )
             });
             // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
             // unsigned PSBT so the user can sign it and POST it back to /swaps/{id}/signed-psbt.
             let pending = engine.pending_lock_psbt(id);
-            let detail = base.map(|(mut j, side, mlb, tlb)| {
+            // 0027: if a user-held swap is parked awaiting the user's claim/refund signature, surface
+            // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
+            let pending_spend = engine.pending_spend(id);
+            let spend_template = engine.pending_spend_template(id);
+            let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
+                }
+                if let Some((claim, sighash)) = pending_spend {
+                    let mut ps = json!({
+                        "claim": claim,
+                        "sighash": sighash.to_lower_hex_string(),
+                    });
+                    // 0027: the full spend template, flat keys matching tests/fixtures/htlc_vectors.json,
+                    // so the browser recomputes the BIP143 sighash itself and signs its own digest
+                    // instead of trusting `sighash`. Absent only if the swap changed underneath the
+                    // parked sighash (then there is no stable template to sign).
+                    if let Some(t) = &spend_template {
+                        let txin = &t.unsigned_tx.input[0];
+                        let txout = &t.unsigned_tx.output[0];
+                        let out_sat = txout.value.to_sat();
+                        ps["tx_version"] = json!(t.unsigned_tx.version.0);
+                        ps["locktime"] = json!(t.unsigned_tx.lock_time.to_consensus_u32());
+                        ps["prevout_txid_internal_hex"] =
+                            json!(serialize_hex(&txin.previous_output.txid));
+                        ps["prevout_txid_display"] = json!(txin.previous_output.txid.to_string());
+                        ps["prevout_vout"] = json!(txin.previous_output.vout);
+                        ps["sequence"] = json!(txin.sequence.to_consensus_u32());
+                        ps["value_sat"] = json!(t.input_value.to_sat());
+                        ps["output_value_sat"] = json!(out_sat);
+                        ps["destination_script_pubkey_hex"] =
+                            json!(txout.script_pubkey.as_bytes().to_lower_hex_string());
+                        ps["fee_sat"] = json!(t.input_value.to_sat() - out_sat);
+                        ps["witness_script_hex"] =
+                            json!(t.witness_script.as_bytes().to_lower_hex_string());
+                        ps["unsigned_tx_hex"] = json!(serialize_hex(&t.unsigned_tx));
+                    }
+                    j["pending_spend"] = ps;
+                }
+                // 0027: whenever the user must sign (the funding PSBT or a parked spend), surface the
+                // swap's key index and its contract commitments, so the browser can verify the contracts
+                // commit ITS OWN bundle (keys + secret hash) BEFORE signing, and refuse if a malicious
+                // engine committed foreign keys. Public data (indices and hashes, never a key).
+                if pending.is_some() || pending_spend.is_some() {
+                    j["key_index"] = json!(key_index);
+                    j["contracts"] = contracts;
                 }
                 match engine.chain_view(id) {
                     Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
@@ -272,6 +352,38 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     .map_err(|e| format!("{e:?}")),
             );
         }
+        EngineCmd::SubmitSignedSpend {
+            swap_id,
+            sig,
+            pubkey,
+            preimage,
+            reply,
+        } => {
+            let _ = reply.send(
+                engine
+                    .submit_signed_spend(swap_id, sig, pubkey, preimage)
+                    .map_err(|e| format!("{e:?}")),
+            );
+        }
+        EngineCmd::ProvisionCommitments { entries, reply } => {
+            let _ = reply.send(
+                engine
+                    .provision_commitments(entries)
+                    .map_err(|e| format!("{e:?}")),
+            );
+        }
+        EngineCmd::CommitmentStatus(reply) => {
+            let (next_index, provisioned) = engine.commitment_status();
+            let _ = reply.send(json!({ "next_index": next_index, "provisioned": provisioned }));
+        }
+        EngineCmd::RelayStatus(reply) => {
+            let list: Vec<Value> = engine
+                .relay_status()
+                .into_iter()
+                .map(|r| json!({ "url": r.url, "connected": r.connected }))
+                .collect();
+            let _ = reply.send(json!(list));
+        }
     }
 }
 
@@ -289,6 +401,8 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
         policy,
         btc_payout: payout(&s.btc_payout_address),
         xbtc_payout: payout(&s.xbtc_payout_address),
+        // A public relay is non-custodial by profile: it never signs claim/refund locally (0030).
+        user_held_spends: s.user_held_spends || s.public_relay,
     }
 }
 
@@ -304,11 +418,25 @@ pub(crate) fn offer_to_json(o: &SwapOffer, seen_at: Option<u64>) -> Value {
         "taker_lock_blocks": o.taker_lock_blocks,
         // When this node last saw the offer on its market (#88), for the time column.
         "seen_at": seen_at,
+        // Maker-set expiry (design 0026, #212): unix seconds, or null for no explicit expiry.
+        "valid_until": o.valid_until,
     })
 }
 
 /// The live chain view for the swap-detail screen: heights, each lock's txid and confirmations, and
 /// the countdown until our own lock can be refunded.
+/// The public commitments of a contract, for the browser to verify a swap commits its own bundle
+/// (0027). Hashes and an index only, never a key: `secret_hash` and the claim/refund pubkey hashes as
+/// forward hex (matching a browser `hash160` of the compressed pubkey), plus the relative lock.
+fn contract_json(c: &crate::htlc::Contract) -> Value {
+    json!({
+        "secret_hash": c.secret_hash.to_lower_hex_string(),
+        "claim_pkh": c.claim_pkh.to_byte_array().to_lower_hex_string(),
+        "refund_pkh": c.refund_pkh.to_byte_array().to_lower_hex_string(),
+        "lock_blocks": c.lock_blocks,
+    })
+}
+
 pub(crate) fn chain_view_json(
     view: &ChainView,
     own_side: Side,
@@ -359,6 +487,25 @@ mod tests {
     use bitcoin::OutPoint;
     use std::sync::mpsc;
 
+    #[test]
+    fn contract_json_exposes_commitments_as_forward_hex() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::PubkeyHash;
+        // The browser verifies a swap's contracts against its own bundle using this exact format:
+        // secret_hash and the pubkey hashes as forward hex, matching a browser hash160 of the pubkey.
+        let c = crate::htlc::Contract {
+            secret_hash: [0xab; 32],
+            claim_pkh: PubkeyHash::from_byte_array([0x11; 20]),
+            refund_pkh: PubkeyHash::from_byte_array([0x22; 20]),
+            lock_blocks: 40,
+        };
+        let j = contract_json(&c);
+        assert_eq!(j["secret_hash"], "ab".repeat(32));
+        assert_eq!(j["claim_pkh"], "11".repeat(20));
+        assert_eq!(j["refund_pkh"], "22".repeat(20));
+        assert_eq!(j["lock_blocks"], 40);
+    }
+
     fn test_offer() -> SwapOffer {
         SwapOffer {
             id: [0u8; 16],
@@ -372,6 +519,7 @@ mod tests {
             taker_lock_depth: 1,
             margin_blocks: 6,
             fee: None,
+            valid_until: None,
         }
     }
 

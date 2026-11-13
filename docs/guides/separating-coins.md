@@ -1,13 +1,28 @@
 # Separating your BTC and xBTC coins yourself
 
+> Looking for the simple, guided way (no command line, no node of your own)? See
+> [Protect your BTC (Blake2b) coins](/guides/protect-your-coins). This page is the by-hand method for
+> people who run their own BTC (Blake2b) node.
+
+
 Coins you held at block 961,631 or earlier exist on both chains, BTC and xBTC (Bitcoin Blake2b),
 under the same keys. Until you separate them, a transaction you make on BTC can be copied onto xBTC
 by anyone and confirmed there too, moving your xBTC without your intent. The swap engine refuses to
 lock such coins for exactly this reason.
 
 Separating means spending the xBTC copy once, to yourself, with a signature that only xBTC accepts.
-After that the two copies are independent. This guide does it by hand. The swap engine can do the
-same with every check automated, as a paid function; doing it yourself costs only the network fee.
+After that the two copies are independent.
+
+**This guide needs a Bitcoin Blake2b (Knots) wallet** - one whose signature the BTC chain rejects (the
+default; Shrike is one, [`shrike-startos`](https://github.com/TwentyOneLife/shrike-startos)). If that is
+how you sign, separating is free: just follow the steps below, or simply spend the coin with that wallet.
+
+**If you can only sign the old way** - a hardware wallet, Sparrow, Electrum, an old SeedSigner - this
+by-hand method does not work for you: those signatures are valid on both chains, so nothing is separated
+(see "What can go wrong"). Use the **Split tab in the web UI** instead. It lends a Blake2b-only "marker"
+coin (and recovers it) so the move cannot exist on the BTC chain regardless of how you sign; you sign on
+your own device, non-custodial, for a 0.5% fee. See
+[design 0024](/design/0024-coin-split-replay-protection) for how it works.
 
 **Read the whole guide before you start.** A mistake here can move coins on the wrong chain.
 

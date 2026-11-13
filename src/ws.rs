@@ -12,12 +12,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bitcoin::secp256k1::XOnlyPublicKey;
+use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{client::client_with_config, Error as WsProtoError, Message as WsMessage};
 
 use crate::nostr::{Event, KIND_SWAP};
-use crate::routing::RelayConn;
+use crate::routing::{RelayConn, RelayStatus};
 
 /// Caps on untrusted input from a relay: a message larger than this is refused, and no more than
 /// this many events are buffered (oldest dropped), so a hostile or flooding relay cannot exhaust
@@ -39,6 +39,11 @@ pub struct WsConn {
     /// than silently dropped (#151). Bounded; drained by `take_rejections`.
     rejections: Arc<Mutex<VecDeque<String>>>,
     shutdown: Arc<AtomicBool>,
+    /// The relay URL and whether the worker currently holds a live socket, for the connected-relays
+    /// display (design 0029). `live` is set while the worker is serving and cleared when the socket
+    /// breaks or during reconnect backoff.
+    url: String,
+    live: Arc<AtomicBool>,
     _worker: std::thread::JoinHandle<()>,
 }
 
@@ -76,16 +81,20 @@ impl WsConn {
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let url = url.to_owned();
+        // Connected the instant the first dial succeeded; the worker keeps it current thereafter.
+        let live = Arc::new(AtomicBool::new(initial.is_some()));
+        let worker_live = Arc::clone(&live);
+        let worker_url = url.to_owned();
         let socks = socks.map(str::to_owned);
         let worker = std::thread::spawn(move || {
             run(
-                &url,
+                &worker_url,
                 socks.as_deref(),
                 rx,
                 buffer,
                 worker_rejections,
                 &worker_shutdown,
+                &worker_live,
                 initial,
             );
         });
@@ -94,6 +103,8 @@ impl WsConn {
             incoming,
             rejections,
             shutdown,
+            url: url.to_owned(),
+            live,
             _worker: worker,
         }
     }
@@ -177,6 +188,9 @@ fn connect_with_backoff(
 /// The owner thread: connect if needed, serve the socket until it breaks, then reconnect (unless
 /// shutting down). `initial` is the socket from the synchronous first dial, or `None` when that dial
 /// failed and the first connection must be made here (#113).
+// The worker's inputs are all distinct channels/flags it needs; grouping them into a struct would not
+// make it clearer.
+#[allow(clippy::too_many_arguments)]
 fn run(
     url: &str,
     socks: Option<&str>,
@@ -184,6 +198,7 @@ fn run(
     buffer: Arc<Mutex<VecDeque<Event>>>,
     rejections: Arc<Mutex<VecDeque<String>>>,
     shutdown: &AtomicBool,
+    live: &AtomicBool,
     initial: Option<tungstenite::WebSocket<TcpStream>>,
 ) {
     let mut since: Option<u64> = None;
@@ -191,12 +206,17 @@ fn run(
     loop {
         let mut socket = match next.take() {
             Some(s) => s,
-            None => match connect_with_backoff(url, socks, since, shutdown) {
-                Some(s) => s,
-                None => return, // shutting down
-            },
+            None => {
+                live.store(false, Ordering::Relaxed); // disconnected while backing off
+                match connect_with_backoff(url, socks, since, shutdown) {
+                    Some(s) => s,
+                    None => return, // shutting down
+                }
+            }
         };
+        live.store(true, Ordering::Relaxed); // a live socket, serving
         serve(&mut socket, &rx, &buffer, &rejections, shutdown, &mut since);
+        live.store(false, Ordering::Relaxed); // the socket broke
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
@@ -215,6 +235,12 @@ fn serve(
     shutdown: &AtomicBool,
     since: &mut Option<u64>,
 ) {
+    // Verify every event at this untrusted boundary: an event whose id is not the hash of its content,
+    // or whose signature does not check, is dropped before it is buffered. Without this a hostile relay
+    // could send an event carrying another maker's event id (with junk content) and, once the client
+    // aggregates several relays (design 0029), poison the cross-relay dedup so the real offer is dropped
+    // as already-seen. Verifying here keeps only genuine events in the buffer and the dedup set.
+    let secp = Secp256k1::verification_only();
     let mut last_ping = Instant::now();
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -239,7 +265,8 @@ fn serve(
         }
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
-                if let Some(event) = parse_event_message(&text) {
+                if let Some(event) = parse_event_message(&text).filter(|e| e.verify(&secp).is_ok())
+                {
                     *since = Some(since.map_or(event.created_at, |s| s.max(event.created_at)));
                     let mut buf = buffer.lock().unwrap();
                     if buf.len() >= MAX_BUFFERED_EVENTS {
@@ -310,6 +337,13 @@ impl RelayConn for WsConn {
             .filter(|e| e.pubkey != *subscriber)
             .filter(|e| e.recipient().is_none_or(|to| to == *subscriber))
             .collect()
+    }
+
+    fn status(&self) -> Vec<RelayStatus> {
+        vec![RelayStatus {
+            url: self.url.clone(),
+            connected: self.live.load(Ordering::Relaxed),
+        }]
     }
 }
 

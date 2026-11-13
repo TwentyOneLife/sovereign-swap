@@ -50,6 +50,14 @@ fn serve(stream: TcpStream, valid: Event) {
         ),
     ); // oversized
     send(&mut ws, r#"["NOTICE","ignore me"]"#.to_owned()); // non-EVENT
+                                                           // A well-formed event carrying a CHOSEN id that is NOT the hash of its content (here, the valid
+                                                           // event's own id so it would mask it). It parses but fails verification, so the client must drop it
+                                                           // at ingest; otherwise, once a client aggregates several relays (design 0029), such a forged id
+                                                           // poisons the cross-relay dedup and censors the real offer. Sent BEFORE the good event so a leak
+                                                           // would surface first.
+    let mut forged = valid.clone();
+    forged.content = "cccc".to_owned(); // change the content so the id no longer hashes to it
+    send(&mut ws, format!(r#"["EVENT","s",{}]"#, forged.to_json()));
     send(&mut ws, format!(r#"["EVENT","s",{}]"#, valid.to_json())); // the one good event
                                                                     // Keep the socket open so the client's read loop continues.
     loop {
@@ -78,18 +86,25 @@ fn a_hostile_relay_cannot_break_the_client() {
         .x_only_public_key()
         .0;
 
-    // Despite the flood of junk, oversized and malformed frames, the one valid event arrives and the
-    // connection stays alive (we keep polling well past the attack).
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Despite the flood of junk, oversized, malformed and FORGED frames, only the one genuine event
+    // arrives and the connection stays alive. Collect over a window (not just the first event) so a
+    // leaked forgery, which is sent before the good event, would be caught.
+    let deadline = Instant::now() + Duration::from_secs(4);
     let mut got = Vec::new();
-    while Instant::now() < deadline && got.is_empty() {
+    while Instant::now() < deadline {
         got.extend(conn.poll(&subscriber));
         thread::sleep(Duration::from_millis(30));
     }
     assert_eq!(
         got.len(),
         1,
-        "exactly the one valid event should survive the hostile flood"
+        "only the genuine event survives the hostile flood, got {got:?}"
     );
     assert_eq!(got[0].id, valid.id);
+    // The forged event masqueraded under the same id but different content; the survivor is the genuine
+    // one, proving the forgery was dropped at ingest (not merely deduped by its claimed id).
+    assert_eq!(
+        got[0].content, valid.content,
+        "the surviving event is the genuine one, not the forgery"
+    );
 }
