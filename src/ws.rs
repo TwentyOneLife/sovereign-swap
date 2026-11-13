@@ -12,7 +12,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bitcoin::secp256k1::XOnlyPublicKey;
+use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{client::client_with_config, Error as WsProtoError, Message as WsMessage};
 
@@ -235,6 +235,12 @@ fn serve(
     shutdown: &AtomicBool,
     since: &mut Option<u64>,
 ) {
+    // Verify every event at this untrusted boundary: an event whose id is not the hash of its content,
+    // or whose signature does not check, is dropped before it is buffered. Without this a hostile relay
+    // could send an event carrying another maker's event id (with junk content) and, once the client
+    // aggregates several relays (design 0029), poison the cross-relay dedup so the real offer is dropped
+    // as already-seen. Verifying here keeps only genuine events in the buffer and the dedup set.
+    let secp = Secp256k1::verification_only();
     let mut last_ping = Instant::now();
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -259,7 +265,8 @@ fn serve(
         }
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
-                if let Some(event) = parse_event_message(&text) {
+                if let Some(event) = parse_event_message(&text).filter(|e| e.verify(&secp).is_ok())
+                {
                     *since = Some(since.map_or(event.created_at, |s| s.max(event.created_at)));
                     let mut buf = buffer.lock().unwrap();
                     if buf.len() >= MAX_BUFFERED_EVENTS {
