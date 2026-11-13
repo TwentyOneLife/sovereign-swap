@@ -128,8 +128,28 @@ fn split_build_sign_submit_through_the_daemon() {
         &token,
         &format!(r#"{{"address":"{coin_addr}"}}"#),
     );
-    assert_eq!(code, 200, "scan failed: {body}");
-    let scanned: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(code, 202, "scan start failed: {body}");
+    let started: Value = serde_json::from_str(&body).unwrap();
+    let scan_id = started["scan_id"].as_str().unwrap().to_owned();
+    // The scan runs async on a background thread (#206); poll GET /split/scan/{id} until it is done.
+    let scanned = {
+        let mut out = None;
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(500));
+            let (code, body) = request(&addr, "GET", &format!("/split/scan/{scan_id}"), &token, "");
+            assert_eq!(code, 200, "scan poll failed: {body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            match v["status"].as_str() {
+                Some("done") => {
+                    out = Some(v);
+                    break;
+                }
+                Some("error") => panic!("scan errored: {}", v["error"]),
+                _ => {}
+            }
+        }
+        out.expect("scan did not finish within the poll window")
+    };
     let scoins = scanned["coins"].as_array().unwrap();
     assert!(!scoins.is_empty(), "scan found the address's coins");
     assert!(
