@@ -252,6 +252,134 @@ fn a_user_held_maker_settles_with_the_users_own_key_not_the_engines() {
     }
 }
 
+/// A user-held maker REFUNDS its own lock with the user's own key when the counterparty never locks.
+/// This exercises the refund path the two settle tests do not: `own_refund_pkh` from the bundle, the
+/// refund park, and `submit_signed_spend` with no preimage. The taker bids so the maker starts and
+/// funds, then is never ticked again, so it never locks; the maker's lock times out to a refund.
+#[test]
+fn a_user_held_maker_refunds_with_the_users_own_key() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-uhr-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-uhr-t-{}", std::process::id()));
+    let udir = std::env::temp_dir().join(format!("sovswap-uhr-user-{}", std::process::id()));
+    for d in [&mdir, &tdir, &udir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    std::fs::create_dir_all(&udir).unwrap();
+
+    let mut maker = open(&mdir, "maker", (77, 107), &relay, &core, &knots, true);
+    let mut taker = open(&tdir, "taker", (88, 208), &relay, &core, &knots, false);
+
+    let user = Keys::open(&udir).unwrap();
+    let entries: Vec<(u32, Commitment)> = (0..4u32).map(|i| (i, bundle(&user, i))).collect();
+    maker.provision_commitments(entries).unwrap();
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", serde_json::json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", serde_json::json!([maddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+    wait_for_confirmed_utxo(&knots, "maker");
+
+    maker.publish(offer()).unwrap();
+    tick(&mut taker); // discover the offer
+    taker.bid(&offer(), offer().maker_amount, [9; 16]).unwrap();
+
+    // Drive ONLY the maker: it accepts the bid, funds its xBTC lock, and reaches Locked. The taker is
+    // never ticked again, so it never locks.
+    let mut rounds = 0;
+    let swap_id = loop {
+        tick(&mut maker);
+        knots.mine(1);
+        if let Some(s) = maker.swaps().next() {
+            if s.phase == Phase::Locked {
+                break s.id;
+            }
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "maker never funded its lock: {:?}",
+            maker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    // Mine the maker chain past the lock's timelock so the refund opens, then drive until the maker
+    // parks its refund for the user.
+    let index = maker.swaps().next().unwrap().key_index;
+    knots.mine(u32::from(offer().maker_lock_blocks) + 5);
+    let mut rounds = 0;
+    let sighash = loop {
+        tick(&mut maker);
+        knots.mine(1);
+        if let Some((is_claim, sighash)) = maker.pending_spend(swap_id) {
+            assert!(!is_claim, "an unclaimed maker lock times out to a refund");
+            break sighash;
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "maker never parked a refund: {:?}",
+            maker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    let secp = Secp256k1::new();
+
+    // The engine's own refund key is refused; the contract commits the user's refund pubkey hash.
+    let engine_keys = Keys::open(&mdir).unwrap();
+    let ekey = engine_keys.key(index, Use::Refund);
+    let epub = PublicKey::new(ekey.public_key(&secp));
+    let esig = secp.sign_ecdsa(&Message::from_digest(sighash), &ekey);
+    assert!(
+        maker
+            .submit_signed_spend(swap_id, esig, epub, None)
+            .is_err(),
+        "the engine's own key must not settle a user-held refund"
+    );
+
+    // The user signs the refund with its own refund key; a refund reveals no secret, so no preimage.
+    let ukey = user.key(index, Use::Refund);
+    let upub = PublicKey::new(ukey.public_key(&secp));
+    let usig = secp.sign_ecdsa(&Message::from_digest(sighash), &ukey);
+    maker
+        .submit_signed_spend(swap_id, usig, upub, None)
+        .expect("the user's own key settles the refund");
+
+    let mut rounds = 0;
+    while !matches!(
+        maker.swaps().next().map(|s| s.phase),
+        Some(Phase::Refunded | Phase::Refunding)
+    ) {
+        tick(&mut maker);
+        knots.mine(1);
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "maker refund never confirmed: {:?}",
+            maker.swaps().next().map(|s| s.phase)
+        );
+    }
+
+    for d in [&mdir, &tdir, &udir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// The mirror of the maker test: a user-held TAKER settles against a plain maker. The taker advertises
 /// its bundle's pubkey hashes in the bid and claims the maker's lock with the user's own key. This is
 /// the path that is broken if the bid still sends engine-derived pubkey hashes (the two sides then
