@@ -214,7 +214,16 @@ function renderStatus() {
   const btcTitle = `${chainLong("btc")} node RPC: ${s.btc_node ? "reachable" : "unreachable"}`;
   const xbtcTitle = `${chainLong("xbtc")} node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
   const engineTitle = `Swap engine (the daemon's tick loop): ${s.engine ? "running" : "stopped"}`;
-  const relayTitle = `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
+  // Connected sovereign-relays (your combined market, design 0029): list each with a tick/cross when
+  // the daemon reports per-relay status, else fall back to the plain count.
+  const relays = Array.isArray(s.relay_list) ? s.relay_list : [];
+  const connectedRelays = relays.filter((r) => r.connected).length;
+  const relayTitle = relays.length
+    ? "Connected sovereign-relays (your market): " +
+      relays.map((r) => `${escapeHtml(r.url)} ${r.connected ? "✓" : "✗"}`).join(", ")
+    : `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
+  const relayOk = relays.length ? connectedRelays > 0 : s.relays > 0;
+  const relayLabel = relays.length ? `relays ${connectedRelays}/${relays.length}` : "relay";
   const activeTitle = `Swaps currently in flight on this node: ${s.active_swaps ?? "unknown"}`;
   // Each item groups its dot and label under one tooltip (hover either), and the items are spaced and
   // separated by a thin divider so a glance reads them apart instead of as one run-on string.
@@ -225,7 +234,7 @@ function renderStatus() {
     item(onoff(s.btc_node), btcTitle, chainShort("btc")),
     item(onoff(s.xbtc_node), xbtcTitle, chainShort("xbtc")),
     item(onoff(s.engine), engineTitle, "engine"),
-    item(onoff(s.relays > 0), relayTitle, "relay"),
+    item(onoff(relayOk), relayTitle, relayLabel),
     item(priceState, priceTitle, "price"),
     `<span class="stat" title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`,
   ].join(sep);
@@ -254,24 +263,44 @@ async function loadReference() {
 }
 
 // --- market ---
-let lastOffers = [];
 
-// Price context from OUR order book (no external oracle; xBTC has no liquid market to derive a rate
-// from, so the offers on our relay are the price discovery). Returns the rate range and midpoint for
-// a sell direction, to prefill the create form and show where the market is.
-function rateHint(sellChain) {
-  const rates = lastOffers
-    .filter((o) => o.sell_chain === sellChain)
-    .map((o) => o.counter_amount_sat / o.amount_sat)
-    .filter((r) => isFinite(r) && r > 0)
-    .sort((a, b) => a - b);
-  if (!rates.length) return null;
-  return { count: rates.length, min: rates[0], max: rates[rates.length - 1], mid: rates[Math.floor(rates.length / 2)] };
+// The maker's own offers (#211), with a Withdraw button each. Separate from the market table below,
+// which lists other peers' offers.
+async function loadMyOffers() {
+  const wrap = $("#my-offers"), list = $("#my-offers-list"), msg = $("#my-offers-msg");
+  const offers = await api("GET", "/my-offers").catch(() => []);
+  if (!offers.length) { wrap.classList.add("hidden"); list.innerHTML = ""; msg.textContent = ""; return; }
+  wrap.classList.remove("hidden");
+  msg.textContent = "";
+  list.innerHTML = offers.map((o) =>
+    `<div class="row between" data-id="${escapeHtml(o.id)}" style="padding:.35rem 0;border-bottom:1px solid var(--line)">` +
+    `<span>Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
+    `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}` +
+    (o.valid_until ? ` · expires ${escapeHtml(fmtTime(o.valid_until).text)}` : "") + `</span>` +
+    `<button class="ghost wd-btn" title="Remove this offer from the market (cannot be undone; re-create to re-post)">Withdraw</button></div>`
+  ).join("");
+  list.querySelectorAll(".wd-btn").forEach((b) =>
+    b.addEventListener("click", () => withdrawOffer(b.closest("[data-id]").dataset.id, b))
+  );
+}
+
+async function withdrawOffer(id, btn) {
+  const msg = $("#my-offers-msg");
+  if (btn) { btn.disabled = true; btn.textContent = "Withdrawing…"; }
+  msg.textContent = "";
+  try {
+    await api("POST", "/offers/" + id + "/withdraw");
+    await loadMyOffers();
+    loadMarket();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Withdraw"; }
+    msg.textContent = "✗ " + ((e.data && e.data.error) || "withdraw failed");
+  }
 }
 
 async function loadMarket() {
+  loadMyOffers();
   const offers = await api("GET", "/offers").catch(() => []);
-  lastOffers = offers;
   $("#offers-empty").style.display = offers.length ? "none" : "block";
   mountTable($("#offers"), {
     rows: offers,
@@ -302,28 +331,43 @@ async function loadMarket() {
 }
 
 function offerForm(o) {
-  const sell = o ? o.sell_chain : "xbtc";
-  const hint = o ? null : rateHint(sell);
-  const price = o ? fmtRate(o.counter_amount_sat / o.amount_sat) : (hint ? fmtRate(hint.mid) : "0.997");
-  const hintLine = hint
-    ? `<p class="muted" title="From current offers on your relay; there is no external rate">Market: ${hint.count} offer(s), rate ${fmtRate(hint.min)} - ${fmtRate(hint.max)}. You set your own price.</p>`
-    : o ? "" : `<p class="muted">No offers yet to compare; you set the price (the market discovers it).</p>`;
-  return `<div class="row between"><h2>${o ? "Take offer" : "Create offer"}</h2>
+  if (o) {
+    // Take: the terms are the maker's; you take the whole offer, nothing to set.
+    return `<div class="row between"><h2>Take offer</h2>
+        <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
+      <p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for
+        <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
+        rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
+      <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
+      <div class="row between">
+        <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
+        <button class="primary" id="f-go">Take</button>
+      </div>
+      <p id="f-msg" class="muted"></p>`;
+  }
+  // Create: market-anchored pricing (design 0025). The nonkyc rate is the default and anchor; you add a
+  // whole-percent maker margin. The rate is not something you invent.
+  return `<div class="row between"><h2>Create offer</h2>
       <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
     <label>I am selling
-      <select id="f-chain" ${o ? "disabled" : ""}>
-        <option value="xbtc" ${sell === "xbtc" ? "selected" : ""}>${chainShort("xbtc")}</option>
-        <option value="btc" ${sell === "btc" ? "selected" : ""}>${chainShort("btc")}</option>
+      <select id="f-chain">
+        <option value="xbtc">${chainShort("xbtc")}</option>
+        <option value="btc">${chainShort("btc")}</option>
       </select></label>
-    <label>Amount <input id="f-amount" value="${o ? fmtSats(o.amount_sat) : ""}" placeholder="0.5"></label>
-    <label title="How much of the other coin per unit; you set it, the order book discovers the market">Price <input id="f-price" value="${price}"></label>
-    ${o ? "" : '<label title="For a lopsided real rate (e.g. BTC vs the much cheaper xBTC): the exact total amount of the other coin you want for the whole amount. Overrides Price when set.">Exact counter amount (optional) <input id="f-counter" placeholder="leave blank to use Price"></label>'}
-    ${hintLine}
-    ${o ? "" : '<p id="f-ref" class="muted"></p><p id="f-dev" class="muted" style="color:var(--orange)"></p>'}
+    <label>Amount (<span id="f-sell-coin">${chainShort("xbtc")}</span>) <input id="f-amount" placeholder="0.5"></label>
+    <p id="f-market" class="muted">Loading the market rate…</p>
+    <label title="Your margin off the nonkyc market rate, in whole percent (1% steps). Positive earns you more as the maker; negative undercuts the market to fill faster. The rate comes from nonkyc; you choose only the margin.">
+      Your maker margin (%) <input id="f-margin" type="number" step="1" value="0"></label>
+    <label title="What the taker pays you for the whole amount, priced from the nonkyc rate and your margin. Computed from the market, not editable.">
+      You receive (<span id="f-recv-coin">${chainShort("btc")}</span>) <input id="f-recv" readonly></label>
+    <p id="f-eff" class="muted"></p>
+    <label title="How many days the offer stays valid. After this it is dropped from the market and can no longer be taken. Leave blank for no explicit expiry (it still ages out if you stop re-announcing).">
+      Valid for (days, optional) <input id="f-days" type="number" min="1" step="1" placeholder="no expiry"></label>
+    <div id="f-d6" class="warn hidden"></div>
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
       <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
-      <button class="primary" id="f-go">${o ? "Take" : "Publish offer"}</button>
+      <button class="primary" id="f-go">Publish offer</button>
     </div>
     <p id="f-msg" class="muted"></p>`;
 }
@@ -339,58 +383,90 @@ function openSheet(html) {
 
 function createSheet() {
   openSheet(offerForm(null));
-  // Re-suggest the price from the order book when the direction changes.
-  $("#f-chain").onchange = () => {
-    const h = rateHint($("#f-chain").value);
-    if (h) $("#f-price").value = fmtRate(h.mid);
-    showReference();
-  };
-  // Optional external reference (nonkyc, over Tor) + a fat-finger deviation warning.
-  let refRate = null; // BTC per xBTC
-  async function showReference() {
-    const box = $("#f-ref");
-    if (!box) return;
+  let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
+  const go = $("#f-go");
+
+  // The market price (counter coin per unit of the sold coin) for the current direction.
+  const marketPrice = () =>
+    !ref ? null : $("#f-chain").value === "xbtc" ? ref.rate : 1 / ref.rate;
+
+  async function loadReference() {
     try {
       const r = await api("GET", "/reference-rate");
-      if (!r.enabled) { box.textContent = ""; refRate = null; return; }
-      if (r.error) { box.textContent = "Reference unavailable (" + r.error + "); using the order book."; refRate = null; return; }
-      refRate = r.rate;
-      const sell = $("#f-chain").value;
-      const shown = sell === "xbtc" ? r.rate : 1 / r.rate; // price is per-unit of what you sell
-      const verify = r.verify_url
-        ? ` · <a href="${escapeHtml(r.verify_url)}" target="_blank" rel="noopener noreferrer">verify on nonkyc</a>`
-        : "";
-      box.innerHTML =
-        `Reference: <strong>${shown.toFixed(sell === "xbtc" ? 8 : 4)}</strong> ` +
-        `(${escapeHtml(r.source)})${verify}. You still set the price.`;
-    } catch (e) { box.textContent = ""; refRate = null; }
+      ref =
+        r.enabled && !r.error && isFinite(r.rate) && r.rate > 0
+          ? { rate: r.rate, band: Number.isFinite(r.price_band_pct) ? r.price_band_pct : 10, verify: r.verify_url }
+          : null;
+    } catch (e) {
+      ref = null;
+    }
+    recompute();
   }
-  function checkDeviation() {
-    const w = $("#f-dev");
-    if (!w || refRate === null) return;
-    const sell = $("#f-chain").value;
-    const ref = sell === "xbtc" ? refRate : 1 / refRate;
-    const p = parseFloat($("#f-price").value.replace(",", "."));
-    const off = isFinite(p) && ref > 0 ? Math.abs(p - ref) / ref : 0;
-    w.textContent = off > 0.05 ? `⚠ ${(off * 100).toFixed(0)}% from the reference - check the price.` : "";
+
+  function recompute() {
+    const market = $("#f-market"), eff = $("#f-eff"), d6 = $("#f-d6"), recv = $("#f-recv");
+    const sell = $("#f-chain").value, taker = sell === "xbtc" ? "btc" : "xbtc";
+    // Keep the leg labels in step with the direction.
+    $("#f-sell-coin").textContent = chainShort(sell);
+    $("#f-recv-coin").textContent = chainShort(taker);
+    const amount = parseBtc($("#f-amount").value);
+    if (!ref) {
+      // D6: no reference, no market-derived price. The form prices only from the market, so it cannot
+      // publish until the reference is back.
+      market.textContent = "";
+      eff.textContent = "";
+      recv.value = "";
+      d6.classList.remove("hidden");
+      d6.innerHTML =
+        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference and reopen this form.";
+      go.disabled = true;
+      return;
+    }
+    d6.classList.add("hidden");
+    const verify = ref.verify
+      ? ` · <a href="${escapeHtml(ref.verify)}" target="_blank" rel="noopener noreferrer">verify</a>`
+      : "";
+    market.innerHTML =
+      `Market (nonkyc): 1 ${chainShort("btc")} = <strong>${(1 / ref.rate).toFixed(2)}</strong> ${chainShort("xbtc")} · ` +
+      `1 ${chainShort("xbtc")} = <strong>${ref.rate.toFixed(8)}</strong> ${chainShort("btc")}${verify}. Band ±${ref.band}%.`;
+    const mp = marketPrice();
+    const margin = parseInt($("#f-margin").value, 10) || 0;
+    const overBand = Math.abs(margin) > ref.band;
+    go.disabled = overBand;
+    const profit = margin > 0
+      ? `you ask ${margin}% above market (earn more; may fill slower)`
+      : margin < 0
+        ? `you undercut market by ${-margin}% (fill faster; earn less)`
+        : "exactly the market rate";
+    if (overBand) {
+      recv.value = "";
+      eff.innerHTML = `<span style="color:var(--orange)">⚠ ${margin}% exceeds the ±${ref.band}% band; lower the margin.</span>`;
+      return;
+    }
+    // Market-derived: price = market * (1 + margin/100); the daemon finalizes the counter at publish.
+    const price = mp * (1 + margin / 100);
+    recv.value = amount ? fmtSats(Math.ceil(amount * price)) : "";
+    eff.innerHTML = `Rate ${fmtRate(price)} (${margin >= 0 ? "+" : ""}${margin}% vs market), ${profit}.`;
   }
-  $("#f-price").addEventListener("input", checkDeviation);
-  showReference();
-  $("#f-go").onclick = async () => {
+
+  $("#f-chain").onchange = recompute;
+  $("#f-amount").addEventListener("input", recompute);
+  $("#f-margin").addEventListener("input", recompute);
+  loadReference();
+
+  go.onclick = async () => {
     const amount = parseBtc($("#f-amount").value);
     if (amount === null) return ($("#f-msg").textContent = "Enter a valid amount.");
-    const counterRaw = $("#f-counter") ? $("#f-counter").value.trim() : "";
-    const body = { sell_chain: $("#f-chain").value, amount_sat: amount, min_amount_sat: amount };
-    if (counterRaw) {
-      // F1/F2: an exact counter amount expresses a lopsided real rate the band/price-field cannot.
-      const counter = parseBtc(counterRaw);
-      if (counter === null) return ($("#f-msg").textContent = "Enter a valid counter amount.");
-      body.counter_amount_sat = counter;
-    } else {
-      const price = parseFloat($("#f-price").value.replace(",", "."));
-      if (!isFinite(price)) return ($("#f-msg").textContent = "Enter a price or an exact counter amount.");
-      body.price = price;
-    }
+    // Always the market-derived path: send only the whole-percent margin; the daemon prices it off the
+    // live reference, so the published rate is the market rate at publish time, always in band.
+    const body = {
+      sell_chain: $("#f-chain").value,
+      amount_sat: amount,
+      min_amount_sat: amount,
+      margin_pct: parseInt($("#f-margin").value, 10) || 0,
+    };
+    const days = parseInt($("#f-days").value, 10);
+    if (Number.isFinite(days) && days > 0) body.valid_days = days;
     try {
       await api("POST", "/offers", body);
       $("#modal").classList.add("hidden");
@@ -500,30 +576,44 @@ async function loadHistory() {
   const h = await api("GET", "/history").catch(() => null);
   // The ledger lists only terminal swaps; any still in flight show in the Swaps tab (and are counted
   // as "in flight" in the totals line below).
-  const entries = ((h && h.swaps) || []).filter(isTerminal);
+  // Unified ledger (#218): terminal swaps plus completed splits in one table. A split row carries
+  // kind:"split"; swap rows have no kind.
+  const swapRows = ((h && h.swaps) || []).filter(isTerminal);
+  const splitRows = ((h && h.splits) || []).map((s) => ({ ...s, kind: "split" }));
+  const entries = swapRows.concat(splitRows);
+  const isSplit = (r) => r && r.kind === "split";
   const t = h && h.totals;
   $("#history-empty").style.display = entries.length ? "none" : "block";
   $("#history-totals").innerHTML = t
     ? `${t.count} swap(s) · ${t.done} done · ${t.refunded} refunded · ${t.abandoned} abandoned` +
       (t.active ? ` · ${t.active} in flight` : "") +
+      (splitRows.length ? ` · ${splitRows.length} split(s)` : "") +
       ` · volume ${fmtSats(t.volume_sat.btc)} ${chainShort("btc")} / ${fmtSats(t.volume_sat.xbtc)} ${chainShort("xbtc")}` +
       ` · voluntary fee paid ${fmtSats(t.voluntary_fee_paid.total_sat)} over ${t.voluntary_fee_paid.swaps} swap(s)`
     : "";
   mountTable($("#history-table"), {
     rows: entries,
-    rowId: (s) => s.id,
+    rowId: (s) => (isSplit(s) ? "split-" + s.txid : s.id),
     defaultSort: 0, // Started, newest first
     defaultDir: "desc",
     columns: [
-      { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const tt = fmtTime(s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
-      { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
-      { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
-      { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
-      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
-      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+      { label: "Started", get: (s) => (isSplit(s) ? s.time : s.started_at) || 0, cell: (s) => { const tt = fmtTime(isSplit(s) ? s.time : s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
+      { label: "Ref", get: (s) => (isSplit(s) ? s.txid : s.id), cell: (s) => "#" + String(isSplit(s) ? s.txid : s.id).slice(0, 6) },
+      { label: "Role", get: (s) => (isSplit(s) ? "split" : s.role), cell: (s) => (isSplit(s) ? "split" : s.role) },
+      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainShort("xbtc")}` : `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}`) },
+      { label: "Rate", num: true, get: (s) => (isSplit(s) ? 0 : s.rate || 0), cell: (s) => (isSplit(s) ? "-" : fmtRate(s.rate)) },
+      { label: "Fee paid", num: true, get: (s) => (isSplit(s) ? s.fee_sat || 0 : s.voluntary_fee_paid_sat || 0), cell: (s) => (isSplit(s) ? fmtSats(s.fee_sat) : s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat)) },
+      { label: "Phase", get: (s) => (isSplit(s) ? "split" : s.phase), cell: (s) => { if (isSplit(s)) return `<span class="pill phase-done">split</span>`; const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => {
+      if (isSplit(s)) {
+        box.innerHTML =
+          `<p class="muted">Coin split · protected ${fmtSats(s.protected_sat)} ${chainShort("xbtc")} · fee ${fmtSats(s.fee_sat)} ${chainShort("xbtc")}</p>` +
+          `<p class="muted">Separating tx (${chainShort("xbtc")}): ${explorerLink("xbtc", s.txid)}</p>` +
+          (s.inputs && s.inputs.length ? `<p class="muted">Protected coin(s): ${s.inputs.map(escapeHtml).join(", ")}</p>` : "") +
+          (s.dest ? `<p class="muted">Sent to: ${escapeHtml(s.dest)}</p>` : "");
+        return;
+      }
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
       box.innerHTML =
         `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ` +
@@ -554,8 +644,8 @@ async function fillSwapDetail(id, box) {
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">` +
-    `<div class="leg card"><strong>Your leg (${chainLink(ownChain)})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
-    `<div class="leg card"><strong>Counterparty (${chainLink(cpChain)})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
+    `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
+    `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
     `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
@@ -646,6 +736,128 @@ function refresh(tab) {
   if (tab === "market") loadMarket();
   else if (tab === "swaps") loadSwaps();
   else if (tab === "history") loadHistory();
+  else if (tab === "split") loadSplit();
+}
+
+// ---- Split tab: separate a pre-fork coin (classify -> build -> sign -> submit -> verify). The money
+// steps are the daemon's; this is the guided, non-custodial front end. Handlers are wired once (CSP
+// forbids inline onclick), and the per-step <p> shows progress/errors. ----
+let splitJob = null; // { coin: {txid,vout}|null, job_id, txid }
+let splitWired = false;
+function splitErr(e) {
+  return "error: " + ((e.data && e.data.error) || e.status || e.message || e);
+}
+function shortTxid(t) {
+  return t.length > 14 ? t.slice(0, 8) + "…" + t.slice(-4) : t;
+}
+function loadSplit() {
+  if (splitWired) return;
+  splitWired = true;
+  splitJob = { coin: null, job_id: null, txid: null };
+  const build = $("#sp-build"), step1 = $("#sp-step1"), coinsBox = $("#sp-coins");
+  // Any change to the inputs clears a prior coin selection.
+  const reset = () => { splitJob.coin = null; build.disabled = true; coinsBox.innerHTML = ""; step1.textContent = ""; };
+  ["#sp-addr", "#sp-coin"].forEach((s) => $(s).addEventListener("input", reset));
+  const select = (txid, vout, note) => {
+    splitJob.coin = { txid, vout: Number(vout) };
+    build.disabled = false;
+    step1.textContent = "✓ " + note + ' Now click "Build the split".';
+  };
+  const postNote = (n) => (n ? " (" + n + " other coin(s) here are post-fork and already safe.)" : "");
+
+  $("#sp-classify").addEventListener("click", async () => {
+    coinsBox.innerHTML = ""; splitJob.coin = null; build.disabled = true;
+    const coinField = ($("#sp-coin").value || "").trim();
+    const addrField = ($("#sp-addr").value || "").trim();
+    // Advanced path: a specific coin as txid:vout.
+    if (coinField) {
+      const [txid, voutS] = coinField.split(":");
+      if (!txid) { step1.textContent = "The coin must be txid:vout."; return; }
+      step1.textContent = "Checking the coin…";
+      try {
+        const r = await api("POST", "/split/classify", { txid: txid.trim(), vout: Number(voutS || 0) });
+        if (r.needs_split) select(txid.trim(), Number(voutS || 0), "Pre-fork coin, it needs protecting.");
+        else step1.textContent = "This coin is already chain-specific; it does not need protecting.";
+      } catch (e) { step1.textContent = "✗ " + splitErr(e); }
+      return;
+    }
+    // Primary path: scan an address for its coins.
+    if (!addrField) { step1.textContent = "Enter your BTC (SHA256) address (or a specific coin)."; return; }
+    step1.textContent = "Scanning the chain for coins at this address… on mainnet this can take a few minutes.";
+    try {
+      // The scan runs async on the node (#206: scantxoutset is minutes on mainnet). POST starts it and
+      // returns a scan id; poll until it is done (or errors / times out).
+      const start = await api("POST", "/split/scan", { address: addrField });
+      const scanId = start.scan_id;
+      let coins = null;
+      for (let i = 0; i < 220 && coins === null; i++) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const st = await api("GET", "/split/scan/" + scanId);
+        if (st.status === "done") coins = st.coins || [];
+        else if (st.status === "error") throw new Error(st.error || "scan failed");
+      }
+      if (coins === null) throw new Error("scan timed out; please try again");
+      const pre = coins.filter((c) => c.needs_split);
+      const post = coins.length - pre.length;
+      if (pre.length === 0) {
+        step1.textContent = "No pre-fork coins to protect at this address." + postNote(post);
+      } else if (pre.length === 1) {
+        select(pre[0].txid, pre[0].vout, "Found 1 coin to protect, " + fmtSats(pre[0].value_sat) + " BTC." + postNote(post));
+      } else {
+        step1.textContent = "This address has " + pre.length + " coins to protect. Pick one:" + postNote(post);
+        pre.forEach((c) => {
+          const b = document.createElement("button");
+          b.className = "ghost";
+          b.style.margin = ".25rem .25rem 0 0";
+          b.textContent = fmtSats(c.value_sat) + " BTC  (" + shortTxid(c.txid) + ":" + c.vout + ")";
+          b.addEventListener("click", () => {
+            coinsBox.querySelectorAll("button").forEach((x) => (x.style.outline = ""));
+            b.style.outline = "2px solid var(--orange)";
+            select(c.txid, c.vout, "Selected " + fmtSats(c.value_sat) + " BTC.");
+          });
+          coinsBox.appendChild(b);
+        });
+      }
+    } catch (e) { step1.textContent = "✗ " + splitErr(e); }
+  });
+
+  $("#sp-build").addEventListener("click", async () => {
+    if (!splitJob.coin) { step1.textContent = "Find or pick a coin to protect first."; return; }
+    const dest = $("#sp-dest").value.trim();
+    if (!dest) { step1.textContent = "Enter your BTC (Blake2b) destination address first."; return; }
+    step1.textContent = "Building the unsigned transaction…";
+    try {
+      const r = await api("POST", "/split/build", { sha_coins: [splitJob.coin], dest });
+      splitJob.job_id = r.job_id;
+      $("#sp-psbt").value = r.psbt;
+      $("#sp-sign-card").classList.remove("hidden");
+      step1.textContent = "✓ Built. Fee " + fmtSats(r.fee_sat) + " XBT. Sign it in step 3.";
+      $("#sp-sign-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { step1.textContent = "✗ " + splitErr(e); }
+  });
+  $("#sp-submit").addEventListener("click", async () => {
+    const psbt = $("#sp-signed").value.trim();
+    if (!psbt) { $("#sp-step2").textContent = "Paste your signed PSBT first."; return; }
+    $("#sp-step2").textContent = "Checking your signature, co-signing the marker, broadcasting…";
+    try {
+      const r = await api("POST", "/split/submit", { job_id: splitJob.job_id, psbt });
+      splitJob.txid = r.txid;
+      $("#sp-verify-card").classList.remove("hidden");
+      $("#sp-step2").textContent = "✓ Broadcast on BTC (Blake2b). txid " + r.txid;
+      $("#sp-verify-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { $("#sp-step2").textContent = "✗ " + splitErr(e); }
+  });
+  $("#sp-verify").addEventListener("click", async () => {
+    $("#sp-step3").textContent = "Verifying on the BTC (SHA256) node…";
+    try {
+      const r = await api("POST", "/split/verify", { txid: splitJob.txid });
+      $("#sp-step3").textContent = r.final
+        ? "✓ FINAL: replay not possible. Your BTC (SHA256) coin is now safe to spend."
+        : r.separated
+          ? "Separated, but only " + r.confirmations + "/" + r.min_confirmations + " BTC (Blake2b) confirmations, wait a little longer."
+          : "Not separated yet. Check the transaction confirmed on BTC (Blake2b).";
+    } catch (e) { $("#sp-step3").textContent = "✗ " + splitErr(e); }
+  });
 }
 
 loadStatus();
