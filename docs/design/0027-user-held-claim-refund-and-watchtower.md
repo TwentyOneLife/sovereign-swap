@@ -19,6 +19,61 @@ would hold every user's claim/refund keys and secret, which is custody (model 3,
 So 2b requires three things to leave the hosted engine: the claim signature, the refund signature, and
 the maker's secret.
 
+### Correction (2026-11-13): it is not only the signatures and the secret, it is the COMMITMENTS
+
+An architecture review of the first build slices found that moving the signatures alone does not reach
+non-custody, because the CONTRACT ITSELF commits to engine-derived keys. At swap-start the engine builds
+both contracts with `refund_pkh: self.keys.pkh(index, Use::Refund)` /
+`claim_pkh: self.keys.pkh(index, Use::Claim)` and `secret_hash = sha256(self.keys.secret(index))`
+(`engine.rs` ~1116-1135). `htlc::finalize` checks the supplied pubkey against the committed pkh, so the
+ONLY key that can ever finalize the parked spend is the engine's own. A parked/handed-off signature from
+a genuinely user-held key would be rejected. So the park/resume handoff (section 1) and the user-held
+secret (section 2) are necessary but not sufficient: the CONTRACT must commit to the USER's claim/refund
+pubkey hashes and the USER's `H(s)` in the first place. That is the commitment bundle below, and it is
+the real unit of 2b non-custody. Until it exists, `user_held_spends` must stay OFF (gate tracked in
+`#226`).
+
+### 0. The per-swap commitment bundle and the pre-provisioned pool
+
+The user's browser runs the SAME `KeyStore` derivation (`keys.rs`: `key`/`pkh`/`secret` over
+`[PURPOSE, swap_index, use]`) from the user's OWN seed, which the hosted engine never holds. Per swap it
+yields a public commitment bundle and nothing secret:
+
+```
+Commitment { secret_hash: [u8;32], claim_pkh: PubkeyHash, refund_pkh: PubkeyHash }   // public only
+```
+
+A Nostr bid arrives while the maker's browser may be offline, so the bundle cannot be fetched on demand
+at swap-start. The browser therefore PRE-PROVISIONS a window of bundles for upcoming `take_index` values
+(the engine's index counter is shared by maker and taker swaps), via a new token-gated local endpoint
+(`POST /commitments`, engine state `commitment_pool: BTreeMap<u32, Commitment>`, persisted with
+`#[serde(default)]`). At swap-start under a user-held swap the engine takes `index = take_index()`, looks
+up `commitment_pool[index]`, builds its own contract parts from that bundle instead of `self.keys`, and
+CONSUMES the entry (never reused). If the pool has no entry for the index, the engine refuses the
+bid/take and the swap does not start. At claim/refund time the browser re-derives `key(index, Use::...)`
+and `secret(index)` from its seed for the swap's recorded `key_index` and signs/reveals.
+
+Why a bundle and not a reused per-offer `H(s)`: reusing one secret across takes of an offer is a theft
+vector (take 1 abandons after the maker locks; take 2 reuses `H(s)`; the maker's take-2 claim reveals
+`s`; take-1's taker reads `s` and sweeps the maker's still-locked take-1 output before its refund
+timelock). The per-`take_index` derivation already in the engine is correct precisely for this reason;
+the bundle keeps it per-swap, only moving the derivation to the user's seed.
+
+No wire/protocol change: the counterparty's pkhs ALREADY cross the wire today (the taker sends its
+claim/refund pkhs in the take; the maker returns `secret_hash` + its pkhs). The bundle only changes where
+each side sources its OWN commitments (user pool vs `self.keys`), so a 2b node and a self-hosted node
+still trade on the same relay with the same messages.
+
+### Per-swap routing, not a global flag at tick time
+
+Whether a swap is user-held is fixed WHEN THE SWAP IS CREATED and recorded on the `Record`
+(`user_held: bool`), then read by park/decide/submit. The global `Config::user_held_spends` only decides
+how NEW swaps are created. Routing by the live config at tick time would break in-flight swaps when the
+gate is flipped (a local-key swap fed a user preimage, or a swap parked for a key the engine does not
+hold). With per-swap routing, `Action::Claim.preimage` becomes `Option<[u8; PREIMAGE_LEN]>` (the park
+and the user-held submit carry `None`/the user's real preimage); the dummy-secret idea is dropped, since
+a user-held swap simply is not handed the engine's secret.
+
 ## The one invariant (unchanged from 0014)
 
 The operator's infrastructure never holds anything that can move a user's coin: no spend key, no seed,
@@ -53,7 +108,8 @@ coin; the user's wallet is the verification point (it shows what it signs).
 The maker's secret must be generated and held client-side (browser/wallet device), not by the hosted
 engine. The engine orchestrates on the hash `H(s)` only:
 
-- The offer/commit carries `H(s)` as today; the engine never needs `s` until it is on chain.
+- The maker's `H(s)` comes from the commitment bundle (section 0), NOT from `sha256(self.keys.secret)`.
+  The engine never holds `s`; it needs it only once, on chain, inside the claim witness.
 - When the maker is to claim the taker's lock, the engine builds the claim template committing to
   `H(s)`; the client signs AND inserts the preimage `s` into the witness. `s` reaches the chain only
   inside that witness, never the engine.
@@ -88,6 +144,13 @@ keeps its client running.
 
 - The hosted engine and the watchtower hold NO spend key, seed, or secret: assert `s` and
   `Use::Claim`/`Use::Refund` keys never leave the client in the 2b path.
+- **Acceptance gate (the test that would have caught the pkh flaw):** a regtest that settles a full
+  user-held swap where the USER is a SEPARATE seed/`KeyStore` the engine never instantiates. The engine
+  gets only the commitment bundle; the user side signs claim/refund and reveals `s`. The engine's own
+  `self.keys` must never be able to finalize. The HTTP tests stop before the engine and the htlc
+  equivalence test signs with the contract key, so neither is sufficient.
+- Pool discipline: the engine refuses a bid/take when `commitment_pool[index]` is absent, and never
+  consumes a bundle twice. Test both (empty-pool refusal, no-reuse).
 - A watchtower cannot redirect: a broadcast transaction's outputs are byte-identical to the user's
   pre-signed one; a tampered output fails signature verification and is un-broadcastable. Test it.
 - The user's wallet rejects a template whose output is not the user's payout address (the verification
@@ -114,8 +177,11 @@ keeps its client running.
 - The multi-tenant web orchestration (per-session engine state, the browser signing UX, session and
   identity management) is the hosted PRODUCT layer, not this protocol change, and is tracked
   separately.
-- Build order: (1) claim/refund handoff first, reusing the 0017 machinery and tests; (2) user-held
-  secret; (3) watchtower last, as an optional add-on once (1) and (2) are adversarially tested.
+- Build order: (1) claim/refund handoff (park/submit) first, reusing the 0017 machinery and tests
+  (DONE, slices 1-2, gated); (2) the commitment bundle + pool + per-swap routing + user-held secret
+  (section 0 and section 2), which is what actually makes (1) non-custodial; (3) watchtower last, as an
+  optional add-on once (1) and (2) are adversarially tested. The acceptance gate for (2) is the
+  separate-seed regtest below, NOT the HTTP tests.
 
 ## Out of scope
 
