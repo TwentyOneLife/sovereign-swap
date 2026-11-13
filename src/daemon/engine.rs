@@ -90,6 +90,13 @@ pub(crate) enum EngineCmd {
         psbt: String,
         reply: Sender<Result<(), String>>,
     },
+    /// 0027: the user submits the signature over a parked claim/refund's sighash for a user-held swap.
+    SubmitSignedSpend {
+        swap_id: [u8; 16],
+        sig: bitcoin::secp256k1::ecdsa::Signature,
+        pubkey: bitcoin::PublicKey,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 impl EngineCmd {
@@ -277,6 +284,18 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     .map_err(|e| format!("{e:?}")),
             );
         }
+        EngineCmd::SubmitSignedSpend {
+            swap_id,
+            sig,
+            pubkey,
+            reply,
+        } => {
+            let _ = reply.send(
+                engine
+                    .submit_signed_spend(swap_id, sig, pubkey)
+                    .map_err(|e| format!("{e:?}")),
+            );
+        }
     }
 }
 
@@ -294,6 +313,7 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
         policy,
         btc_payout: payout(&s.btc_payout_address),
         xbtc_payout: payout(&s.xbtc_payout_address),
+        user_held_spends: false,
     }
 }
 

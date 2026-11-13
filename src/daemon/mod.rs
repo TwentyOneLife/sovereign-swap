@@ -700,6 +700,13 @@ impl Daemon {
             {
                 self.post_signed_psbt(path_id(p, "/swaps/", "/signed-psbt"), &req.body)
             }
+            ("POST", p)
+                if p.starts_with("/swaps/")
+                    && p.ends_with("/signed-spend")
+                    && valid_id(path_id(p, "/swaps/", "/signed-spend")) =>
+            {
+                self.post_signed_spend(path_id(p, "/swaps/", "/signed-spend"), &req.body)
+            }
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -1569,6 +1576,53 @@ impl Daemon {
             reply,
         }) {
             Ok(Ok(())) => (200, json!({ "funded": swap_id.to_hex_string(Case::Lower) })),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// 0027: the user submits their signature over a parked claim/refund's sighash (user-held spends).
+    /// Body `{"sig":"<DER hex>","pubkey":"<compressed hex>"}`. The engine finalizes and broadcasts.
+    fn post_signed_spend(&self, swap_id_hex: &str, body: &[u8]) -> (u16, Value) {
+        let Ok(swap_id) = <[u8; 16]>::from_hex(swap_id_hex) else {
+            return (400, json!({"error": "bad swap id"}));
+        };
+        #[derive(Deserialize)]
+        struct Submit {
+            sig: String,
+            pubkey: String,
+        }
+        let Ok(submit) = serde_json::from_slice::<Submit>(body) else {
+            return (
+                400,
+                json!({"error": "expected a JSON object with hex sig and pubkey fields"}),
+            );
+        };
+        let Ok(sig_bytes) = Vec::<u8>::from_hex(&submit.sig) else {
+            return (400, json!({"error": "sig must be hex"}));
+        };
+        let Ok(sig) = bitcoin::secp256k1::ecdsa::Signature::from_der(&sig_bytes) else {
+            return (
+                400,
+                json!({"error": "sig is not a valid DER ECDSA signature"}),
+            );
+        };
+        let Ok(pub_bytes) = Vec::<u8>::from_hex(&submit.pubkey) else {
+            return (400, json!({"error": "pubkey must be hex"}));
+        };
+        let Ok(pubkey) = bitcoin::PublicKey::from_slice(&pub_bytes) else {
+            return (400, json!({"error": "pubkey is not a valid public key"}));
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::SubmitSignedSpend {
+            swap_id,
+            sig,
+            pubkey,
+            reply,
+        }) {
+            Ok(Ok(())) => (200, json!({ "spent": swap_id.to_hex_string(Case::Lower) })),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }
