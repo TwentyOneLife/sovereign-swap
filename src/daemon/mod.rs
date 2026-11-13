@@ -254,6 +254,22 @@ impl Daemon {
         let Some(relay) = settings.relays.first() else {
             return Err("no relay configured".to_owned());
         };
+        // Public-relay profile (design 0030): a node serving other people must not hold a spendable
+        // funding key on the infra. Refuse to start with hot funding on either chain; cold or
+        // interactive funding keeps the keys off the host. (user_held_spends is forced on separately in
+        // engine_config, so claim/refund are the user's too.)
+        if settings.public_relay {
+            for (chain, funding) in [
+                ("btc", &settings.btc_funding),
+                ("xbtc", &settings.xbtc_funding),
+            ] {
+                if funding.mode == FundingMode::Hot {
+                    return Err(format!(
+                        "public_relay is set but {chain}_funding is hot: a public relay must not hold hot keys on the infra; use cold or interactive funding"
+                    ));
+                }
+            }
+        }
         // A wallet name unique to this daemon's identity, so two daemons sharing one pair of nodes
         // (as in tests, or a shared node setup) do not collide on the same wallet.
         let wallet = format!(

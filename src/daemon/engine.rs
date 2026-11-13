@@ -361,7 +361,8 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
         policy,
         btc_payout: payout(&s.btc_payout_address),
         xbtc_payout: payout(&s.xbtc_payout_address),
-        user_held_spends: s.user_held_spends,
+        // A public relay is non-custodial by profile: it never signs claim/refund locally (0030).
+        user_held_spends: s.user_held_spends || s.public_relay,
     }
 }
 
