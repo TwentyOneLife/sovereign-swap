@@ -34,7 +34,7 @@ use crate::envelope::Identity;
 use crate::feescan;
 use crate::htlc::PREIMAGE_LEN;
 use crate::node::{ChainBackend, ChainNode};
-use crate::routing::RelayTransport;
+use crate::routing::{MultiConn, RelayTransport};
 use crate::rpc::Client;
 use crate::signer::{InteractiveSigner, RemoteSigner};
 use crate::ws::WsConn;
@@ -355,7 +355,16 @@ impl Daemon {
         // Infallible by design (#113): a relay that is momentarily unreachable (a Tor-SOCKS race at
         // boot) must not stop the engine from starting and driving in-flight swaps. The connection's
         // worker attaches to the relay, and reconnects, asynchronously; /status shows the relay state.
-        let conn = WsConn::connect(relay, socks.as_deref());
+        // Client-side federation (design 0029): connect to EVERY configured relay and present them as
+        // one market via `MultiConn` (publish to all, poll + dedup). `relays.first()` above only
+        // guaranteed at least one; here we use them all so separate sovereign-relays combine.
+        let conn = MultiConn::new(
+            settings
+                .relays
+                .iter()
+                .map(|r| WsConn::connect(r, socks.as_deref()))
+                .collect(),
+        );
         let transport = RelayTransport::new(
             Identity::from_seed(&self.identity_seed),
             &self.routing_seed,
@@ -807,6 +816,14 @@ impl Daemon {
         } else {
             json!(0)
         };
+        // Per-relay connection status (design 0029): which sovereign-relays (markets) this node is
+        // connected to. Only meaningful with the engine up; the count stays in `relays` for compat.
+        let relay_list = if running {
+            self.engine_call::<Value>(EngineCmd::RelayStatus)
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
         // Fee scanner totals, per chain (design 0013, scan-only): how many fee outputs the operator
         // has collected and their total sats. Zero and present even when no scanner runs.
         let btc_scan = self.scan_btc.lock().unwrap().clone();
@@ -815,6 +832,7 @@ impl Daemon {
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
             "relays": settings.relays.len(),
+            "relay_list": relay_list,
             "engine": running,
             "active_swaps": active_swaps,
             // Per-chain explorer bases for the web UI to link txids (#67); empty = render as plain text.

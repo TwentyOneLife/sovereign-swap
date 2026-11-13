@@ -710,6 +710,12 @@ impl<T: Transport> Engine<T> {
         &self.state.own_offers
     }
 
+    /// Per-relay connection status (design 0029), for the client to show which relays (markets) it is
+    /// connected to. Delegates to the transport.
+    pub fn relay_status(&self) -> Vec<crate::routing::RelayStatus> {
+        self.transport.relay_status()
+    }
+
     /// Takes one of our offers off the market: drops it locally so `/offers` stops serving it and it
     /// cannot be taken, and broadcasts a `Withdraw` so peers drop it from their seen offers. A no-op
     /// if we do not hold the offer.
