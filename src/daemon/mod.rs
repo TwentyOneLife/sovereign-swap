@@ -844,7 +844,33 @@ impl Daemon {
             return Self::not_running();
         }
         match self.engine_call(EngineCmd::History) {
-            Ok(v) => (200, v),
+            Ok(mut v) => {
+                // Unified ledger (#218): add split operations as a `splits` array (newest first). Swap
+                // entries carry no `kind`; split entries carry `kind:"split"`, so the GUI can render both
+                // in one History table. Splits are daemon-local state, not the engine's.
+                let splits: Vec<Value> = {
+                    let st = self.split.lock().unwrap();
+                    st.history()
+                        .iter()
+                        .rev()
+                        .map(|r| {
+                            json!({
+                                "kind": "split",
+                                "txid": r.txid,
+                                "time": r.time,
+                                "protected_sat": r.protected_sat,
+                                "fee_sat": r.fee_sat,
+                                "inputs": r.inputs,
+                                "dest": r.dest,
+                            })
+                        })
+                        .collect()
+                };
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("splits".to_owned(), json!(splits));
+                }
+                (200, v)
+            }
             Err(e) => (503, json!({ "error": e })),
         }
     }
@@ -1206,7 +1232,7 @@ impl Daemon {
         };
 
         // Prepare inputs (kinds derived on-chain) and build. On any failure, release the reservation.
-        let build = (|| -> Result<(String, u64, String), (u16, Value)> {
+        let build = (|| -> Result<(String, u64, String, u64), (u16, Value)> {
             let mut prepared = Vec::new();
             for (txid, vout) in &coins {
                 let p = crate::split::prepare_input(&xbtc, fork_height, txid, *vout)
@@ -1230,17 +1256,15 @@ impl Daemon {
                     .map_err(|e| (422, json!({"error": format!("{e}")})))?;
             let unsigned_hex = psbt_unsigned_hex(&psbt)
                 .ok_or((500, json!({"error": "could not read built tx"})))?;
-            let fee_sat = crate::split::project_fee_sat(
-                prepared
-                    .iter()
-                    .filter(|p| p.input.kind == crate::split::CoinKind::ShaCoin)
-                    .map(|p| p.input.value_sat)
-                    .sum(),
-                crate::split::FEE_BPS,
-            );
-            Ok((psbt, fee_sat, unsigned_hex))
+            let protected_sat: u64 = prepared
+                .iter()
+                .filter(|p| p.input.kind == crate::split::CoinKind::ShaCoin)
+                .map(|p| p.input.value_sat)
+                .sum();
+            let fee_sat = crate::split::project_fee_sat(protected_sat, crate::split::FEE_BPS);
+            Ok((psbt, fee_sat, unsigned_hex, protected_sat))
         })();
-        let (psbt, fee_sat, unsigned_hex) = match build {
+        let (psbt, fee_sat, unsigned_hex, protected_sat) = match build {
             Ok(v) => v,
             Err(err) => {
                 let mut st = self.split.lock().unwrap();
@@ -1252,6 +1276,16 @@ impl Daemon {
         {
             let mut st = self.split.lock().unwrap();
             st.set_job(&job_id, unsigned_hex);
+            // Park the display metadata (#218) so a successful submit becomes a History entry.
+            st.set_meta(
+                &job_id,
+                crate::split::SplitMeta {
+                    protected_sat,
+                    fee_sat,
+                    inputs: coins.iter().map(|(t, v)| format!("{t}:{v}")).collect(),
+                    dest: dest_str.to_owned(),
+                },
+            );
             let _ = st.save(&self.data_dir.join("split.json"));
         }
         (
@@ -1348,6 +1382,8 @@ impl Daemon {
             // taint `txid` (finish_job) - the change can never be lent as a future marker.
             let mut st = self.split.lock().unwrap();
             st.finish_job(job_id, txid.clone());
+            // Record the completed split in the History ledger (#218).
+            st.record_submit(job_id, txid.clone(), unix_now());
             let _ = st.save(&self.data_dir.join("split.json"));
         }
         (200, json!({"txid": txid}))
