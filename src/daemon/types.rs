@@ -236,6 +236,16 @@ pub struct Settings {
     pub btc_explorer_url: String,
     #[serde(default)]
     pub xbtc_explorer_url: String,
+    /// User-held claim/refund signing (0027, the 2b non-custodial hosted core). When true, the engine
+    /// does NOT sign claim/refund spends: it parks them for the user to sign in their own browser and
+    /// `submit_signed_spend` broadcasts. Default false keeps today's local-signing behaviour, so a
+    /// standalone node and the current product are unchanged. Enable it only on a hosted deployment
+    /// whose browser holds the keys and verifies the swap's contracts against its own commitment bundle
+    /// before signing the funding PSBT (the 2b custody chain, see issue #226); flipping it on without
+    /// that browser-side check leaves the funding contract trusted to the operator. Absent in older
+    /// config, hence `serde(default)`.
+    #[serde(default)]
+    pub user_held_spends: bool,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -357,6 +367,7 @@ impl Default for Settings {
             xbtc_payout_address: String::new(),
             btc_explorer_url: String::new(),
             xbtc_explorer_url: String::new(),
+            user_held_spends: false,
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -887,6 +898,25 @@ mod tests {
         assert_eq!((terms.maker_bps, terms.taker_bps), (20, 30));
         assert_eq!(terms.btc_address.as_deref(), Some(sp_addr().as_str()));
         assert_eq!(terms.xbtc_address.as_deref(), Some(sp_addr().as_str()));
+    }
+
+    #[test]
+    fn user_held_spends_defaults_off_and_wires_through_to_the_engine() {
+        use super::super::engine::engine_config;
+        // A config written before 0027 has no user_held_spends; it loads off (serde default), so a
+        // standalone node keeps local-signing, and the engine config reflects that.
+        let old: Settings = serde_json::from_str(
+            r#"{"btc_node":"x","xbtc_node":"y","relays":[],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2}"#,
+        )
+        .unwrap();
+        assert!(!old.user_held_spends);
+        assert!(!engine_config(&old).user_held_spends);
+        // A 2b deployment opts in via config, and it reaches the engine.
+        let on = Settings {
+            user_held_spends: true,
+            ..Settings::default()
+        };
+        assert!(engine_config(&on).user_held_spends);
     }
 
     #[test]

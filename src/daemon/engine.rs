@@ -351,7 +351,7 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
         policy,
         btc_payout: payout(&s.btc_payout_address),
         xbtc_payout: payout(&s.xbtc_payout_address),
-        user_held_spends: false,
+        user_held_spends: s.user_held_spends,
     }
 }
 
