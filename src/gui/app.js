@@ -776,8 +776,18 @@ function loadSplit() {
     if (!addrField) { step1.textContent = "Enter your BTC (SHA256) address (or a specific coin)."; return; }
     step1.textContent = "Scanning the chain for coins at this address… on mainnet this can take a few minutes.";
     try {
-      const r = await api("POST", "/split/scan", { address: addrField });
-      const coins = r.coins || [];
+      // The scan runs async on the node (#206: scantxoutset is minutes on mainnet). POST starts it and
+      // returns a scan id; poll until it is done (or errors / times out).
+      const start = await api("POST", "/split/scan", { address: addrField });
+      const scanId = start.scan_id;
+      let coins = null;
+      for (let i = 0; i < 220 && coins === null; i++) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const st = await api("GET", "/split/scan/" + scanId);
+        if (st.status === "done") coins = st.coins || [];
+        else if (st.status === "error") throw new Error(st.error || "scan failed");
+      }
+      if (coins === null) throw new Error("scan timed out; please try again");
       const pre = coins.filter((c) => c.needs_split);
       const post = coins.length - pre.length;
       if (pre.length === 0) {
