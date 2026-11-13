@@ -567,30 +567,44 @@ async function loadHistory() {
   const h = await api("GET", "/history").catch(() => null);
   // The ledger lists only terminal swaps; any still in flight show in the Swaps tab (and are counted
   // as "in flight" in the totals line below).
-  const entries = ((h && h.swaps) || []).filter(isTerminal);
+  // Unified ledger (#218): terminal swaps plus completed splits in one table. A split row carries
+  // kind:"split"; swap rows have no kind.
+  const swapRows = ((h && h.swaps) || []).filter(isTerminal);
+  const splitRows = ((h && h.splits) || []).map((s) => ({ ...s, kind: "split" }));
+  const entries = swapRows.concat(splitRows);
+  const isSplit = (r) => r && r.kind === "split";
   const t = h && h.totals;
   $("#history-empty").style.display = entries.length ? "none" : "block";
   $("#history-totals").innerHTML = t
     ? `${t.count} swap(s) · ${t.done} done · ${t.refunded} refunded · ${t.abandoned} abandoned` +
       (t.active ? ` · ${t.active} in flight` : "") +
+      (splitRows.length ? ` · ${splitRows.length} split(s)` : "") +
       ` · volume ${fmtSats(t.volume_sat.btc)} ${chainShort("btc")} / ${fmtSats(t.volume_sat.xbtc)} ${chainShort("xbtc")}` +
       ` · voluntary fee paid ${fmtSats(t.voluntary_fee_paid.total_sat)} over ${t.voluntary_fee_paid.swaps} swap(s)`
     : "";
   mountTable($("#history-table"), {
     rows: entries,
-    rowId: (s) => s.id,
+    rowId: (s) => (isSplit(s) ? "split-" + s.txid : s.id),
     defaultSort: 0, // Started, newest first
     defaultDir: "desc",
     columns: [
-      { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const tt = fmtTime(s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
-      { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
-      { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
-      { label: "Rate", num: true, get: (s) => s.rate || 0, cell: (s) => fmtRate(s.rate) },
-      { label: "Fee paid", num: true, get: (s) => s.voluntary_fee_paid_sat || 0, cell: (s) => s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat) },
-      { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
+      { label: "Started", get: (s) => (isSplit(s) ? s.time : s.started_at) || 0, cell: (s) => { const tt = fmtTime(isSplit(s) ? s.time : s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
+      { label: "Ref", get: (s) => (isSplit(s) ? s.txid : s.id), cell: (s) => "#" + String(isSplit(s) ? s.txid : s.id).slice(0, 6) },
+      { label: "Role", get: (s) => (isSplit(s) ? "split" : s.role), cell: (s) => (isSplit(s) ? "split" : s.role) },
+      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainShort("xbtc")}` : `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}`) },
+      { label: "Rate", num: true, get: (s) => (isSplit(s) ? 0 : s.rate || 0), cell: (s) => (isSplit(s) ? "-" : fmtRate(s.rate)) },
+      { label: "Fee paid", num: true, get: (s) => (isSplit(s) ? s.fee_sat || 0 : s.voluntary_fee_paid_sat || 0), cell: (s) => (isSplit(s) ? fmtSats(s.fee_sat) : s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat)) },
+      { label: "Phase", get: (s) => (isSplit(s) ? "split" : s.phase), cell: (s) => { if (isSplit(s)) return `<span class="pill phase-done">split</span>`; const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => {
+      if (isSplit(s)) {
+        box.innerHTML =
+          `<p class="muted">Coin split · protected ${fmtSats(s.protected_sat)} ${chainShort("xbtc")} · fee ${fmtSats(s.fee_sat)} ${chainShort("xbtc")}</p>` +
+          `<p class="muted">Separating tx (${chainShort("xbtc")}): ${explorerLink("xbtc", s.txid)}</p>` +
+          (s.inputs && s.inputs.length ? `<p class="muted">Protected coin(s): ${s.inputs.map(escapeHtml).join(", ")}</p>` : "") +
+          (s.dest ? `<p class="muted">Sent to: ${escapeHtml(s.dest)}</p>` : "");
+        return;
+      }
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
       box.innerHTML =
         `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ` +

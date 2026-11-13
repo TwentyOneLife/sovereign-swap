@@ -765,6 +765,33 @@ impl MarkerPool {
     }
 }
 
+/// Display metadata for a pending split job (#218): the amounts, inputs and destination known at build
+/// time, parked so a successful `/split/submit` can turn them into a persisted history entry with the
+/// broadcast txid. Not the unsigned tx (that is `jobs`); this is only for the History ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitMeta {
+    /// Total value of the SHA-Coins being separated (the value the dest receives, minus fees).
+    pub protected_sat: u64,
+    /// The project fee charged on the separated value.
+    pub fee_sat: u64,
+    /// The SHA-Coins being split, as `"txid:vout"`.
+    pub inputs: Vec<String>,
+    /// The destination address the protected coin is sent to.
+    pub dest: String,
+}
+
+/// A completed split operation, persisted so it shows in the History ledger alongside swaps (#218).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitRecord {
+    pub txid: String,
+    /// Unix seconds when the split was broadcast.
+    pub time: u64,
+    pub protected_sat: u64,
+    pub fee_sat: u64,
+    pub inputs: Vec<String>,
+    pub dest: String,
+}
+
 /// The persisted split-service state: the lent-marker [`MarkerPool`] plus the pending jobs (the exact
 /// unsigned transaction we built per job, so `/split/submit` can require the submitted PSBT to be the
 /// very transaction we built and reserved a marker for). Persisted to `split.json` in the data dir, so a
@@ -774,6 +801,13 @@ pub struct SplitState {
     pub pool: MarkerPool,
     /// job_id -> the exact unsigned transaction we built (hex), matched byte-for-byte at submit.
     jobs: HashMap<String, String>,
+    /// job_id -> build-time display metadata (#218), moved into `history` on a successful submit.
+    /// `#[serde(default)]` so an existing split.json without it still loads.
+    #[serde(default)]
+    meta: HashMap<String, SplitMeta>,
+    /// Completed splits, newest appended last (#218). `#[serde(default)]` for backward-compatible load.
+    #[serde(default)]
+    history: Vec<SplitRecord>,
 }
 
 impl SplitState {
@@ -798,6 +832,31 @@ impl SplitState {
         self.jobs.insert(job_id.to_owned(), unsigned_tx_hex);
     }
 
+    /// Park the build-time display metadata for `job_id` (#218), consumed by [`record_submit`].
+    pub fn set_meta(&mut self, job_id: &str, meta: SplitMeta) {
+        self.meta.insert(job_id.to_owned(), meta);
+    }
+
+    /// On a successful broadcast, append a completed-split history entry (#218) from the job's parked
+    /// metadata plus the broadcast `txid` and `time`, and drop the metadata. If the metadata is absent
+    /// (a job built before this field existed), a minimal entry is still recorded so the split shows.
+    pub fn record_submit(&mut self, job_id: &str, txid: String, time: u64) {
+        let m = self.meta.remove(job_id);
+        self.history.push(SplitRecord {
+            txid,
+            time,
+            protected_sat: m.as_ref().map(|m| m.protected_sat).unwrap_or(0),
+            fee_sat: m.as_ref().map(|m| m.fee_sat).unwrap_or(0),
+            inputs: m.as_ref().map(|m| m.inputs.clone()).unwrap_or_default(),
+            dest: m.map(|m| m.dest).unwrap_or_default(),
+        });
+    }
+
+    /// The completed-split history, oldest first (the GUI sorts for display) (#218).
+    pub fn history(&self) -> &[SplitRecord] {
+        &self.history
+    }
+
     /// The exact unsigned tx we built for `job_id`, to match a submitted PSBT against.
     pub fn job(&self, job_id: &str) -> Option<&str> {
         self.jobs.get(job_id).map(String::as_str)
@@ -808,6 +867,7 @@ impl SplitState {
     pub fn expire(&mut self, now: u64, timeout: u64) {
         for job_id in self.pool.expire(now, timeout) {
             self.jobs.remove(&job_id);
+            self.meta.remove(&job_id);
         }
     }
 
@@ -1383,6 +1443,36 @@ mod tests {
         pool.release("job");
         assert_eq!(pool.available_count(), 1);
         assert_eq!(pool.reserved_count(), 0);
+    }
+
+    #[test]
+    fn a_submitted_split_is_recorded_in_history() {
+        // #218: a successful submit turns the job's parked metadata into a persisted history entry.
+        let mut st = SplitState::default();
+        st.set_meta(
+            "job-h",
+            SplitMeta {
+                protected_sat: 50_000,
+                fee_sat: 250,
+                inputs: vec!["aaaa:0".to_owned(), "bbbb:1".to_owned()],
+                dest: "bc1qdest".to_owned(),
+            },
+        );
+        assert!(st.history().is_empty());
+        st.record_submit("job-h", "ffff".to_owned(), 1_700_000_000);
+        let h = st.history();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].txid, "ffff");
+        assert_eq!(h[0].time, 1_700_000_000);
+        assert_eq!(h[0].protected_sat, 50_000);
+        assert_eq!(h[0].fee_sat, 250);
+        assert_eq!(h[0].inputs, vec!["aaaa:0", "bbbb:1"]);
+        assert_eq!(h[0].dest, "bc1qdest");
+        // A submit with no parked metadata still records a minimal entry, so the split still shows.
+        st.record_submit("job-missing", "eeee".to_owned(), 1_700_000_100);
+        assert_eq!(st.history().len(), 2);
+        assert_eq!(st.history()[1].txid, "eeee");
+        assert_eq!(st.history()[1].protected_sat, 0);
     }
 
     #[test]
