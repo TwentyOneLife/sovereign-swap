@@ -170,6 +170,30 @@ keeps its client running.
   trade on the SAME relay and market with the SAME protocol; add an interop test asserting a 2b-signed
   order and a self-hosted order match and settle.
 
+## Spend template exposure (what it is, and what it is NOT)
+
+The swap detail exposes a spend TEMPLATE for a parked user-held claim/refund (`pending_spend` carries,
+beside `claim` and `sighash`, the unsigned tx, the witness script, the prevout, the input value, the
+single output and its value, the fee, the sequence, the version and the locktime, flat keys matching
+`tests/fixtures/htlc_vectors.json`). It lets the browser recompute the BIP143 sighash from first
+principles and sign its OWN computed digest instead of trusting the engine's `sighash`. The engine
+rebuilds it read-only through the same `build_spend` the signature submission uses, so what it exposes
+is exactly what the engine would spend.
+
+This DOES NOT by itself close the theft path. In the hosted model the engine is untrusted, so it can
+serve any template together with a matching sighash. For the browser to be safe it must, with the
+template:
+
+- rebuild the witness script from ITS OWN verified contract and reject a template whose
+  `witness_script_hex` differs (do not trust the exposed script);
+- check the single output's destination against a reference the browser owns: a payout address or a
+  derivation from its own funding descriptor (the per-identity funding work), since the template alone
+  cannot show the destination is the user's;
+- bound the fee (`value_sat - output_value_sat`) so a hostile engine cannot burn the claim to miners.
+
+Until those browser checks land, `user_held_spends` / `public_relay` stay off on any live deployment;
+exposing the template is a precondition for them, not a substitute.
+
 ## Scope and sequencing
 
 - In scope: the claim/refund handoff (section 1), the user-held secret (section 2), and the watchtower

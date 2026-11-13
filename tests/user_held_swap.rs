@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, Network, PublicKey, ScriptBuf, Transaction, Txid};
 
 use common::{binaries, Node};
@@ -241,6 +242,33 @@ fn a_user_held_maker_settles_with_the_users_own_key_not_the_engines() {
         "a rejected bad signature leaves the claim parked for a retry"
     );
 
+    // 0027: the exposed spend template must be a faithful description of the parked spend, so the
+    // browser can recompute the BIP143 sighash itself rather than trust the engine's value. Recompute
+    // it INDEPENDENTLY from the template's own raw fields (tx + witness script + input value) with
+    // SighashCache and require it to equal the parked sighash. This catches a template whose exposed
+    // fields do not actually produce that sighash (a wrong input value, script, or output).
+    let tmpl = maker
+        .pending_spend_template(swap_id)
+        .expect("a parked user-held claim exposes its spend template");
+    assert!(tmpl.claim, "the parked spend here is a claim");
+    assert_eq!(
+        tmpl.sighash, sighash,
+        "the template reports the parked sighash"
+    );
+    let recomputed = SighashCache::new(&tmpl.unsigned_tx)
+        .p2wsh_signature_hash(
+            0,
+            &tmpl.witness_script,
+            tmpl.input_value,
+            EcdsaSighashType::All,
+        )
+        .expect("input 0 is in the template tx")
+        .to_byte_array();
+    assert_eq!(
+        recomputed, sighash,
+        "the template's own fields recompute the parked sighash the browser is asked to sign"
+    );
+
     // The USER signs the parked sighash with its own claim key and reveals its own secret.
     let usig = secp.sign_ecdsa(&Message::from_digest(sighash), &ukey);
     maker
@@ -249,6 +277,10 @@ fn a_user_held_maker_settles_with_the_users_own_key_not_the_engines() {
     assert!(
         maker.pending_spend(swap_id).is_none(),
         "a settled claim clears the parked spend"
+    );
+    assert!(
+        maker.pending_spend_template(swap_id).is_none(),
+        "a settled claim exposes no spend template"
     );
 
     // The swap runs to completion: the maker's claim (with the user's revealed secret) confirms, the

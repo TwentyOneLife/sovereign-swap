@@ -9,7 +9,7 @@ use bitcoin::{Amount, PubkeyHash, ScriptBuf, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
 use crate::fee::{self, FeeRates};
-use crate::htlc::{Contract, Spend, PREIMAGE_LEN};
+use crate::htlc::{Contract, Spend, UnsignedSpend, PREIMAGE_LEN};
 use crate::keys::{Keys, Use};
 use crate::node::{ChainBackend, ChainNode, FeeDest, NodeError};
 use crate::policy::{Policy, PolicyError};
@@ -346,6 +346,32 @@ impl From<std::io::Error> for EngineError {
     fn from(e: std::io::Error) -> EngineError {
         EngineError::Io(e)
     }
+}
+
+/// The spend a parked claim/refund rebuilds to, from `Engine::build_spend`: the chain to broadcast on,
+/// the unsigned transaction and its BIP143 sighash, the witness script, the input value it spends (not
+/// in the segwit tx), and the claim preimage the engine already knows (`None` for a refund or a
+/// user-held maker claim). Internal; `submit_signed_spend` finalizes it and `pending_spend_template`
+/// exposes the public parts.
+struct RebuiltSpend {
+    chain: Chain,
+    unsigned: UnsignedSpend,
+    witness_script: ScriptBuf,
+    input_value: Amount,
+    preimage: Option<[u8; PREIMAGE_LEN]>,
+}
+
+/// The public spend template a parked user-held swap is awaiting (0027), for the browser to recompute
+/// the BIP143 sighash itself and sign its OWN digest rather than trusting the engine's `sighash`. Holds
+/// no key and no preimage. The browser must still rebuild the witness script from its own verified
+/// contract and check the destination against a reference it owns; this only exposes what the engine
+/// would spend.
+pub struct SpendTemplate {
+    pub claim: bool,
+    pub unsigned_tx: Transaction,
+    pub witness_script: ScriptBuf,
+    pub input_value: Amount,
+    pub sighash: [u8; 32],
 }
 
 /// Tests only: how a cheating counterparty tampers with the voluntary fee output it funds, so the
@@ -839,6 +865,72 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// The role -> (contract, value, destination) construction for a decided claim/refund action,
+    /// built at `fee`, shared by `submit_signed_spend` (which verifies + finalizes it) and
+    /// `pending_spend_template` (which exposes it for the browser). Pure: no `decide`, no chain read,
+    /// no state change, and no park handling - the caller owns those, so the hardened terminal and
+    /// sighash-mismatch branches in `submit_signed_spend` stay exactly where they are.
+    fn build_spend(
+        &self,
+        i: usize,
+        action: &Action,
+        fee: Amount,
+        user_preimage: Option<[u8; PREIMAGE_LEN]>,
+    ) -> Result<RebuiltSpend, EngineError> {
+        let swap = &self.records[i].swap;
+        let (own_chain, own_contract, other_contract, other_amount) = match swap.role {
+            Role::Maker => (
+                swap.offer.maker_chain,
+                &swap.maker_contract,
+                &swap.taker_contract,
+                swap.taker_part,
+            ),
+            Role::Taker => (
+                swap.offer.maker_chain.other(),
+                &swap.taker_contract,
+                &swap.maker_contract,
+                swap.maker_part,
+            ),
+        };
+        match action {
+            Action::Claim { lock, preimage } => {
+                let spend = Spend {
+                    outpoint: *lock,
+                    value: other_amount,
+                    destination: self.records[i].claim_to.clone(),
+                    fee,
+                };
+                Ok(RebuiltSpend {
+                    chain: own_chain.other(),
+                    unsigned: other_contract
+                        .claim_unsigned(&spend)
+                        .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?,
+                    witness_script: other_contract.script(),
+                    input_value: other_amount,
+                    preimage: (*preimage).or(user_preimage),
+                })
+            }
+            Action::Refund { lock, value } => {
+                let spend = Spend {
+                    outpoint: *lock,
+                    value: *value,
+                    destination: self.records[i].refund_to.clone(),
+                    fee,
+                };
+                Ok(RebuiltSpend {
+                    chain: own_chain,
+                    unsigned: own_contract
+                        .refund_unsigned(&spend)
+                        .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?,
+                    witness_script: own_contract.script(),
+                    input_value: *value,
+                    preimage: None,
+                })
+            }
+            _ => unreachable!("caller filters to Claim/Refund"),
+        }
+    }
+
     /// Resume a user-held claim/refund (0027): the user signed the parked spend's sighash, so assemble
     /// it with their signature and broadcast. Mirrors `submit_signed_lock`'s guard: it re-decides
     /// against a fresh chain view and only broadcasts if claim/refund is still the move. A terminal
@@ -886,59 +978,17 @@ impl<T: Transport> Engine<T> {
             }
             return Err(EngineError::NotYetFundable);
         };
-        let swap = self.records[i].swap.clone();
-        let (own_chain, own_contract, other_contract, other_amount) = match swap.role {
-            Role::Maker => (
-                swap.offer.maker_chain,
-                &swap.maker_contract,
-                &swap.taker_contract,
-                swap.taker_part,
-            ),
-            Role::Taker => (
-                swap.offer.maker_chain.other(),
-                &swap.taker_contract,
-                &swap.maker_contract,
-                swap.maker_part,
-            ),
-        };
         let fee = Amount::from_sat(pending.fee_sat);
-        // The claim preimage is whichever is present: the one the re-decided action carries (a taker's
-        // learned secret, or a local maker's own secret) or, for a user-held maker where `decide`
-        // leaves it `None`, the one the user supplied with the signature. `finalize` then checks it
-        // against the committed `secret_hash`. A refund needs none.
-        let (chain, unsigned, preimage) = match action {
-            Action::Claim { lock, preimage } => {
-                let spend = Spend {
-                    outpoint: lock,
-                    value: other_amount,
-                    destination: self.records[i].claim_to.clone(),
-                    fee,
-                };
-                (
-                    own_chain.other(),
-                    other_contract
-                        .claim_unsigned(&spend)
-                        .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?,
-                    preimage.or(user_preimage),
-                )
-            }
-            Action::Refund { lock, value } => {
-                let spend = Spend {
-                    outpoint: lock,
-                    value,
-                    destination: self.records[i].refund_to.clone(),
-                    fee,
-                };
-                (
-                    own_chain,
-                    own_contract
-                        .refund_unsigned(&spend)
-                        .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?,
-                    None,
-                )
-            }
-            _ => unreachable!("filtered to Claim/Refund above"),
-        };
+        // Rebuild the spend at the parked fee. The claim preimage build_spend returns is whichever is
+        // present: the one the re-decided action carries (a taker's learned secret, or a local maker's
+        // own secret) or, for a user-held maker where `decide` leaves it `None`, the one the user
+        // supplied with the signature. `finalize` then checks it against the committed `secret_hash`.
+        let RebuiltSpend {
+            chain,
+            unsigned,
+            preimage,
+            ..
+        } = self.build_spend(i, &action, fee, user_preimage)?;
         if unsigned.sighash != pending.sighash {
             self.records[i].pending_spend = None;
             self.save(&self.records[i])?;
@@ -1004,6 +1054,45 @@ impl<T: Transport> Engine<T> {
             .pending_spend
             .as_ref()?;
         Some((p.claim, p.sighash))
+    }
+
+    /// The full spend template a parked user-held swap is awaiting (0027), so the browser can recompute
+    /// the BIP143 sighash from first principles and sign its own digest. `None` if the swap is not
+    /// awaiting a spend signature, is no longer spendable, or has changed underneath the parked sighash.
+    /// Rebuilt read-only through the same `build_spend` the signature submission uses, so what it
+    /// exposes is exactly what the engine would spend. Decides with `secret = None` (the engine never
+    /// needs the user's secret to describe the spend) and carries no preimage.
+    ///
+    /// The rebuilt-vs-parked sighash check is a FRESHNESS guard, not a security one: a malicious engine
+    /// could serve any template with a matching sighash, so the browser must still rebuild the witness
+    /// script from its own verified contract and check the destination against a reference it owns.
+    pub fn pending_spend_template(&self, id: [u8; 16]) -> Option<SpendTemplate> {
+        let i = self.records.iter().position(|r| r.swap.id == id)?;
+        let sighash = self.records[i].pending_spend.as_ref()?.sighash;
+        let claim = self.records[i].pending_spend.as_ref()?.claim;
+        let fee = Amount::from_sat(self.records[i].pending_spend.as_ref()?.fee_sat);
+        let view = self.view(&self.records[i]).ok()?;
+        // `decide` takes `&mut self` and advances the swap phase; this accessor is read-only, so decide
+        // on a CLONE and discard the transition. The action is identical to the one the real swap would
+        // yield (same state), so the rebuilt spend matches what `submit_signed_spend` builds.
+        let action = self.records[i]
+            .swap
+            .clone()
+            .decide(&view, None)
+            .into_iter()
+            .find(|a| matches!(a, Action::Claim { .. } | Action::Refund { .. }))?;
+        let rebuilt = self.build_spend(i, &action, fee, None).ok()?;
+        // Freshness: if the swap changed underneath the parked sighash there is no stable template.
+        if rebuilt.unsigned.sighash != sighash {
+            return None;
+        }
+        Some(SpendTemplate {
+            claim,
+            unsigned_tx: rebuilt.unsigned.tx,
+            witness_script: rebuilt.witness_script,
+            input_value: rebuilt.input_value,
+            sighash,
+        })
     }
 
     pub fn node(&self, chain: Chain) -> &ChainNode {

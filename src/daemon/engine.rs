@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::Amount;
@@ -256,15 +257,41 @@ pub(crate) fn handle_engine_cmd(
             // 0027: if a user-held swap is parked awaiting the user's claim/refund signature, surface
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
+            let spend_template = engine.pending_spend_template(id);
             let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
                 if let Some((claim, sighash)) = pending_spend {
-                    j["pending_spend"] = json!({
+                    let mut ps = json!({
                         "claim": claim,
                         "sighash": sighash.to_lower_hex_string(),
                     });
+                    // 0027: the full spend template, flat keys matching tests/fixtures/htlc_vectors.json,
+                    // so the browser recomputes the BIP143 sighash itself and signs its own digest
+                    // instead of trusting `sighash`. Absent only if the swap changed underneath the
+                    // parked sighash (then there is no stable template to sign).
+                    if let Some(t) = &spend_template {
+                        let txin = &t.unsigned_tx.input[0];
+                        let txout = &t.unsigned_tx.output[0];
+                        let out_sat = txout.value.to_sat();
+                        ps["tx_version"] = json!(t.unsigned_tx.version.0);
+                        ps["locktime"] = json!(t.unsigned_tx.lock_time.to_consensus_u32());
+                        ps["prevout_txid_internal_hex"] =
+                            json!(serialize_hex(&txin.previous_output.txid));
+                        ps["prevout_txid_display"] = json!(txin.previous_output.txid.to_string());
+                        ps["prevout_vout"] = json!(txin.previous_output.vout);
+                        ps["sequence"] = json!(txin.sequence.to_consensus_u32());
+                        ps["value_sat"] = json!(t.input_value.to_sat());
+                        ps["output_value_sat"] = json!(out_sat);
+                        ps["destination_script_pubkey_hex"] =
+                            json!(txout.script_pubkey.as_bytes().to_lower_hex_string());
+                        ps["fee_sat"] = json!(t.input_value.to_sat() - out_sat);
+                        ps["witness_script_hex"] =
+                            json!(t.witness_script.as_bytes().to_lower_hex_string());
+                        ps["unsigned_tx_hex"] = json!(serialize_hex(&t.unsigned_tx));
+                    }
+                    j["pending_spend"] = ps;
                 }
                 // 0027: whenever the user must sign (the funding PSBT or a parked spend), surface the
                 // swap's key index and its contract commitments, so the browser can verify the contracts
