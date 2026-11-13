@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::Amount;
 use serde_json::{json, Value};
@@ -238,6 +239,10 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     s.offer.maker_lock_blocks,
                     s.offer.taker_lock_blocks,
                     s.key_index,
+                    json!({
+                        "maker": contract_json(&s.maker_contract),
+                        "taker": contract_json(&s.taker_contract),
+                    }),
                 )
             });
             // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
@@ -246,7 +251,7 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
             // 0027: if a user-held swap is parked awaiting the user's claim/refund signature, surface
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
-            let detail = base.map(|(mut j, side, mlb, tlb, key_index)| {
+            let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
@@ -255,9 +260,14 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                         "claim": claim,
                         "sighash": sighash.to_lower_hex_string(),
                     });
-                    // 0027: the swap's key index, so a user-held browser knows which key derived from
-                    // its seed to sign the parked spend with. Public data (an index, not a key).
+                }
+                // 0027: whenever the user must sign (the funding PSBT or a parked spend), surface the
+                // swap's key index and its contract commitments, so the browser can verify the contracts
+                // commit ITS OWN bundle (keys + secret hash) BEFORE signing, and refuse if a malicious
+                // engine committed foreign keys. Public data (indices and hashes, never a key).
+                if pending.is_some() || pending_spend.is_some() {
                     j["key_index"] = json!(key_index);
+                    j["contracts"] = contracts;
                 }
                 match engine.chain_view(id) {
                     Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
@@ -374,6 +384,18 @@ pub(crate) fn offer_to_json(o: &SwapOffer, seen_at: Option<u64>) -> Value {
 
 /// The live chain view for the swap-detail screen: heights, each lock's txid and confirmations, and
 /// the countdown until our own lock can be refunded.
+/// The public commitments of a contract, for the browser to verify a swap commits its own bundle
+/// (0027). Hashes and an index only, never a key: `secret_hash` and the claim/refund pubkey hashes as
+/// forward hex (matching a browser `hash160` of the compressed pubkey), plus the relative lock.
+fn contract_json(c: &crate::htlc::Contract) -> Value {
+    json!({
+        "secret_hash": c.secret_hash.to_lower_hex_string(),
+        "claim_pkh": c.claim_pkh.to_byte_array().to_lower_hex_string(),
+        "refund_pkh": c.refund_pkh.to_byte_array().to_lower_hex_string(),
+        "lock_blocks": c.lock_blocks,
+    })
+}
+
 pub(crate) fn chain_view_json(
     view: &ChainView,
     own_side: Side,
@@ -423,6 +445,25 @@ mod tests {
     use super::*;
     use bitcoin::OutPoint;
     use std::sync::mpsc;
+
+    #[test]
+    fn contract_json_exposes_commitments_as_forward_hex() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::PubkeyHash;
+        // The browser verifies a swap's contracts against its own bundle using this exact format:
+        // secret_hash and the pubkey hashes as forward hex, matching a browser hash160 of the pubkey.
+        let c = crate::htlc::Contract {
+            secret_hash: [0xab; 32],
+            claim_pkh: PubkeyHash::from_byte_array([0x11; 20]),
+            refund_pkh: PubkeyHash::from_byte_array([0x22; 20]),
+            lock_blocks: 40,
+        };
+        let j = contract_json(&c);
+        assert_eq!(j["secret_hash"], "ab".repeat(32));
+        assert_eq!(j["claim_pkh"], "11".repeat(20));
+        assert_eq!(j["refund_pkh"], "22".repeat(20));
+        assert_eq!(j["lock_blocks"], 40);
+    }
 
     fn test_offer() -> SwapOffer {
         SwapOffer {
