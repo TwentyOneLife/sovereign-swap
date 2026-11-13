@@ -107,6 +107,9 @@ pub(crate) enum EngineCmd {
         entries: Vec<(u32, Commitment)>,
         reply: Sender<Result<(), String>>,
     },
+    /// 0027: the next swap index and the pool's provisioned indices, so the browser knows what to top
+    /// up. Read-only, public data.
+    CommitmentStatus(Sender<Value>),
 }
 
 impl EngineCmd {
@@ -322,6 +325,10 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
                     .provision_commitments(entries)
                     .map_err(|e| format!("{e:?}")),
             );
+        }
+        EngineCmd::CommitmentStatus(reply) => {
+            let (next_index, provisioned) = engine.commitment_status();
+            let _ = reply.send(json!({ "next_index": next_index, "provisioned": provisioned }));
         }
     }
 }

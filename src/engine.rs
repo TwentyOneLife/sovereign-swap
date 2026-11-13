@@ -1008,10 +1008,14 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
-    /// The next swap index that will be assigned, and whether its commitment bundle is present, so a
-    /// user-held browser knows how far ahead the pool is provisioned.
-    pub fn commitment_status(&self) -> (u32, usize) {
-        (self.state.next_index, self.state.commitment_pool.len())
+    /// The next swap index that will be assigned, and the sorted indices the commitment pool already
+    /// holds, so a user-held browser knows which indices still need provisioning (it tops up from
+    /// `next_index` upward, skipping any already present). Public data only.
+    pub fn commitment_status(&self) -> (u32, Vec<u32>) {
+        (
+            self.state.next_index,
+            self.state.commitment_pool.keys().copied().collect(),
+        )
     }
 
     /// True if a user-held commitment bundle is provisioned for `index` (peek, does not consume).
@@ -2064,6 +2068,39 @@ mod tests {
             state.seen_at.is_empty(),
             "seen_at defaults empty on an old state"
         );
+    }
+
+    #[test]
+    fn a_pre_0027_engine_state_still_loads_and_commitments_round_trip() {
+        use super::Commitment;
+        use bitcoin::hashes::Hash;
+        use bitcoin::PubkeyHash;
+        // A state written before 0027 has no commitment_pool or bid_commitments; both default empty.
+        let old = r#"{"next_index":3,"own_offers":[],"seen_offers":[],"bids":[]}"#;
+        let state: State = serde_json::from_str(old).unwrap();
+        assert!(state.commitment_pool.is_empty());
+        assert!(state.bid_commitments.is_empty());
+        // A state carrying a commitment (keyed by index) round-trips through save/load.
+        let mut state = State {
+            next_index: 5,
+            ..Default::default()
+        };
+        state.commitment_pool.insert(
+            5,
+            Commitment {
+                secret_hash: [7u8; 32],
+                claim_pkh: PubkeyHash::from_byte_array([1u8; 20]),
+                refund_pkh: PubkeyHash::from_byte_array([2u8; 20]),
+            },
+        );
+        let back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.next_index, 5);
+        let c = back
+            .commitment_pool
+            .get(&5)
+            .expect("commitment round-trips");
+        assert_eq!(c.secret_hash, [7u8; 32]);
+        assert_eq!(c.claim_pkh, PubkeyHash::from_byte_array([1u8; 20]));
     }
 
     #[test]
