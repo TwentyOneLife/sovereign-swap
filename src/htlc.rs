@@ -794,3 +794,218 @@ mod tests {
         );
     }
 }
+
+/// Cross-implementation test vectors for the browser (0027 user-held) signer. The hosted browser must
+/// port `Contract::script`, the P2WSH `script_pubkey`, the BIP143 sighash, and ECDSA signing to JS and
+/// produce byte-identical results, or a user-held claim/refund it signs will not spend. These vectors
+/// are the byte-exact target: this Rust test asserts the engine reproduces every field of the committed
+/// `tests/fixtures/htlc_vectors.json`, and the browser test reads the same file. The engine signs the
+/// raw sighash (no extra hashing) with RFC6979 + low-S; so must the browser, so the deterministic DER
+/// signature is included and must match across the two implementations.
+#[cfg(test)]
+mod test_vectors {
+    use super::*;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hex::DisplayHex;
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::{Txid, WPubkeyHash};
+    use serde_json::{json, Value};
+
+    // Fixed, deterministic inputs. Real secret keys (valid scalars) so the committed pubkey hashes are
+    // genuine hash160s and the signature + finalized-tx vectors exercise the whole signing path.
+    const CLAIM_SK: [u8; 32] = [0x11; 32];
+    const REFUND_SK: [u8; 32] = [0x22; 32];
+    const PREIMAGE: [u8; PREIMAGE_LEN] = [0x07; PREIMAGE_LEN];
+    const PREVOUT_VOUT: u32 = 1;
+    const VALUE_SAT: u64 = 100_000;
+    const FEE_SAT: u64 = 2_000;
+    const DEST_WPKH: [u8; 20] = [0x33; 20];
+    // Number-encoding boundaries for the CSV lock value: minimal push (1), the OP_1..OP_16 edge
+    // (16/17), the one-byte/two-byte edge (127/128, where 128 needs a sign byte), a realistic value,
+    // and the two-byte/three-byte edges (32767/32768) up to the u16 max.
+    const LOCK_VECTORS: [u16; 9] = [1, 16, 17, 127, 128, 144, 32767, 32768, 65535];
+
+    // Prevout txid internal bytes 0x00..0x1f: `Txid::from_byte_array` takes the raw (consensus /
+    // little-endian) order, which is what the serialized tx carries. Deliberately NOT a palindrome,
+    // so the explorer DISPLAY string (`Txid` reverses to big-endian) differs visibly from the raw
+    // bytes and the browser port is forced to get the byte order right, the classic JS bug. The
+    // fixture records both forms so the relationship is pinned.
+    fn prevout_txid_internal() -> [u8; 32] {
+        std::array::from_fn(|i| i as u8)
+    }
+
+    fn pkh(sk: &[u8; 32]) -> PubkeyHash {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(sk).unwrap();
+        PublicKey::new(key.public_key(&secp)).pubkey_hash()
+    }
+
+    fn contract(lock_blocks: u16) -> Contract {
+        Contract {
+            secret_hash: sha256::Hash::hash(&PREIMAGE).to_byte_array(),
+            claim_pkh: pkh(&CLAIM_SK),
+            refund_pkh: pkh(&REFUND_SK),
+            lock_blocks,
+        }
+    }
+
+    fn spend() -> Spend {
+        Spend {
+            outpoint: OutPoint::new(Txid::from_byte_array(prevout_txid_internal()), PREVOUT_VOUT),
+            value: Amount::from_sat(VALUE_SAT),
+            destination: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array(DEST_WPKH)),
+            fee: Amount::from_sat(FEE_SAT),
+        }
+    }
+
+    /// One claim/refund branch: the unsigned tx + sighash the browser must reproduce, then the
+    /// deterministic signature and the finalized spendable tx it must match.
+    fn branch(
+        unsigned: UnsignedSpend,
+        signed: Transaction,
+        sk: &[u8; 32],
+        preimage: Option<[u8; PREIMAGE_LEN]>,
+    ) -> Value {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(sk).unwrap();
+        // The bare DER signature over the sighash (no trailing sighash-type byte): what the browser's
+        // `sign()` returns. The engine/finalize appends SIGHASH_ALL (0x01).
+        let der = secp
+            .sign_ecdsa(&Message::from_digest(unsigned.sighash), &key)
+            .serialize_der()
+            .to_lower_hex_string();
+        json!({
+            "sequence": unsigned.tx.input[0].sequence.to_consensus_u32(),
+            "sighash": unsigned.sighash.to_lower_hex_string(),
+            "unsigned_tx_hex": serialize_hex(&unsigned.tx),
+            "der_signature": der,
+            "pubkey": PublicKey::new(key.public_key(&secp)).to_bytes().to_lower_hex_string(),
+            "preimage": preimage.map(|p| p.to_lower_hex_string()),
+            "signed_tx_hex": serialize_hex(&signed),
+        })
+    }
+
+    /// Signatures whose canonical DER encoding exercises each branch of a hand-rolled DER encoder
+    /// (what the browser signer uses): an `r` with the high bit set (DER prepends a 0x00 sign byte),
+    /// an `r` with a leading zero byte, and an `s` with a leading zero byte (both stripped to minimal
+    /// form). Under low-S, `s` never has its high bit set, so that pad case cannot arise and is not
+    /// listed. Each case signs sha256(counter) with the claim key and records the counter, the digest,
+    /// and the canonical DER the browser must reproduce from the raw (r, s). RFC6979 makes these
+    /// deterministic, so a browser with a broken encoder fails on every retry, which is why a vector
+    /// per branch matters, not just the two plain spend signatures above.
+    fn der_edge_cases() -> Vec<Value> {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&CLAIM_SK).unwrap();
+        // A predicate over the signature's (r, s) big-endian halves, one per DER-encoder branch.
+        type RsPred = fn(&[u8], &[u8]) -> bool;
+        let wanted: [(&str, RsPred); 3] = [
+            ("r_high_bit_set", |r, _s| r[0] >= 0x80),
+            ("r_leading_zero", |r, _s| r[0] == 0x00),
+            ("s_leading_zero", |_r, s| s[0] == 0x00),
+        ];
+        let mut found = [false; 3];
+        let mut out: Vec<Value> = Vec::new();
+        for counter in 0u32.. {
+            let digest = sha256::Hash::hash(&counter.to_be_bytes()).to_byte_array();
+            let sig = secp.sign_ecdsa(&Message::from_digest(digest), &key);
+            let compact = sig.serialize_compact();
+            let (r, s) = compact.split_at(32);
+            for (idx, (case, pred)) in wanted.iter().enumerate() {
+                if !found[idx] && pred(r, s) {
+                    found[idx] = true;
+                    out.push(json!({
+                        "case": case,
+                        "counter": counter,
+                        "digest": digest.to_lower_hex_string(),
+                        "der_signature": sig.serialize_der().as_ref().to_lower_hex_string(),
+                    }));
+                }
+            }
+            if found.iter().all(|&f| f) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Build the full vector set from the engine's own code paths.
+    fn build() -> Value {
+        let secp = Secp256k1::new();
+        let scripts: Vec<Value> = LOCK_VECTORS
+            .iter()
+            .map(|&lock_blocks| {
+                let c = contract(lock_blocks);
+                json!({
+                    "lock_blocks": lock_blocks,
+                    "witness_script_hex": c.script().as_bytes().to_lower_hex_string(),
+                    "script_pubkey_hex": c.script_pubkey().as_bytes().to_lower_hex_string(),
+                })
+            })
+            .collect();
+
+        let c = contract(144);
+        let s = spend();
+        let claim_unsigned = c.claim_unsigned(&s).unwrap();
+        let refund_unsigned = c.refund_unsigned(&s).unwrap();
+        let claim_signed = c
+            .claim(
+                &secp,
+                &s,
+                &SecretKey::from_slice(&CLAIM_SK).unwrap(),
+                &PREIMAGE,
+            )
+            .unwrap();
+        let refund_signed = c
+            .refund(&secp, &s, &SecretKey::from_slice(&REFUND_SK).unwrap())
+            .unwrap();
+
+        json!({
+            "_note": "Cross-implementation vectors for the 0027 browser signer. Generated by the \
+                sovereign-swap engine; the browser port must reproduce every field byte-for-byte. \
+                Regenerate with REGEN_HTLC_VECTORS=1 cargo test test_vectors.",
+            "contract": {
+                "secret_hash": c.secret_hash.to_lower_hex_string(),
+                "preimage": PREIMAGE.to_lower_hex_string(),
+                "claim_pkh": c.claim_pkh.to_string(),
+                "refund_pkh": c.refund_pkh.to_string(),
+                "lock_blocks": c.lock_blocks,
+            },
+            "spend": {
+                "prevout_txid_internal_hex": prevout_txid_internal().to_lower_hex_string(),
+                "prevout_txid_display": s.outpoint.txid.to_string(),
+                "prevout_vout": PREVOUT_VOUT,
+                "value_sat": VALUE_SAT,
+                "fee_sat": FEE_SAT,
+                "output_value_sat": VALUE_SAT - FEE_SAT,
+                "destination_script_pubkey_hex": s.destination.as_bytes().to_lower_hex_string(),
+                "tx_version": 2,
+                "locktime": 0,
+                "sighash_type": "SIGHASH_ALL (0x01)",
+            },
+            "scripts": scripts,
+            "claim": branch(claim_unsigned, claim_signed, &CLAIM_SK, Some(PREIMAGE)),
+            "refund": branch(refund_unsigned, refund_signed, &REFUND_SK, None),
+            "der_signatures": der_edge_cases(),
+        })
+    }
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/htlc_vectors.json");
+
+    #[test]
+    fn test_vectors_match_the_committed_fixture() {
+        let built = build();
+        if std::env::var("REGEN_HTLC_VECTORS").is_ok() {
+            let mut out = serde_json::to_string_pretty(&built).unwrap();
+            out.push('\n');
+            std::fs::write("tests/fixtures/htlc_vectors.json", out).unwrap();
+            return;
+        }
+        let committed: Value = serde_json::from_str(FIXTURE)
+            .expect("committed htlc_vectors.json parses; regenerate with REGEN_HTLC_VECTORS=1");
+        assert_eq!(
+            built, committed,
+            "engine no longer reproduces the committed HTLC vectors; if this change is intended, \
+             regenerate the fixture and update the browser signer to match"
+        );
+    }
+}
