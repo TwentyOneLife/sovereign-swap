@@ -710,6 +710,7 @@ impl Daemon {
                 self.post_signed_spend(path_id(p, "/swaps/", "/signed-spend"), &req.body)
             }
             ("POST", "/commitments") => self.post_commitments(&req.body),
+            ("GET", "/commitments") => self.get_commitments(),
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -1647,6 +1648,18 @@ impl Daemon {
         }) {
             Ok(Ok(())) => (200, json!({ "spent": swap_id.to_hex_string(Case::Lower) })),
             Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// 0027: the next swap index and the indices the pool already holds, so the browser knows which
+    /// upcoming indices still need a commitment bundle (it tops up from `next_index` upward).
+    fn get_commitments(&self) -> (u16, Value) {
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(EngineCmd::CommitmentStatus) {
+            Ok(v) => (200, v),
             Err(e) => (503, json!({ "error": e })),
         }
     }
