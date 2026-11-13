@@ -18,19 +18,23 @@
 mod common;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1};
-use bitcoin::{Amount, PublicKey};
+use bitcoin::{Amount, Network, PublicKey, ScriptBuf, Transaction, Txid};
 
 use common::{binaries, Node};
 use sovereign_swap::engine::{Commitment, Config, Engine, EngineError};
 use sovereign_swap::envelope::Identity;
+use sovereign_swap::htlc::Contract;
 use sovereign_swap::keys::{Keys, Use};
+use sovereign_swap::node::{ChainBackend, ChainNode, NodeError};
 use sovereign_swap::policy::Policy;
 use sovereign_swap::relay::{InProcessConn, Relay};
 use sovereign_swap::routing::RelayTransport;
-use sovereign_swap::swap::{BidError, Chain, Offer, Phase};
+use sovereign_swap::swap::{BidError, Chain, LockView, Offer, Phase};
 
 type Tp = RelayTransport<InProcessConn>;
 
@@ -540,6 +544,186 @@ fn a_user_held_node_refuses_to_bid_without_a_commitment() {
     );
 
     for d in [&mdir, &tdir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// A `ChainBackend` that can hide a lock's spend on demand and records every broadcast (0028). It
+/// delegates everything to a real `ChainNode`; with `hide` set, `lock_view` nulls the spend so the
+/// engine sees the already-broadcast claim as if it had vanished (a restart/eviction), which is the
+/// deterministic trigger for the rebroadcast path without driving a real reorg.
+struct HideSpendBackend {
+    inner: ChainNode,
+    hide: Arc<AtomicBool>,
+    broadcasts: Arc<Mutex<Vec<Txid>>>,
+}
+
+impl ChainBackend for HideSpendBackend {
+    fn network(&self) -> Network {
+        self.inner.network()
+    }
+    fn height(&self) -> Result<u32, NodeError> {
+        self.inner.height()
+    }
+    fn get_tx(&self, txid: Txid) -> Result<Transaction, NodeError> {
+        self.inner.get_tx(txid)
+    }
+    fn watch_contract(&self, contract: &Contract) -> Result<(), NodeError> {
+        self.inner.watch_contract(contract)
+    }
+    fn lock_view(
+        &self,
+        contract: &Contract,
+        amount: Amount,
+        ours: &[ScriptBuf],
+    ) -> Result<Option<LockView>, NodeError> {
+        let mut view = self.inner.lock_view(contract, amount, ours)?;
+        if self.hide.load(Ordering::SeqCst) {
+            if let Some(lv) = view.as_mut() {
+                lv.spend = None;
+            }
+        }
+        Ok(view)
+    }
+    fn broadcast(&self, tx: &Transaction) -> Result<(), NodeError> {
+        self.broadcasts.lock().unwrap().push(tx.compute_txid());
+        self.inner.broadcast(tx)
+    }
+    fn estimate_fee_sat_vb(&self, conf_target: u16) -> Option<u64> {
+        self.inner.estimate_fee_sat_vb(conf_target)
+    }
+}
+
+#[test]
+fn a_user_held_claim_rebroadcasts_after_its_spend_vanishes_without_a_re_sign() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-uhrb-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-uhrb-t-{}", std::process::id()));
+    let udir = std::env::temp_dir().join(format!("sovswap-uhrb-user-{}", std::process::id()));
+    for d in [&mdir, &tdir, &udir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    std::fs::create_dir_all(&udir).unwrap();
+
+    let mut maker = open(&mdir, "maker", (99, 109), &relay, &core, &knots, true);
+    let mut taker = open(&tdir, "taker", (110, 210), &relay, &core, &knots, false);
+
+    // The maker claims the taker's BTC lock, so inject the hide/record backend on the maker's BTC
+    // chain before the swap starts (so it watches the contract through the seam).
+    let hide = Arc::new(AtomicBool::new(false));
+    let broadcasts = Arc::new(Mutex::new(Vec::<Txid>::new()));
+    maker.set_read_backend(
+        Chain::Btc,
+        Box::new(HideSpendBackend {
+            inner: ChainNode::open(core.rpc.clone(), "maker").unwrap(),
+            hide: hide.clone(),
+            broadcasts: broadcasts.clone(),
+        }),
+    );
+
+    let user = Keys::open(&udir).unwrap();
+    let entries: Vec<(u32, Commitment)> = (0..4u32).map(|i| (i, bundle(&user, i))).collect();
+    maker.provision_commitments(entries).unwrap();
+
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", serde_json::json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", serde_json::json!([maddr, 1.0]))
+        .unwrap();
+    let taddr = core
+        .rpc
+        .wallet("taker")
+        .call("getnewaddress", serde_json::json!([]))
+        .unwrap();
+    core.wallet()
+        .call("sendtoaddress", serde_json::json!([taddr, 1.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+    wait_for_confirmed_utxo(&knots, "maker");
+    wait_for_confirmed_utxo(&core, "taker");
+
+    maker.publish(offer()).unwrap();
+    tick(&mut taker);
+    taker.bid(&offer(), offer().maker_amount, [9; 16]).unwrap();
+
+    let mut rounds = 0;
+    let (swap_id, index, sighash) = loop {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        if let Some(s) = maker.swaps().next() {
+            if let Some((is_claim, sighash)) = maker.pending_spend(s.id) {
+                assert!(is_claim);
+                break (s.id, s.key_index, sighash);
+            }
+        }
+        rounds += 1;
+        assert!(rounds < 80, "maker never parked a claim");
+    };
+
+    // The user signs and submits; the engine broadcasts the claim and stores it.
+    let secp = Secp256k1::new();
+    let ukey = user.key(index, Use::Claim);
+    let upub = PublicKey::new(ukey.public_key(&secp));
+    let usig = secp.sign_ecdsa(&Message::from_digest(sighash), &ukey);
+    maker
+        .submit_signed_spend(swap_id, usig, upub, Some(user.secret(index)))
+        .expect("the user settles the claim");
+    assert!(maker.pending_spend(swap_id).is_none());
+    let claim_txid = *broadcasts
+        .lock()
+        .unwrap()
+        .last()
+        .expect("submit broadcast the claim");
+    let before = broadcasts.lock().unwrap().len();
+
+    // Hide the claim's spend: the engine now sees the taker lock as unspent again (as after a restart
+    // that lost the mempool). A tick must REBROADCAST the stored claim, not re-park for a re-sign.
+    hide.store(true, Ordering::SeqCst);
+    tick(&mut maker);
+    {
+        let b = broadcasts.lock().unwrap();
+        assert!(b.len() > before, "the stored claim was rebroadcast");
+        assert_eq!(
+            *b.last().unwrap(),
+            claim_txid,
+            "the rebroadcast is the same stored claim, byte-for-byte"
+        );
+    }
+    assert!(
+        maker.pending_spend(swap_id).is_none(),
+        "rebroadcasting must never re-park the claim for a second signature"
+    );
+
+    // Unhide and settle: the claim is seen again, the swap completes, no re-sign ever happened.
+    hide.store(false, Ordering::SeqCst);
+    let mut rounds = 0;
+    while maker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+        || taker.swaps().next().map(|s| s.phase) != Some(Phase::Done)
+    {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        rounds += 1;
+        assert!(rounds < 80, "stuck after rebroadcast");
+    }
+
+    for d in [&mdir, &tdir, &udir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }
