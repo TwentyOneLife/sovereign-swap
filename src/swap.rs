@@ -176,6 +176,10 @@ pub enum BidError {
     /// design 0018). Taking it would let us commit while unable to fund the fee, stranding the maker's
     /// already-locked coin to a timelock refund, so we refuse up front. Local refusal.
     FeeNotFundable,
+    /// This is a user-held node (0027) but no commitment bundle is provisioned for the index this bid
+    /// would use, so the engine has no user claim/refund pubkey hashes to commit. Refuse before
+    /// bidding rather than stranding a half-open swap when the Accept arrives. Local refusal.
+    NoCommitment,
 }
 
 impl Offer {
@@ -341,7 +345,11 @@ pub enum Action {
     Fund,
     Claim {
         lock: OutPoint,
-        preimage: [u8; PREIMAGE_LEN],
+        /// The maker's secret, revealed in the claim witness. `None` for a user-held maker (0027):
+        /// the engine does not hold the maker's secret, so it cannot fill this, and the user supplies
+        /// it at `submit_signed_spend`. Always `Some` for a local-signing maker (its own secret) and
+        /// for any taker (the secret is public on chain once the maker claims, so the taker learns it).
+        preimage: Option<[u8; PREIMAGE_LEN]>,
     },
     Refund {
         lock: OutPoint,
@@ -381,12 +389,19 @@ impl Swap {
             return vec![];
         }
         match self.role {
-            Role::Maker => self.decide_maker(view, secret.expect("maker always has the secret")),
+            // A local-signing maker passes its own secret; a user-held maker (0027) passes `None`,
+            // since the engine does not hold the secret, and the user reveals it when signing the
+            // claim. The `Action::Claim` carries the `Option` straight through.
+            Role::Maker => self.decide_maker(view, secret),
             Role::Taker => self.decide_taker(view),
         }
     }
 
-    fn decide_maker(&mut self, view: &ChainView, secret: [u8; PREIMAGE_LEN]) -> Vec<Action> {
+    fn decide_maker(
+        &mut self,
+        view: &ChainView,
+        secret: Option<[u8; PREIMAGE_LEN]>,
+    ) -> Vec<Action> {
         let (ha, hb) = (view.maker_chain_height, view.taker_chain_height);
         let Some(own) = &view.maker_lock else {
             return match self.phase {
@@ -484,7 +499,7 @@ impl Swap {
                 self.phase = Phase::Claiming;
                 return vec![Action::Claim {
                     lock: theirs.outpoint,
-                    preimage,
+                    preimage: Some(preimage),
                 }];
             }
         }
@@ -873,7 +888,7 @@ mod tests {
             s.decide(&view(105, 112, own, Some(lock(2, Some(100)))), SECRET),
             vec![Action::Claim {
                 lock: outpoint(2),
-                preimage: [9; 32]
+                preimage: Some([9; 32])
             }]
         );
         assert_eq!(s.phase, Phase::Claiming);
@@ -897,7 +912,7 @@ mod tests {
         // The claim was dropped and the margin has passed meanwhile: claim again anyway.
         let claim = vec![Action::Claim {
             lock: outpoint(2),
-            preimage: [9; 32],
+            preimage: Some([9; 32]),
         }];
         assert_eq!(
             s.decide(
@@ -1041,7 +1056,7 @@ mod tests {
             ),
             vec![Action::Claim {
                 lock: outpoint(2),
-                preimage: [9; 32]
+                preimage: Some([9; 32])
             }]
         );
         assert_eq!(s.phase, Phase::Claiming);
@@ -1051,7 +1066,7 @@ mod tests {
             s.decide(&view(105, 112, own, Some(taker(FeeState::Failed))), SECRET),
             vec![Action::Claim {
                 lock: outpoint(2),
-                preimage: [9; 32]
+                preimage: Some([9; 32])
             }]
         );
         assert_eq!(s.phase, Phase::Claiming);
@@ -1070,7 +1085,7 @@ mod tests {
             s.decide(&view(104, 104, Some(lock(1, Some(100))), Some(own)), None),
             vec![Action::Claim {
                 lock: outpoint(1),
-                preimage: [9; 32]
+                preimage: Some([9; 32])
             }]
         );
     }
@@ -1103,7 +1118,7 @@ mod tests {
         });
         let claim = vec![Action::Claim {
             lock: outpoint(1),
-            preimage: [9; 32],
+            preimage: Some([9; 32]),
         }];
         assert_eq!(
             s.decide(&view(106, 106, Some(lock(1, Some(100))), Some(own)), None),

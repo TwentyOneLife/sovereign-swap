@@ -22,15 +22,17 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{Case, DisplayHex, FromHex};
-use bitcoin::Amount;
+use bitcoin::{Amount, PubkeyHash};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::electrum::ElectrumBackend;
-use crate::engine::Engine;
+use crate::engine::{Commitment, Engine};
 use crate::envelope::Identity;
 use crate::feescan;
+use crate::htlc::PREIMAGE_LEN;
 use crate::node::{ChainBackend, ChainNode};
 use crate::routing::RelayTransport;
 use crate::rpc::Client;
@@ -707,6 +709,7 @@ impl Daemon {
             {
                 self.post_signed_spend(path_id(p, "/swaps/", "/signed-spend"), &req.body)
             }
+            ("POST", "/commitments") => self.post_commitments(&req.body),
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -1591,6 +1594,10 @@ impl Daemon {
         struct Submit {
             sig: String,
             pubkey: String,
+            /// 0027: the maker's secret (hex, 32 bytes), supplied by a user-held maker with its claim
+            /// signature. Omitted for a refund or a taker claim.
+            #[serde(default)]
+            preimage: Option<String>,
         }
         let Ok(submit) = serde_json::from_slice::<Submit>(body) else {
             return (
@@ -1613,6 +1620,21 @@ impl Daemon {
         let Ok(pubkey) = bitcoin::PublicKey::from_slice(&pub_bytes) else {
             return (400, json!({"error": "pubkey is not a valid public key"}));
         };
+        let preimage = match submit.preimage {
+            None => None,
+            Some(ref hex) => {
+                let Ok(bytes) = Vec::<u8>::from_hex(hex) else {
+                    return (400, json!({"error": "preimage must be hex"}));
+                };
+                let Ok(arr) = <[u8; PREIMAGE_LEN]>::try_from(bytes.as_slice()) else {
+                    return (
+                        400,
+                        json!({"error": format!("preimage must be {PREIMAGE_LEN} bytes")}),
+                    );
+                };
+                Some(arr)
+            }
+        };
         if !self.engine_running() {
             return Self::not_running();
         }
@@ -1620,9 +1642,69 @@ impl Daemon {
             swap_id,
             sig,
             pubkey,
+            preimage,
             reply,
         }) {
             Ok(Ok(())) => (200, json!({ "spent": swap_id.to_hex_string(Case::Lower) })),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// 0027: pre-provision user-held commitment bundles for upcoming swap indices. The body is a JSON
+    /// array of `{index, secret_hash, claim_pkh, refund_pkh}` (hex), all PUBLIC data the browser
+    /// derives from the user's own seed. The engine commits one per swap and never reuses it.
+    fn post_commitments(&self, body: &[u8]) -> (u16, Value) {
+        #[derive(Deserialize)]
+        struct Entry {
+            index: u32,
+            secret_hash: String,
+            claim_pkh: String,
+            refund_pkh: String,
+        }
+        let Ok(entries) = serde_json::from_slice::<Vec<Entry>>(body) else {
+            return (
+                400,
+                json!({"error": "expected a JSON array of {index, secret_hash, claim_pkh, refund_pkh} (hex)"}),
+            );
+        };
+        let parse_pkh = |hex: &str| -> Option<PubkeyHash> {
+            let bytes = Vec::<u8>::from_hex(hex).ok()?;
+            PubkeyHash::from_slice(&bytes).ok()
+        };
+        let mut parsed = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let Ok(sh_bytes) = Vec::<u8>::from_hex(&e.secret_hash) else {
+                return (400, json!({"error": "secret_hash must be hex"}));
+            };
+            let Ok(secret_hash) = <[u8; 32]>::try_from(sh_bytes.as_slice()) else {
+                return (400, json!({"error": "secret_hash must be 32 bytes"}));
+            };
+            let (Some(claim_pkh), Some(refund_pkh)) =
+                (parse_pkh(&e.claim_pkh), parse_pkh(&e.refund_pkh))
+            else {
+                return (
+                    400,
+                    json!({"error": "claim_pkh and refund_pkh must be 20-byte hex pubkey hashes"}),
+                );
+            };
+            parsed.push((
+                e.index,
+                Commitment {
+                    secret_hash,
+                    claim_pkh,
+                    refund_pkh,
+                },
+            ));
+        }
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::ProvisionCommitments {
+            entries: parsed,
+            reply,
+        }) {
+            Ok(Ok(())) => (200, json!({ "provisioned": entries.len() })),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
         }

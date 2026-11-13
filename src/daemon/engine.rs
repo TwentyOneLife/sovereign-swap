@@ -8,7 +8,8 @@ use bitcoin::hex::{Case, DisplayHex};
 use bitcoin::Amount;
 use serde_json::{json, Value};
 
-use crate::engine::{Config as EngineConfig, Engine};
+use crate::engine::{Commitment, Config as EngineConfig, Engine};
+use crate::htlc::PREIMAGE_LEN;
 use crate::policy::Policy;
 use crate::routing::RelayTransport;
 use crate::swap::{
@@ -91,10 +92,19 @@ pub(crate) enum EngineCmd {
         reply: Sender<Result<(), String>>,
     },
     /// 0027: the user submits the signature over a parked claim/refund's sighash for a user-held swap.
+    /// `preimage` carries the maker's secret for a user-held maker claim (the user holds it); `None`
+    /// for a refund or a taker claim.
     SubmitSignedSpend {
         swap_id: [u8; 16],
         sig: bitcoin::secp256k1::ecdsa::Signature,
         pubkey: bitcoin::PublicKey,
+        preimage: Option<[u8; PREIMAGE_LEN]>,
+        reply: Sender<Result<(), String>>,
+    },
+    /// 0027: the user's browser pre-provisions public commitment bundles for upcoming swap indices
+    /// (user-held mode). Public data only; the engine commits one per swap and never reuses it.
+    ProvisionCommitments {
+        entries: Vec<(u32, Commitment)>,
         reply: Sender<Result<(), String>>,
     },
 }
@@ -229,9 +239,18 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
             // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
             // unsigned PSBT so the user can sign it and POST it back to /swaps/{id}/signed-psbt.
             let pending = engine.pending_lock_psbt(id);
+            // 0027: if a user-held swap is parked awaiting the user's claim/refund signature, surface
+            // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
+            let pending_spend = engine.pending_spend(id);
             let detail = base.map(|(mut j, side, mlb, tlb)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
+                }
+                if let Some((claim, sighash)) = pending_spend {
+                    j["pending_spend"] = json!({
+                        "claim": claim,
+                        "sighash": sighash.to_lower_hex_string(),
+                    });
                 }
                 match engine.chain_view(id) {
                     Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
@@ -288,11 +307,19 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
             swap_id,
             sig,
             pubkey,
+            preimage,
             reply,
         } => {
             let _ = reply.send(
                 engine
-                    .submit_signed_spend(swap_id, sig, pubkey)
+                    .submit_signed_spend(swap_id, sig, pubkey, preimage)
+                    .map_err(|e| format!("{e:?}")),
+            );
+        }
+        EngineCmd::ProvisionCommitments { entries, reply } => {
+            let _ = reply.send(
+                engine
+                    .provision_commitments(entries)
                     .map_err(|e| format!("{e:?}")),
             );
         }
