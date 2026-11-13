@@ -621,8 +621,8 @@ async function fillSwapDetail(id, box) {
     `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">` +
-    `<div class="leg card"><strong>Your leg (${chainLink(ownChain)})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
-    `<div class="leg card"><strong>Counterparty (${chainLink(cpChain)})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
+    `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
+    `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
     (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
     `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
