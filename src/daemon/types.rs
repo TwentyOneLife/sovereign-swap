@@ -246,6 +246,15 @@ pub struct Settings {
     /// config, hence `serde(default)`.
     #[serde(default)]
     pub user_held_spends: bool,
+    /// Public-relay profile (design 0030): set this on a node that serves OTHER people (a public,
+    /// non-custodial deployment), as opposed to a private/standalone node. When true it turns on the
+    /// non-custodial safety bundle so the operator cannot accidentally run a public service with keys on
+    /// the infra: `user_held_spends` is forced on (claim/refund are the user's, signed in their browser),
+    /// and the daemon REFUSES to start with hot funding on either chain (funding must be cold or
+    /// interactive, so no spendable funding key lives on the host). Default false = a private node, which
+    /// keeps today's behaviour. Absent in older config, hence `serde(default)`.
+    #[serde(default)]
+    pub public_relay: bool,
     /// Maker fee, basis points (default 20 = 0.20 %). See design 0010 / spec 7.5.
     #[serde(default = "default_fee_maker_bps")]
     pub fee_maker_bps: u16,
@@ -368,6 +377,7 @@ impl Default for Settings {
             btc_explorer_url: String::new(),
             xbtc_explorer_url: String::new(),
             user_held_spends: false,
+            public_relay: false,
             fee_maker_bps: default_fee_maker_bps(),
             fee_taker_bps: default_fee_taker_bps(),
             btc_rpc_ca: String::new(),
@@ -917,6 +927,25 @@ mod tests {
             ..Settings::default()
         };
         assert!(engine_config(&on).user_held_spends);
+    }
+
+    #[test]
+    fn public_relay_profile_forces_user_held_signing() {
+        use super::super::engine::engine_config;
+        // The public-relay profile makes the node non-custodial: even with the raw flag off, the
+        // engine signs nothing locally. (The hot-funding refusal is enforced at start().)
+        let s = Settings {
+            public_relay: true,
+            ..Settings::default()
+        };
+        assert!(
+            !s.user_held_spends,
+            "the raw flag is independent and stays off"
+        );
+        assert!(
+            engine_config(&s).user_held_spends,
+            "public_relay forces user-held claim/refund signing on"
+        );
     }
 
     #[test]
