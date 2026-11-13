@@ -185,16 +185,25 @@ impl Contract {
         key: &SecretKey,
         preimage: &[u8; PREIMAGE_LEN],
     ) -> Result<Transaction, SpendError> {
+        self.claim_unsigned(spend, preimage)?.sign_with(secp, key)
+    }
+
+    /// Build the claim spend WITHOUT signing it (0027): the unsigned tx plus the sighash an external
+    /// signer signs with the claim key, assembled by [`UnsignedSpend::finalize`]. The local-key
+    /// [`claim`](Self::claim) is this followed by `sign_with`.
+    pub fn claim_unsigned(
+        &self,
+        spend: &Spend,
+        preimage: &[u8; PREIMAGE_LEN],
+    ) -> Result<UnsignedSpend, SpendError> {
         if sha256::Hash::hash(preimage).to_byte_array() != self.secret_hash {
             return Err(SpendError::WrongPreimage);
         }
-        self.sign(
-            secp,
+        self.build_unsigned(
             spend,
-            key,
-            &self.claim_pkh,
             Sequence::ENABLE_RBF_NO_LOCKTIME,
-            |sig, pk| vec![sig, pk, preimage.to_vec(), vec![1]],
+            self.claim_pkh,
+            WitnessKind::Claim(*preimage),
         )
     }
 
@@ -204,35 +213,102 @@ impl Contract {
         spend: &Spend,
         key: &SecretKey,
     ) -> Result<Transaction, SpendError> {
-        let sequence = Sequence::from_height(self.lock_blocks);
-        self.sign(secp, spend, key, &self.refund_pkh, sequence, |sig, pk| {
-            vec![sig, pk, vec![]]
-        })
+        self.refund_unsigned(spend)?.sign_with(secp, key)
     }
 
-    fn sign<C: Signing>(
+    /// Build the refund spend WITHOUT signing it (0027); see [`claim_unsigned`](Self::claim_unsigned).
+    pub fn refund_unsigned(&self, spend: &Spend) -> Result<UnsignedSpend, SpendError> {
+        self.build_unsigned(
+            spend,
+            Sequence::from_height(self.lock_blocks),
+            self.refund_pkh,
+            WitnessKind::Refund,
+        )
+    }
+
+    fn build_unsigned(
         &self,
-        secp: &Secp256k1<C>,
         spend: &Spend,
-        key: &SecretKey,
-        expected_pkh: &PubkeyHash,
         sequence: Sequence,
-        witness_items: impl FnOnce(Vec<u8>, Vec<u8>) -> Vec<Vec<u8>>,
+        expected_pubkey_hash: PubkeyHash,
+        witness: WitnessKind,
+    ) -> Result<UnsignedSpend, SpendError> {
+        let tx = unsigned_spend(spend, sequence)?;
+        let sighash = self.sighash(&tx, 0, spend.value).to_byte_array();
+        Ok(UnsignedSpend {
+            tx,
+            sighash,
+            expected_pubkey_hash,
+            witness,
+            script: self.script(),
+        })
+    }
+}
+
+/// The non-signature half of a claim/refund witness: a claim pushes the preimage and the branch
+/// selector `OP_1`; a refund pushes the empty selector. Carried by [`UnsignedSpend`] so `finalize` can
+/// assemble the witness from a signature without the signer holding the preimage.
+enum WitnessKind {
+    Claim([u8; PREIMAGE_LEN]),
+    Refund,
+}
+
+/// An HTLC claim or refund that is built but not yet signed (0027): the unsigned transaction and the
+/// sighash an external signer signs with the claim/refund key. The engine builds this and either signs
+/// locally ([`sign_with`](Self::sign_with), today's path) or hands the digest to a user-held signer and
+/// assembles the result with [`finalize`](Self::finalize). The spend is a single P2WSH input, so a
+/// generic PSBT wallet cannot finalize it; the signer only produces a signature over `sighash`, and the
+/// witness is assembled here.
+pub struct UnsignedSpend {
+    pub tx: Transaction,
+    /// The SegWit v0 SIGHASH_ALL digest over input 0, the bytes to sign with the claim/refund key.
+    pub sighash: [u8; 32],
+    /// The signer's key must hash to this; `sign_with`/`finalize` refuse any other key, so a wrong key
+    /// can never assemble a spendable transaction.
+    pub expected_pubkey_hash: PubkeyHash,
+    witness: WitnessKind,
+    script: ScriptBuf,
+}
+
+impl UnsignedSpend {
+    /// Sign locally with `key` (today's engine path): sign `sighash` and assemble the witness.
+    pub fn sign_with<C: Signing>(
+        self,
+        secp: &Secp256k1<C>,
+        key: &SecretKey,
     ) -> Result<Transaction, SpendError> {
         let pubkey = PublicKey::new(key.public_key(secp));
-        if pubkey.pubkey_hash() != *expected_pkh {
+        if pubkey.pubkey_hash() != self.expected_pubkey_hash {
             return Err(SpendError::WrongKey);
         }
-        let mut tx = unsigned_spend(spend, sequence)?;
-        let digest = self.sighash(&tx, 0, spend.value);
+        let sig = secp.sign_ecdsa(&Message::from_digest(self.sighash), key);
+        self.finalize(sig, pubkey)
+    }
+
+    /// Assemble the broadcastable transaction from a signature over `sighash` by `pubkey` (0027, the
+    /// user-held path). Refuses a `pubkey` that does not hash to `expected_pubkey_hash`, so a wrong key
+    /// cannot produce a spendable transaction.
+    pub fn finalize(
+        mut self,
+        sig: bitcoin::secp256k1::ecdsa::Signature,
+        pubkey: PublicKey,
+    ) -> Result<Transaction, SpendError> {
+        if pubkey.pubkey_hash() != self.expected_pubkey_hash {
+            return Err(SpendError::WrongKey);
+        }
         let sig = ecdsa::Signature {
-            signature: secp.sign_ecdsa(&Message::from_digest(digest.to_byte_array()), key),
+            signature: sig,
             sighash_type: EcdsaSighashType::All,
         };
-        let mut items = witness_items(sig.to_vec(), pubkey.to_bytes());
-        items.push(self.script().into_bytes());
-        tx.input[0].witness = Witness::from_slice(&items);
-        Ok(tx)
+        let mut items = match &self.witness {
+            WitnessKind::Claim(preimage) => {
+                vec![sig.to_vec(), pubkey.to_bytes(), preimage.to_vec(), vec![1]]
+            }
+            WitnessKind::Refund => vec![sig.to_vec(), pubkey.to_bytes(), vec![]],
+        };
+        items.push(self.script.into_bytes());
+        self.tx.input[0].witness = Witness::from_slice(&items);
+        Ok(self.tx)
     }
 }
 
@@ -506,6 +582,51 @@ mod tests {
         );
         let refund = c.refund(&secp, &spend(), &key);
         assert_eq!(refund, Err(SpendError::WrongKey));
+    }
+
+    #[test]
+    fn build_then_finalize_equals_the_local_key_claim_and_refund() {
+        // 0027: claim_unsigned/refund_unsigned + finalize must produce the exact transaction the
+        // local-key claim/refund does, so moving the signature to a user-held signer changes nothing on
+        // chain. (ECDSA signing here is deterministic, so the bytes match.)
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey = PublicKey::new(key.public_key(&secp));
+        let preimage = [9u8; 32];
+        let c = Contract {
+            secret_hash: sha256::Hash::hash(&preimage).to_byte_array(),
+            claim_pkh: pubkey.pubkey_hash(),
+            refund_pkh: pubkey.pubkey_hash(),
+            ..contract()
+        };
+
+        let local_claim = c.claim(&secp, &spend(), &key, &preimage).unwrap();
+        let unsigned = c.claim_unsigned(&spend(), &preimage).unwrap();
+        let sig = secp.sign_ecdsa(&Message::from_digest(unsigned.sighash), &key);
+        assert_eq!(
+            unsigned.finalize(sig, pubkey).unwrap(),
+            local_claim,
+            "finalized claim equals the local-key claim"
+        );
+
+        let local_refund = c.refund(&secp, &spend(), &key).unwrap();
+        let unsigned_r = c.refund_unsigned(&spend()).unwrap();
+        let sig_r = secp.sign_ecdsa(&Message::from_digest(unsigned_r.sighash), &key);
+        assert_eq!(
+            unsigned_r.finalize(sig_r, pubkey).unwrap(),
+            local_refund,
+            "finalized refund equals the local-key refund"
+        );
+
+        // finalize refuses a wrong key, so a bad signer cannot assemble a spendable transaction.
+        let wrong = SecretKey::from_slice(&[6u8; 32]).unwrap();
+        let wrong_pub = PublicKey::new(wrong.public_key(&secp));
+        let unsigned2 = c.claim_unsigned(&spend(), &preimage).unwrap();
+        let sig2 = secp.sign_ecdsa(&Message::from_digest(unsigned2.sighash), &wrong);
+        assert_eq!(
+            unsigned2.finalize(sig2, wrong_pub),
+            Err(SpendError::WrongKey)
+        );
     }
 
     #[test]
