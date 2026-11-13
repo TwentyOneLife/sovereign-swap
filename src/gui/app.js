@@ -214,7 +214,16 @@ function renderStatus() {
   const btcTitle = `${chainLong("btc")} node RPC: ${s.btc_node ? "reachable" : "unreachable"}`;
   const xbtcTitle = `${chainLong("xbtc")} node RPC: ${s.xbtc_node ? "reachable" : "unreachable"}`;
   const engineTitle = `Swap engine (the daemon's tick loop): ${s.engine ? "running" : "stopped"}`;
-  const relayTitle = `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
+  // Connected sovereign-relays (your combined market, design 0029): list each with a tick/cross when
+  // the daemon reports per-relay status, else fall back to the plain count.
+  const relays = Array.isArray(s.relay_list) ? s.relay_list : [];
+  const connectedRelays = relays.filter((r) => r.connected).length;
+  const relayTitle = relays.length
+    ? "Connected sovereign-relays (your market): " +
+      relays.map((r) => `${escapeHtml(r.url)} ${r.connected ? "✓" : "✗"}`).join(", ")
+    : `Nostr relay(s) for offer discovery: ${s.relays > 0 ? `${s.relays} connected` : "none connected"}`;
+  const relayOk = relays.length ? connectedRelays > 0 : s.relays > 0;
+  const relayLabel = relays.length ? `relays ${connectedRelays}/${relays.length}` : "relay";
   const activeTitle = `Swaps currently in flight on this node: ${s.active_swaps ?? "unknown"}`;
   // Each item groups its dot and label under one tooltip (hover either), and the items are spaced and
   // separated by a thin divider so a glance reads them apart instead of as one run-on string.
@@ -225,7 +234,7 @@ function renderStatus() {
     item(onoff(s.btc_node), btcTitle, chainShort("btc")),
     item(onoff(s.xbtc_node), xbtcTitle, chainShort("xbtc")),
     item(onoff(s.engine), engineTitle, "engine"),
-    item(onoff(s.relays > 0), relayTitle, "relay"),
+    item(onoff(relayOk), relayTitle, relayLabel),
     item(priceState, priceTitle, "price"),
     `<span class="stat" title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`,
   ].join(sep);

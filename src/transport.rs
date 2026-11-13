@@ -7,6 +7,11 @@ use crate::swap::Message;
 pub trait Transport {
     fn send(&self, message: &Message);
     fn receive(&self) -> Vec<Message>;
+    /// Per-relay connection status, for the client to show which relays (markets) it is connected to
+    /// (design 0029). Default empty; the real relay transport reports its relays.
+    fn relay_status(&self) -> Vec<crate::routing::RelayStatus> {
+        Vec::new()
+    }
 }
 
 /// One end of a pair: what one end sends, the other receives.

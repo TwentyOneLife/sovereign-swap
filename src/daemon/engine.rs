@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::engine::{Commitment, Config as EngineConfig, Engine};
 use crate::htlc::PREIMAGE_LEN;
 use crate::policy::Policy;
-use crate::routing::RelayTransport;
+use crate::routing::{MultiConn, RelayTransport};
 use crate::swap::{
     Chain as SwapChain, ChainView, LockView, Offer as SwapOffer, Phase, Role, Side, Swap,
 };
@@ -111,6 +111,8 @@ pub(crate) enum EngineCmd {
     /// 0027: the next swap index and the pool's provisioned indices, so the browser knows what to top
     /// up. Read-only, public data.
     CommitmentStatus(Sender<Value>),
+    /// 0029: per-relay connection status (url + connected), for the connected-relays display.
+    RelayStatus(Sender<Value>),
 }
 
 impl EngineCmd {
@@ -171,7 +173,7 @@ impl SwapView {
 /// Owns the engine, drives it forward on a timer, and serves commands. Ends when the daemon drops its
 /// sender (all senders gone => `Disconnected`).
 pub(crate) fn run_engine(
-    mut engine: Engine<RelayTransport<WsConn>>,
+    mut engine: Engine<RelayTransport<MultiConn<WsConn>>>,
     rx: Receiver<Dispatch>,
     events: Arc<Mutex<Vec<Sender<String>>>>,
 ) {
@@ -215,7 +217,10 @@ pub(crate) fn broadcast(events: &Arc<Mutex<Vec<Sender<String>>>>, line: &str) {
         .retain(|tx| tx.send(line.to_owned()).is_ok());
 }
 
-pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTransport<WsConn>>) {
+pub(crate) fn handle_engine_cmd(
+    cmd: EngineCmd,
+    engine: &mut Engine<RelayTransport<MultiConn<WsConn>>>,
+) {
     match cmd {
         EngineCmd::Publish(offer, reply) => {
             let _ = reply.send(engine.publish(offer).map_err(|e| format!("{e:?}")));
@@ -343,6 +348,14 @@ pub(crate) fn handle_engine_cmd(cmd: EngineCmd, engine: &mut Engine<RelayTranspo
         EngineCmd::CommitmentStatus(reply) => {
             let (next_index, provisioned) = engine.commitment_status();
             let _ = reply.send(json!({ "next_index": next_index, "provisioned": provisioned }));
+        }
+        EngineCmd::RelayStatus(reply) => {
+            let list: Vec<Value> = engine
+                .relay_status()
+                .into_iter()
+                .map(|r| json!({ "url": r.url, "connected": r.connected }))
+                .collect();
+            let _ = reply.send(json!(list));
         }
     }
 }
