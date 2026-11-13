@@ -825,7 +825,9 @@ impl<T: Transport> Engine<T> {
             ),
         };
         let fee = Amount::from_sat(pending.fee_sat);
-        let (chain, unsigned) = match action {
+        // The preimage for a claim comes from the re-decided action (the engine's secret today; a later
+        // slice has the user supply it alongside the signature). A refund needs none.
+        let (chain, unsigned, preimage) = match action {
             Action::Claim { lock, preimage } => {
                 let spend = Spend {
                     outpoint: lock,
@@ -836,8 +838,9 @@ impl<T: Transport> Engine<T> {
                 (
                     own_chain.other(),
                     other_contract
-                        .claim_unsigned(&spend, &preimage)
+                        .claim_unsigned(&spend)
                         .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?,
+                    Some(preimage),
                 )
             }
             Action::Refund { lock, value } => {
@@ -852,6 +855,7 @@ impl<T: Transport> Engine<T> {
                     own_contract
                         .refund_unsigned(&spend)
                         .map_err(|e| NodeError::Unexpected(format!("refund: {e:?}")))?,
+                    None,
                 )
             }
             _ => unreachable!("filtered to Claim/Refund above"),
@@ -864,7 +868,7 @@ impl<T: Transport> Engine<T> {
             )));
         }
         let tx = unsigned
-            .finalize(sig, pubkey)
+            .finalize(sig, pubkey, preimage)
             .map_err(|e| NodeError::Unexpected(format!("finalize: {e:?}")))?;
         self.backend(chain).broadcast(&tx)?;
         self.records[i].pending_spend = None;
@@ -1737,7 +1741,7 @@ impl<T: Transport> Engine<T> {
                             fee,
                         };
                         let unsigned = other_contract
-                            .claim_unsigned(&spend, &preimage)
+                            .claim_unsigned(&spend)
                             .map_err(|e| NodeError::Unexpected(format!("claim: {e:?}")))?;
                         self.records[i].pending_spend = Some(PendingSpend {
                             claim: true,
