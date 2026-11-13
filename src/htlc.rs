@@ -185,25 +185,23 @@ impl Contract {
         key: &SecretKey,
         preimage: &[u8; PREIMAGE_LEN],
     ) -> Result<Transaction, SpendError> {
-        self.claim_unsigned(spend, preimage)?.sign_with(secp, key)
+        self.claim_unsigned(spend)?
+            .sign_with(secp, key, Some(*preimage))
     }
 
-    /// Build the claim spend WITHOUT signing it (0027): the unsigned tx plus the sighash an external
-    /// signer signs with the claim key, assembled by [`UnsignedSpend::finalize`]. The local-key
-    /// [`claim`](Self::claim) is this followed by `sign_with`.
-    pub fn claim_unsigned(
-        &self,
-        spend: &Spend,
-        preimage: &[u8; PREIMAGE_LEN],
-    ) -> Result<UnsignedSpend, SpendError> {
-        if sha256::Hash::hash(preimage).to_byte_array() != self.secret_hash {
-            return Err(SpendError::WrongPreimage);
-        }
+    /// Build the claim spend WITHOUT signing it, and WITHOUT the preimage (0027): the unsigned tx plus
+    /// the sighash a signer signs with the claim key. The preimage is supplied later to
+    /// [`UnsignedSpend::finalize`] (by the engine for a local claim, by the user for a user-held one),
+    /// so a built claim carries only the `secret_hash` and never the secret. The local-key
+    /// [`claim`](Self::claim) is this followed by `sign_with` with the preimage.
+    pub fn claim_unsigned(&self, spend: &Spend) -> Result<UnsignedSpend, SpendError> {
         self.build_unsigned(
             spend,
             Sequence::ENABLE_RBF_NO_LOCKTIME,
             self.claim_pkh,
-            WitnessKind::Claim(*preimage),
+            WitnessKind::Claim {
+                secret_hash: self.secret_hash,
+            },
         )
     }
 
@@ -213,7 +211,7 @@ impl Contract {
         spend: &Spend,
         key: &SecretKey,
     ) -> Result<Transaction, SpendError> {
-        self.refund_unsigned(spend)?.sign_with(secp, key)
+        self.refund_unsigned(spend)?.sign_with(secp, key, None)
     }
 
     /// Build the refund spend WITHOUT signing it (0027); see [`claim_unsigned`](Self::claim_unsigned).
@@ -282,10 +280,12 @@ impl Contract {
 }
 
 /// The non-signature half of a claim/refund witness: a claim pushes the preimage and the branch
-/// selector `OP_1`; a refund pushes the empty selector. Carried by [`UnsignedSpend`] so `finalize` can
-/// assemble the witness from a signature without the signer holding the preimage.
+/// selector `OP_1`; a refund pushes the empty selector. Carried by [`UnsignedSpend`]. A claim holds only
+/// the `secret_hash`, not the preimage: the preimage is supplied to `finalize` (by the engine for a
+/// local claim, by the user for a user-held one, 0027), and `finalize` checks it against this hash. So a
+/// built claim never carries the secret, which is what lets the secret stay with the user.
 enum WitnessKind {
-    Claim([u8; PREIMAGE_LEN]),
+    Claim { secret_hash: [u8; 32] },
     Refund,
 }
 
@@ -307,27 +307,32 @@ pub struct UnsignedSpend {
 }
 
 impl UnsignedSpend {
-    /// Sign locally with `key` (today's engine path): sign `sighash` and assemble the witness.
+    /// Sign locally with `key` (today's engine path): sign `sighash` and assemble the witness. For a
+    /// claim, `preimage` is the secret (the engine provides it locally); for a refund it is `None`.
     pub fn sign_with<C: Signing>(
         self,
         secp: &Secp256k1<C>,
         key: &SecretKey,
+        preimage: Option<[u8; PREIMAGE_LEN]>,
     ) -> Result<Transaction, SpendError> {
         let pubkey = PublicKey::new(key.public_key(secp));
         if pubkey.pubkey_hash() != self.expected_pubkey_hash {
             return Err(SpendError::WrongKey);
         }
         let sig = secp.sign_ecdsa(&Message::from_digest(self.sighash), key);
-        self.finalize(sig, pubkey)
+        self.finalize(sig, pubkey, preimage)
     }
 
-    /// Assemble the broadcastable transaction from a signature over `sighash` by `pubkey` (0027, the
-    /// user-held path). Refuses a `pubkey` that does not hash to `expected_pubkey_hash`, so a wrong key
-    /// cannot produce a spendable transaction.
+    /// Assemble the broadcastable transaction from a signature over `sighash` by `pubkey`, plus the
+    /// `preimage` for a claim (0027, the user-held path). Refuses a `pubkey` that does not hash to
+    /// `expected_pubkey_hash`, and a claim whose `preimage` is missing or does not hash to the
+    /// contract's `secret_hash` - so a wrong key or a wrong/absent secret can never assemble a spendable
+    /// transaction. A refund ignores `preimage`.
     pub fn finalize(
         mut self,
         sig: bitcoin::secp256k1::ecdsa::Signature,
         pubkey: PublicKey,
+        preimage: Option<[u8; PREIMAGE_LEN]>,
     ) -> Result<Transaction, SpendError> {
         if pubkey.pubkey_hash() != self.expected_pubkey_hash {
             return Err(SpendError::WrongKey);
@@ -337,7 +342,11 @@ impl UnsignedSpend {
             sighash_type: EcdsaSighashType::All,
         };
         let mut items = match &self.witness {
-            WitnessKind::Claim(preimage) => {
+            WitnessKind::Claim { secret_hash } => {
+                let preimage = preimage.ok_or(SpendError::WrongPreimage)?;
+                if sha256::Hash::hash(&preimage).to_byte_array() != *secret_hash {
+                    return Err(SpendError::WrongPreimage);
+                }
                 vec![sig.to_vec(), pubkey.to_bytes(), preimage.to_vec(), vec![1]]
             }
             WitnessKind::Refund => vec![sig.to_vec(), pubkey.to_bytes(), vec![]],
@@ -637,19 +646,19 @@ mod tests {
         };
 
         let local_claim = c.claim(&secp, &spend(), &key, &preimage).unwrap();
-        let unsigned = c.claim_unsigned(&spend(), &preimage).unwrap();
+        let unsigned = c.claim_unsigned(&spend()).unwrap();
         let sig = secp.sign_ecdsa(&Message::from_digest(unsigned.sighash), &key);
         assert_eq!(
-            unsigned.finalize(sig, pubkey).unwrap(),
+            unsigned.finalize(sig, pubkey, Some(preimage)).unwrap(),
             local_claim,
-            "finalized claim equals the local-key claim"
+            "finalized claim (preimage at finalize) equals the local-key claim"
         );
 
         let local_refund = c.refund(&secp, &spend(), &key).unwrap();
         let unsigned_r = c.refund_unsigned(&spend()).unwrap();
         let sig_r = secp.sign_ecdsa(&Message::from_digest(unsigned_r.sighash), &key);
         assert_eq!(
-            unsigned_r.finalize(sig_r, pubkey).unwrap(),
+            unsigned_r.finalize(sig_r, pubkey, None).unwrap(),
             local_refund,
             "finalized refund equals the local-key refund"
         );
@@ -657,11 +666,27 @@ mod tests {
         // finalize refuses a wrong key, so a bad signer cannot assemble a spendable transaction.
         let wrong = SecretKey::from_slice(&[6u8; 32]).unwrap();
         let wrong_pub = PublicKey::new(wrong.public_key(&secp));
-        let unsigned2 = c.claim_unsigned(&spend(), &preimage).unwrap();
+        let unsigned2 = c.claim_unsigned(&spend()).unwrap();
         let sig2 = secp.sign_ecdsa(&Message::from_digest(unsigned2.sighash), &wrong);
         assert_eq!(
-            unsigned2.finalize(sig2, wrong_pub),
+            unsigned2.finalize(sig2, wrong_pub, Some(preimage)),
             Err(SpendError::WrongKey)
+        );
+        // finalize refuses a claim with a missing or wrong preimage (0027: the secret is checked at
+        // finalize now, not at build).
+        let unsigned3 = c.claim_unsigned(&spend()).unwrap();
+        let sig3 = secp.sign_ecdsa(&Message::from_digest(unsigned3.sighash), &key);
+        assert_eq!(
+            unsigned3.finalize(sig3, pubkey, None),
+            Err(SpendError::WrongPreimage),
+            "a claim with no preimage is refused"
+        );
+        let unsigned4 = c.claim_unsigned(&spend()).unwrap();
+        let sig4 = secp.sign_ecdsa(&Message::from_digest(unsigned4.sighash), &key);
+        assert_eq!(
+            unsigned4.finalize(sig4, pubkey, Some([0u8; 32])),
+            Err(SpendError::WrongPreimage),
+            "a claim with the wrong preimage is refused"
         );
     }
 
