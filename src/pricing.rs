@@ -102,6 +102,21 @@ mod tests {
     }
 
     #[test]
+    fn stale_offer_is_out_of_band_at_take_time() {
+        // The take-side check (post_take) re-derives an offer's implied price as taker/maker and bands
+        // it against the live reference. The live orphan offers are the regression case: adb870 sells
+        // 3900 BTC for 1_068_962 xBTC (implied 274.1 xBTC/BTC), posted when the market sat near 274.
+        // At today's rate 0.00320986 (market ~311.5 xBTC/BTC) it is ~12% off, outside the 10% band, so
+        // a taker is refused - no swap executes off-market however the offer was posted.
+        let market = market_price(Chain::Btc, 0.00320986).unwrap();
+        let stale_price = 1_068_962.0 / 3_900.0; // 274.09, the offer's implied price
+        assert!(!in_band(stale_price, market, 10));
+        // A near-market offer (3900 BTC for ~1_214_000 xBTC, implied ~311.3) is accepted.
+        let fresh_price = 1_214_000.0 / 3_900.0;
+        assert!(in_band(fresh_price, market, 10));
+    }
+
+    #[test]
     fn counter_rounds_up_for_the_maker() {
         // 5000 sat BTC at ~294.96 xBTC per BTC -> 1_474_800 xBTC, ceil.
         assert_eq!(counter_from(5000, 294.96), 1_474_800);
