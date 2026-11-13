@@ -13,6 +13,7 @@
 //! - the request is size-capped and the body must parse as the expected JSON, or it is refused;
 //! - there is no "move funds" or "freeze" route: the API starts and watches swaps, never seizes value.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -60,6 +61,18 @@ const SIGNER_TIMEOUT: Duration = Duration::from_secs(60);
 /// ~368s; 900s leaves margin for a loaded node. It is a read-only, operator-initiated call on one of
 /// 128 connection slots, so a long bound is safe.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// How long a finished (or stale) async scan job is kept before pruning (#206).
+const SCAN_JOB_TTL: Duration = Duration::from_secs(1800);
+
+/// An async coin-scan job (#206). `done` is `None` while the background thread runs, `Some(Ok(coins))`
+/// when the scan + classify finished, `Some(Err(msg))` on failure. `coins` are the same JSON objects
+/// the old synchronous scan returned.
+struct ScanJob {
+    address: String,
+    started_at: std::time::Instant,
+    done: Option<Result<Vec<Value>, String>>,
+}
 
 use engine::{
     engine_config, offer_to_json, run_engine, Dispatch, EngineCmd, ENGINE_CALL_TIMEOUT,
@@ -128,6 +141,11 @@ pub struct Daemon {
     /// `split.json`. A reserved marker or a built-but-unsubmitted job must survive a restart, else a
     /// restart could double-lend a marker.
     split: Arc<Mutex<crate::split::SplitState>>,
+    /// In-flight async coin-scan jobs (#206): POST /split/scan runs scantxoutset + classify on a
+    /// background thread (minutes on mainnet) so the request returns at once with a scan id, and the GUI
+    /// polls GET /split/scan/{id}. In-memory only: a scan is cheap to re-run and need not survive a
+    /// restart.
+    scans: Arc<Mutex<HashMap<String, ScanJob>>>,
     /// An exclusive OS lock on the data dir, held for the daemon's whole life (design 0004). Two
     /// daemons on one seed and state would reuse per-swap key indices and secrets and double-broadcast,
     /// losing funds; this makes a second daemon on the same data dir refuse to start. Never read after
@@ -200,6 +218,7 @@ impl Daemon {
             split: Arc::new(Mutex::new(crate::split::SplitState::load(
                 &data_dir.join("split.json"),
             ))),
+            scans: Arc::new(Mutex::new(HashMap::new())),
             _state_lock: state_lock,
         };
         // If the saved settings are already complete, bring the engine up. A failure here is not fatal
@@ -647,6 +666,9 @@ impl Daemon {
             ("GET", "/history") => self.get_history(),
             ("POST", "/split/classify") => self.split_classify(&req.body),
             ("POST", "/split/scan") => self.split_scan(&req.body),
+            ("GET", p) if p.starts_with("/split/scan/") => {
+                self.get_scan(&p["/split/scan/".len()..])
+            }
             ("POST", "/split/verify") => self.split_verify(&req.body),
             ("POST", "/split/build") => self.split_build(&req.body),
             ("POST", "/split/submit") => self.split_submit(&req.body),
@@ -1072,43 +1094,50 @@ impl Daemon {
                 json!({"error": "the Blake2b node needs a synced txindex to classify coins"}),
             );
         }
-        // scantxoutset scans the whole (mainnet-sized) UTXO set, so give just this call a long budget
-        // (#199); the default 120s read timeout surfaces as WouldBlock on mainnet. Client is cheap to
-        // clone and the fast calls above keep the default timeout.
-        let scan = match xbtc.clone().with_timeout(SCAN_TIMEOUT).call(
-            "scantxoutset",
-            json!(["start", [{"desc": format!("addr({address})")}]]),
-        ) {
-            Ok(v) => v,
-            Err(e) => return (502, json!({"error": format!("scan failed: {e:?}")})),
-        };
-        let src = match crate::split::NodeTxSource::new(&xbtc) {
-            Ok(s) => s,
-            Err(e) => return (502, json!({"error": e.to_string()})),
-        };
-        let mut coins = Vec::new();
-        for u in scan["unspents"].as_array().into_iter().flatten() {
-            let (Some(txid), Some(vout)) = (u["txid"].as_str(), u["vout"].as_u64()) else {
-                continue;
-            };
-            let value_sat = u["amount"]
-                .as_f64()
-                .map(|b| (b * 1e8).round() as u64)
-                .unwrap_or(0);
-            let Ok(kind) =
-                crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS)
-            else {
-                continue;
-            };
-            coins.push(json!({
-                "txid": txid,
-                "vout": vout,
-                "value_sat": value_sat,
-                "kind": match kind { crate::split::CoinKind::ShaCoin => "sha_coin", _ => "blake2b_coin" },
-                "needs_split": kind.needs_split(),
-            }));
+        // scantxoutset walks the whole (mainnet-sized) UTXO set and classify reads a tx per coin, which
+        // takes minutes (#199). Run it on a background thread (#206) so the request returns at once with
+        // a scan id; the GUI polls GET /split/scan/{id}. The fast checks above (address, txindex) have
+        // already run, so the job only fails on a transport error, surfaced through the job status.
+        let address = address.to_owned();
+        let scan_id = new_job_id();
+        {
+            let mut jobs = self.scans.lock().unwrap();
+            jobs.retain(|_, j| j.done.is_none() || j.started_at.elapsed() < SCAN_JOB_TTL);
+            jobs.insert(
+                scan_id.clone(),
+                ScanJob {
+                    address: address.clone(),
+                    started_at: Instant::now(),
+                    done: None,
+                },
+            );
         }
-        (200, json!({ "address": address, "coins": coins }))
+        let scans = Arc::clone(&self.scans);
+        let id = scan_id.clone();
+        std::thread::spawn(move || {
+            let result = scan_address(&xn, &xu, &xp, &xca, &tor, fork_height, &address);
+            if let Some(job) = scans.lock().unwrap().get_mut(&id) {
+                job.done = Some(result);
+            }
+        });
+        (202, json!({ "scan_id": scan_id, "status": "scanning" }))
+    }
+
+    /// Poll an async coin-scan job (#206): `{status:"scanning"}` while it runs, `{status:"done", coins}`
+    /// when finished, `{status:"error", error}` on failure, or 404 for an unknown or expired id.
+    fn get_scan(&self, scan_id: &str) -> (u16, Value) {
+        let jobs = self.scans.lock().unwrap();
+        match jobs.get(scan_id) {
+            None => (404, json!({"error": "unknown or expired scan"})),
+            Some(j) => match &j.done {
+                None => (200, json!({"status": "scanning", "address": j.address})),
+                Some(Ok(coins)) => (
+                    200,
+                    json!({"status": "done", "address": j.address, "coins": coins}),
+                ),
+                Some(Err(e)) => (200, json!({"status": "error", "error": e})),
+            },
+        }
     }
 
     /// Coin-split service (P5): build the UNSIGNED separating PSBT for the lent-marker move. Body
@@ -1732,6 +1761,53 @@ fn connect_client(
     let socks = addr.contains(".onion").then_some(tor_socks);
     let ca = (!ca.trim().is_empty()).then_some(ca);
     Client::connect(addr, user, pass, ca, socks).map_err(|e| format!("{e:?}"))
+}
+
+/// The slow half of a coin scan (#206), run on a background thread: scantxoutset at `address`, then
+/// classify each unspent. Returns the coin JSON objects the synchronous scan used to return, or an
+/// error string. The caller has already validated the address and the node's txindex.
+fn scan_address(
+    xn: &str,
+    xu: &str,
+    xp: &str,
+    xca: &str,
+    tor: &str,
+    fork_height: u32,
+    address: &str,
+) -> Result<Vec<Value>, String> {
+    let xbtc = connect_client(xn, xu, xp, xca, tor).map_err(|e| format!("Blake2b node: {e}"))?;
+    let scan = xbtc
+        .clone()
+        .with_timeout(SCAN_TIMEOUT)
+        .call(
+            "scantxoutset",
+            json!(["start", [{"desc": format!("addr({address})")}]]),
+        )
+        .map_err(|e| format!("scan failed: {e:?}"))?;
+    let src = crate::split::NodeTxSource::new(&xbtc).map_err(|e| e.to_string())?;
+    let mut coins = Vec::new();
+    for u in scan["unspents"].as_array().into_iter().flatten() {
+        let (Some(txid), Some(vout)) = (u["txid"].as_str(), u["vout"].as_u64()) else {
+            continue;
+        };
+        let value_sat = u["amount"]
+            .as_f64()
+            .map(|b| (b * 1e8).round() as u64)
+            .unwrap_or(0);
+        let Ok(kind) =
+            crate::split::classify(&src, fork_height, txid, crate::split::DEFAULT_MAX_LOOKUPS)
+        else {
+            continue;
+        };
+        coins.push(json!({
+            "txid": txid,
+            "vout": vout,
+            "value_sat": value_sat,
+            "kind": match kind { crate::split::CoinKind::ShaCoin => "sha_coin", _ => "blake2b_coin" },
+            "needs_split": kind.needs_split(),
+        }));
+    }
+    Ok(coins)
 }
 
 /// Seconds since the Unix epoch (for marker-reservation timestamps).
