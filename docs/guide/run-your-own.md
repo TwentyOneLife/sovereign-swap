@@ -39,6 +39,49 @@ Over a LAN use the node's HTTPS RPC with its StartOS Root CA; over Tor use the n
 ([design 0011](/design/)). Optionally put an Electrum server (Fulcrum for BTC, Shulcrum for xBTC) in
 front for thinner chain reads ([design 0016](/design/)).
 
+### Minimum node requirements
+
+Each chain's node must provide, over RPC:
+
+- **A wallet with descriptor support, enabled.** The client creates and loads a descriptor wallet and
+  derives addresses from it (`createwallet`, `importdescriptors`, `getnewaddress`, `getwalletinfo`,
+  `getaddressinfo`, `getdescriptorinfo`). A node started with `disablewallet=1` cannot be used. In cold
+  or interactive funding the wallet is watch-only and the client parks an unsigned PSBT for you to sign
+  elsewhere, so `walletprocesspsbt` must be available.
+- **The swap wallet as a watch wallet.** The client imports each swap's lock as a descriptor into the
+  node wallet and reads the counterparty's spend from the wallet's own transaction history to learn the
+  revealed preimage; so the wallet must be loadable and see those transactions. An Electrum server
+  (Fulcrum for BTC, Shulcrum for xBTC) in front gives thinner chain reads but is optional. `txindex=1`
+  is **not required** (a node without it settles fine); it only makes the fee-proof prevout lookup
+  (`getrawtransaction` on a counterparty's older funding inputs) more robust, so it is a reasonable
+  extra on a busy market-making node, not a prerequisite.
+- **Fee estimation and broadcast** (`estimatesmartfee`, `sendrawtransaction`).
+- **Reachable for the life of a swap.** Do not restart a node while a swap is mid-flight: the client
+  reports the chain down until RPC returns, then resumes. Node software version does not otherwise
+  matter, only that these RPCs work.
+
+### Assign each chain to the right node (there is no automatic guard)
+
+BTC and xBTC share Bitcoin's network parameters and address format (they descend from the same chain),
+so the client **cannot** auto-detect which node is which; it trusts your configuration. Point the BTC
+node setting at your Bitcoin Core/Knots node and the xBTC node setting at your Bitcoin Knots BLAKE2b
+node. There is **no automatic wrong-chain guard** on the node assignment, so a swapped pair would direct
+a leg to the wrong chain. Set each carefully and confirm with the status read before any real value.
+(The per-chain fee **address** is a separate per-chain field, so that fees land on the right chain; it
+does not police which node you assigned, see [design 0013](/design/).)
+
+### Reaching onion relays and nodes (Tor)
+
+The client dials `.onion` relays and `.onion` node RPC through a SOCKS5 proxy (on StartOS this is the
+Tor service's proxy). A LAN clearnet node needs no proxy. At least one relay must be reachable, and you
+and a counterparty must share at least one relay to find each other.
+
+### The relay needs no Bitcoin node
+
+The relay is a Nostr-style event relay: it connects to **no** Bitcoin node and holds no funds or keys.
+It only needs to be reachable (StartOS provisions its onion automatically). Operators run it to host a
+marketplace for others to discover offers over.
+
 ## 3. Configure the client
 
 In the client's config actions, set:
