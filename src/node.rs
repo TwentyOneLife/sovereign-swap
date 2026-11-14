@@ -355,6 +355,34 @@ fn chain_network(rpc: &Client) -> Result<Network, NodeError> {
     }
 }
 
+/// Whether a node's `getmininginfo` describes the proof-of-work the configured `chain` expects, or an
+/// error message if not. The two chains share Bitcoin's network parameters and address format, so the
+/// `getblockchaininfo` `chain` field cannot tell them apart; the BLAKE2b (xBTC) node is distinguished by
+/// reporting a `difficulty_blake2b` field, which a SHA256d node does not. A mismatch means the BTC and
+/// xBTC node endpoints are almost certainly swapped in the configuration.
+fn pow_mismatch(mining_info: &Value, chain: &str) -> Option<String> {
+    let is_blake2b = mining_info.get("difficulty_blake2b").is_some();
+    let want_blake2b = chain == "xbtc";
+    (is_blake2b != want_blake2b).then(|| {
+        format!(
+            "the node configured as the {chain} chain reports {} proof-of-work; \
+             the BTC and xBTC node endpoints look swapped",
+            if is_blake2b { "BLAKE2b" } else { "SHA256d" }
+        )
+    })
+}
+
+/// Fail fast if a node is assigned to the wrong chain (there is no network-level guard, so a swapped
+/// configuration would otherwise route a swap leg onto the wrong chain). Checked once per chain at
+/// startup via `getmininginfo`.
+pub fn check_chain_pow(rpc: &Client, chain: &str) -> Result<(), NodeError> {
+    let info = rpc.call("getmininginfo", json!([]))?;
+    match pow_mismatch(&info, chain) {
+        Some(msg) => Err(NodeError::Unexpected(msg)),
+        None => Ok(()),
+    }
+}
+
 /// Imports one account descriptor into the watch-only funding wallet as an active descriptor (design
 /// 0012), idempotently. The checksum comes from `getdescriptorinfo`'s canonical `descriptor` field,
 /// so a descriptor supplied with or without a `#checksum` is normalised and never double-appended.
@@ -906,5 +934,17 @@ mod fee_dest_tests {
         let mainnet_sp = sp(Network::Bitcoin).encode();
         assert!(FeeDest::parse(&mainnet_sp, Network::Regtest).is_err());
         assert!(FeeDest::parse("not-an-address", Network::Regtest).is_err());
+    }
+
+    #[test]
+    fn pow_mismatch_catches_a_swapped_chain_assignment() {
+        let blake2b = json!({ "difficulty_blake2b": 1.0, "difficulty": 2.0 });
+        let sha256d = json!({ "difficulty": 2.0 });
+        // A node assigned to the chain whose PoW it actually serves is accepted.
+        assert!(pow_mismatch(&blake2b, "xbtc").is_none());
+        assert!(pow_mismatch(&sha256d, "btc").is_none());
+        // A swapped assignment is rejected, and the message names the chain it was configured as.
+        assert!(pow_mismatch(&blake2b, "btc").unwrap().contains("btc"));
+        assert!(pow_mismatch(&sha256d, "xbtc").unwrap().contains("xbtc"));
     }
 }
