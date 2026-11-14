@@ -107,16 +107,28 @@ const SEEN_OFFER_TTL_SECS: u64 = 7 * 24 * 3600;
 /// refinement; this horizon is what bounds the walk-away case (where the inputs stay unspent).
 const ADOPT_WATCH_CAP_BLOCKS: u32 = 1008;
 
-/// Drop discovered offers not re-seen within `SEEN_OFFER_TTL_SECS` (and their timestamps). Any offer
-/// with no timestamp yet - a legacy entry loaded from state written before `seen_at` existed - is
-/// stamped with `now` so it ages from load rather than lingering forever. Pure, so it is unit-tested
-/// directly. Returns whether anything changed (so the caller can persist).
+/// Drop discovered offers that are past their maker-set expiry (design 0250 / #212), or not re-seen
+/// within `SEEN_OFFER_TTL_SECS` (and their timestamps). Any offer with no timestamp yet - a legacy
+/// entry loaded from state written before `seen_at` existed - is stamped with `now` so it ages from
+/// load rather than lingering forever. Pure, so it is unit-tested directly. Returns whether anything
+/// changed (so the caller can persist).
 fn prune_seen(
     seen_offers: &mut Vec<crate::swap::Offer>,
     seen_at: &mut Vec<([u8; 16], u64)>,
     now: u64,
 ) -> bool {
     let before = (seen_offers.len(), seen_at.len());
+    // Maker-set expiry: drop a peer offer past its `valid_until` outright, so a stale offer stops
+    // showing (with a Take button) in the market even if it was re-announced within the TTL.
+    let expired: std::collections::HashSet<[u8; 16]> = seen_offers
+        .iter()
+        .filter(|o| o.is_expired(now))
+        .map(|o| o.id)
+        .collect();
+    if !expired.is_empty() {
+        seen_offers.retain(|o| !expired.contains(&o.id));
+        seen_at.retain(|(id, _)| !expired.contains(id));
+    }
     let known: std::collections::HashSet<[u8; 16]> = seen_at.iter().map(|(id, _)| *id).collect();
     for o in seen_offers.iter() {
         if !known.contains(&o.id) {
@@ -503,23 +515,28 @@ impl<T: Transport> Engine<T> {
         Ok(engine)
     }
 
-    /// On load, drop any own offer a record already covers. A started swap means the offer was taken,
-    /// and an atomic offer is then fully consumed, so keeping it would let it be taken again or
-    /// re-announced on reconnect from a wallet that might still hold funds.
+    /// On load, drop any own offer whose swap has COMPLETED (design 0250): a completed offer is
+    /// consumed, so keeping it would let it be taken again or re-announced from a wallet that already
+    /// settled. An offer whose swap is still in flight is kept but reserved (`offer_reserved`, so it is
+    /// not re-announced); one whose swap abandoned or refunded is kept and returns to the market.
     fn reconcile_offers(&mut self) -> Result<(), EngineError> {
-        let taken: std::collections::HashSet<[u8; 16]> =
-            self.records.iter().map(|r| r.swap.offer.id).collect();
+        let completed: std::collections::HashSet<[u8; 16]> = self
+            .records
+            .iter()
+            .filter(|r| r.swap.phase == Phase::Done)
+            .map(|r| r.swap.offer.id)
+            .collect();
         let dropped: Vec<[u8; 16]> = self
             .state
             .own_offers
             .iter()
-            .filter(|o| taken.contains(&o.id))
+            .filter(|o| completed.contains(&o.id))
             .map(|o| o.id)
             .collect();
         if dropped.is_empty() {
             return Ok(());
         }
-        self.state.own_offers.retain(|o| !taken.contains(&o.id));
+        self.state.own_offers.retain(|o| !completed.contains(&o.id));
         self.save_state()?;
         // Tell peers to drop these too, so a filled offer does not linger in their discovery (#70).
         // The send queues on the transport and goes out once the relay connection is up.
@@ -591,9 +608,41 @@ impl<T: Transport> Engine<T> {
         if self.state.own_offers.len() != before {
             let _ = self.save_state();
         }
-        for offer in &self.state.own_offers {
-            self.transport.send(&Message::Offer(offer.clone()));
+        // design 0250: do not re-advertise an offer reserved by a swap in flight (a second taker would
+        // be refused). A reserved offer returns to the announce set once its swap abandons or refunds.
+        let announce: Vec<Offer> = self
+            .state
+            .own_offers
+            .iter()
+            .filter(|o| !self.offer_reserved(o.id))
+            .cloned()
+            .collect();
+        for offer in announce {
+            self.transport.send(&Message::Offer(offer));
         }
+    }
+
+    /// design 0250: remove an own offer once a swap on it has completed (`Done`) - the offer is
+    /// consumed - and tell peers to drop it from discovery. An offer whose swap only abandoned or
+    /// refunded is NOT removed: it is no longer reserved, so `reannounce_offers` returns it to the
+    /// market. Called each tick after records advance.
+    fn consume_completed_offers(&mut self) -> Result<(), EngineError> {
+        let consumed: Vec<[u8; 16]> = self
+            .state
+            .own_offers
+            .iter()
+            .filter(|o| self.offer_completed(o.id))
+            .map(|o| o.id)
+            .collect();
+        if consumed.is_empty() {
+            return Ok(());
+        }
+        self.state.own_offers.retain(|o| !consumed.contains(&o.id));
+        self.save_state()?;
+        for offer_id in consumed {
+            self.transport.send(&Message::Withdraw { offer_id });
+        }
+        Ok(())
     }
 
     /// Overrides the minimum trade the fee path acts on, replacing the [`crate::fee::MIN_TRADE_SAT`]
@@ -742,8 +791,32 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
-    /// Our own live offers (those not yet taken). A filled offer is pruned, so this never advertises
-    /// a spent offer.
+    /// Whether one of our offers currently has a swap in flight on it (design 0250): a non-terminal
+    /// record, or one still refunding our own lock. Such an offer is "reserved" - `reannounce_offers`
+    /// stops advertising it and `handle(Bid)` refuses a second take - but it is NOT removed: it returns
+    /// to the market if that swap abandons or refunds (no longer reserved), and leaves only when the
+    /// swap completes (`offer_completed`). Reserved is derived from records, with no wire field; a
+    /// peer-visible "reserved" would be a protocol change and is deferred to the next bundled wire bump.
+    fn offer_reserved(&self, offer_id: [u8; 16]) -> bool {
+        self.records.iter().any(|r| {
+            r.swap.offer.id == offer_id
+                && !matches!(
+                    r.swap.phase,
+                    Phase::Done | Phase::Abandoned | Phase::Refunded
+                )
+        })
+    }
+
+    /// Whether a swap on one of our offers has completed (`Done`), so the offer is consumed and must
+    /// leave the market (design 0250).
+    fn offer_completed(&self, offer_id: [u8; 16]) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.swap.offer.id == offer_id && r.swap.phase == Phase::Done)
+    }
+
+    /// Our own offers still in the market: live, or reserved by a swap in flight (design 0250). A
+    /// completed offer is removed; an abandoned/refunded one returns here.
     pub fn own_offers(&self) -> &[Offer] {
         &self.state.own_offers
     }
@@ -1199,7 +1272,14 @@ impl<T: Transport> Engine<T> {
                 }
             }
         }
-        self.state.own_offers.push(offer.clone());
+        // Re-publishing an offer already in the market (a replay, or an operator re-posting the same
+        // id) must not duplicate it: keep `own_offers` id-unique so the design-0250 reserve/consume
+        // logic acts on a single entry. Refresh the existing entry's terms in place; otherwise add it.
+        if let Some(existing) = self.state.own_offers.iter_mut().find(|o| o.id == offer.id) {
+            *existing = offer.clone();
+        } else {
+            self.state.own_offers.push(offer.clone());
+        }
         self.save_state()?;
         self.transport.send(&Message::Offer(offer));
         Ok(())
@@ -1363,6 +1443,17 @@ impl<T: Transport> Engine<T> {
                 if self.records.iter().any(|r| r.swap.id == swap_id) {
                     return Ok(());
                 }
+                // design 0250: the offer leaves the market only when its swap completes, so it stays in
+                // `own_offers` while a swap is in flight. Refuse a second take of an already-reserved
+                // offer (a peer that has not yet seen it leave discovery; peer-visible reservation is a
+                // deferred wire change). The idempotent re-take of the SAME swap_id is handled above.
+                if self.offer_reserved(offer_id) {
+                    eprintln!(
+                        "bid dropped: offer {} is reserved by a swap already in flight",
+                        short_id(&offer_id)
+                    );
+                    return Ok(());
+                }
                 // A bid the maker cannot honour was silently dropped, so an operator could not tell a
                 // below-minimum (or above-offer) bid from a lost message (F4). Log the reason.
                 let taker_part = match offer
@@ -1443,11 +1534,11 @@ impl<T: Transport> Engine<T> {
                     offer,
                 };
                 self.start(swap)?;
-                // The offer is atomic, so this bid consumes it: drop it so it cannot be taken again,
-                // and tell peers to drop it from discovery too.
-                self.state.own_offers.retain(|o| o.id != offer_id);
-                self.save_state()?;
-                self.transport.send(&Message::Withdraw { offer_id });
+                // design 0250: do NOT consume the offer on take. The swap is now in flight, so the
+                // offer is reserved: `reannounce_offers` stops advertising it and a second take is
+                // refused above. It stays in `own_offers` so it returns to the market if this swap
+                // abandons or refunds, and is removed (with a `Withdraw` to peers) only when the swap
+                // completes - see `consume_completed_offers`.
                 let swap = &self.records.last().expect("just started").swap;
                 self.transport.send(&Message::Accept {
                     swap_id,
@@ -1791,6 +1882,11 @@ impl<T: Transport> Engine<T> {
                 let id: String = swap.id.iter().map(|b| format!("{b:02x}")).collect();
                 eprintln!("swap {id} ({:?}): {before:?} -> {after:?}", swap.role);
             }
+        }
+        // design 0250: a swap that just completed consumes its offer (remove it + tell peers); an
+        // abandoned/refunded one is left to return to the market via reannounce next tick.
+        if let Err(e) = self.consume_completed_offers() {
+            errors.push(([0; 16], e));
         }
         errors
     }
@@ -2368,6 +2464,45 @@ mod tests {
             now + SEEN_OFFER_TTL_SECS + 1
         ));
         assert!(seen_offers.is_empty() && seen_at.is_empty());
+    }
+
+    #[test]
+    fn prune_seen_drops_an_expired_offer_even_when_recently_seen() {
+        // design 0250 / #212: a peer offer past its maker-set valid_until must leave the market view
+        // immediately, even though it was re-announced within the TTL (seen_at fresh). This is the
+        // "5-day-old offer still shows a Take button" fix.
+        use super::prune_seen;
+        use crate::swap::{Chain, Offer};
+        use bitcoin::Amount;
+        let now = 1_000_000u64;
+        let offer = |n: u8, valid_until: Option<u64>| Offer {
+            id: [n; 16],
+            maker_chain: Chain::Xbtc,
+            maker_amount: Amount::from_sat(1000),
+            taker_amount: Amount::from_sat(1000),
+            min_maker_amount: Amount::ZERO,
+            maker_lock_blocks: 40,
+            taker_lock_blocks: 20,
+            maker_lock_depth: 2,
+            taker_lock_depth: 2,
+            margin_blocks: 3,
+            fee: None,
+            valid_until,
+        };
+        // offer 1 is expired (valid_until in the past); offer 2 is live. Both were seen just now.
+        let mut seen_offers = vec![offer(1, Some(now - 1)), offer(2, None)];
+        let mut seen_at = vec![([1u8; 16], now), ([2u8; 16], now)];
+        assert!(
+            prune_seen(&mut seen_offers, &mut seen_at, now),
+            "dropping the expired offer is a change"
+        );
+        let ids: Vec<[u8; 16]> = seen_offers.iter().map(|o| o.id).collect();
+        assert!(
+            !ids.contains(&[1u8; 16]) && ids.contains(&[2u8; 16]),
+            "the expired offer is dropped, the live one kept: {ids:?}"
+        );
+        // Its seen_at entry is dropped too, so it cannot be re-stamped and linger.
+        assert!(!seen_at.iter().any(|(id, _)| *id == [1u8; 16]));
     }
 
     #[test]
