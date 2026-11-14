@@ -98,6 +98,16 @@ function fmtTime(sec) {
     : Math.floor(diff / 86400) + "d ago";
   return { text, title: d.toLocaleString() };
 }
+// Relative time for a FUTURE instant (e.g. an offer expiry): "in 23h" / "in 2d", or "expired".
+// fmtTime is "ago"-only, so a future timestamp would wrongly read "just now" (#260).
+function fmtUntil(sec) {
+  if (!sec) return "";
+  const diff = sec - Date.now() / 1000;
+  if (diff <= 0) return "expired";
+  if (diff < 3600) return "in " + Math.round(diff / 60) + "m";
+  if (diff < 86400) return "in " + Math.round(diff / 3600) + "h";
+  return "in " + Math.round(diff / 86400) + "d";
+}
 const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // A sortable, paged (5/row) table with an inline expanding detail row, shared by Swaps and Market
@@ -276,7 +286,7 @@ async function loadMyOffers() {
     `<div class="row between" data-id="${escapeHtml(o.id)}" style="padding:.35rem 0;border-bottom:1px solid var(--line)">` +
     `<span>Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
     `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}` +
-    (o.valid_until ? ` · expires ${escapeHtml(fmtTime(o.valid_until).text)}` : "") + `</span>` +
+    (o.valid_until ? ` · expires ${escapeHtml(fmtUntil(o.valid_until))}` : "") + `</span>` +
     `<button class="ghost wd-btn" title="Remove this offer from the market (cannot be undone; re-create to re-post)">Withdraw</button></div>`
   ).join("");
   list.querySelectorAll(".wd-btn").forEach((b) =>
@@ -286,6 +296,18 @@ async function loadMyOffers() {
 
 async function withdrawOffer(id, btn) {
   const msg = $("#my-offers-msg");
+  // Withdrawing is outward-facing and easy to hit by accident, so confirm and spell out the effects
+  // first (#276).
+  if (
+    !confirm(
+      "Withdraw this offer?\n\n" +
+        "• It is removed from the market and peers are told to drop it.\n" +
+        "• Any swap already in progress on this offer is unaffected and still completes.\n" +
+        "• No funds move.\n" +
+        "• You can re-create the offer later.",
+    )
+  )
+    return;
   if (btn) { btn.disabled = true; btn.textContent = "Withdrawing…"; }
   msg.textContent = "";
   try {
@@ -384,6 +406,7 @@ function openSheet(html) {
 function createSheet() {
   openSheet(offerForm(null));
   let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
+  let refLoaded = false; // whether the first /reference-rate fetch has returned yet (#263)
   const go = $("#f-go");
 
   // The market price (counter coin per unit of the sold coin) for the current direction.
@@ -400,6 +423,7 @@ function createSheet() {
     } catch (e) {
       ref = null;
     }
+    refLoaded = true;
     recompute();
   }
 
@@ -411,15 +435,22 @@ function createSheet() {
     $("#f-recv-coin").textContent = chainShort(taker);
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
-      // D6: no reference, no market-derived price. The form prices only from the market, so it cannot
-      // publish until the reference is back.
+      // No market-derived price. The form prices only from the market, so it cannot publish until the
+      // reference is back.
       market.textContent = "";
-      eff.textContent = "";
       recv.value = "";
+      go.disabled = true;
+      if (!refLoaded) {
+        // The first fetch can be a slow Tor round-trip; don't flash the "unavailable" warning while it
+        // is still in flight (#263).
+        d6.classList.add("hidden");
+        eff.textContent = "Checking the market rate…";
+        return;
+      }
+      eff.textContent = "";
       d6.classList.remove("hidden");
       d6.innerHTML =
         "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference and reopen this form.";
-      go.disabled = true;
       return;
     }
     d6.classList.add("hidden");
@@ -562,11 +593,20 @@ function explorerLink(chain, txid) {
     : short;
 }
 
-// A lock (txid + confirmation state) rendered for the live per-swap detail.
+// A lock (txid + confirmation state) rendered for the live per-swap detail. Confirmations show as
+// count/required when the daemon reports the required depth (#268), and the state is coloured by
+// progress: muted before it is locked, orange while confirming, green once settled or spent (#267).
 function explorerTx(chain, lock) {
-  if (!lock || !lock.txid) return "not locked yet";
-  const state = `${lock.confirmations == null ? "unconfirmed" : lock.confirmations + " conf"} · ${lock.spent ? "spent" : "locked"}`;
-  return `${explorerLink(chain, lock.txid)}<br>${state}`;
+  if (!lock || !lock.txid)
+    return `<span style="color:var(--dim)">not locked yet</span>`;
+  const need = lock.required_depth;
+  const confs = lock.confirmations;
+  const count =
+    confs == null ? "unconfirmed" : need ? `${confs}/${need} conf` : `${confs} conf`;
+  const settled = lock.spent || (confs != null && (!need || confs >= need));
+  const color = settled ? "var(--ok)" : confs == null ? "var(--dim)" : "var(--orange)";
+  const state = `${count} · ${lock.spent ? "spent" : "locked"}`;
+  return `${explorerLink(chain, lock.txid)}<br><span style="color:${color}">${escapeHtml(state)}</span>`;
 }
 
 // History / ledger (#67): the daemon derives per-swap entries + totals from its own records at
@@ -626,8 +666,14 @@ async function loadHistory() {
   });
 }
 
+// Per-swap draft of the pasted signed PSBT, held outside the DOM so no refresh of the detail panel
+// can wipe what the user is typing/pasting (#265). Cleared on a successful submit.
+const psbtDrafts = {};
+
 async function fillSwapDetail(id, box) {
-  box.innerHTML = "Loading…";
+  // Only show the placeholder on first open; on a refresh keep the current content so the panel does
+  // not flash or tear down the signing inputs (#265).
+  if (!box.querySelector("[data-sd]")) box.innerHTML = `<span class="muted">Loading…</span>`;
   const s = await api("GET", "/swaps/" + id).catch(() => null);
   const st = $("#swaps-table")._v;
   if (!st || st.open !== id) return; // row closed or changed during the fetch
@@ -641,13 +687,15 @@ async function fillSwapDetail(id, box) {
   const ownLock = s.role === "maker" ? c.maker_lock : c.taker_lock;
   const cpLock = s.role === "maker" ? c.taker_lock : c.maker_lock;
   live.innerHTML =
-    `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
+    `<p class="muted" data-sd>${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
     `<div class="legs">` +
     `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
     `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
-    (c.refund_in_blocks != null ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
+    // Once the secret is on chain the swap settles by claims, so the refund countdown no longer
+    // applies; hiding it avoids the "refund available" text looking like a refund is happening (#275).
+    (c.refund_in_blocks != null && !s.secret_revealed ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
     `<p class="muted">Funds are safe: this ends claimed or refunded, always.</p>` +
     // E2 (design 0017): when funding is parked for the user, show the PSBT handoff.
     (s.pending_lock_psbt
@@ -659,12 +707,51 @@ async function fillSwapDetail(id, box) {
         `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
         `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
         `lock only the engine can refund.</p>` +
-        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable" id="unsigned-psbt">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+        `<div class="row" style="justify-content:flex-end"><button class="ghost" type="button" id="copy-psbt">Copy</button></div>` +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
-        `<div class="row" style="justify-content:flex-end"><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
+        `<div class="row" style="justify-content:space-between;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`
       : "");
   if (s.pending_lock_psbt) {
+    const ta = live.querySelector("#signed-psbt");
+    // Restore any draft the user had typed and keep it in sync, so a refresh never loses it (#265).
+    if (ta) {
+      if (psbtDrafts[id]) ta.value = psbtDrafts[id];
+      ta.addEventListener("input", () => {
+        psbtDrafts[id] = ta.value;
+      });
+    }
+    const copyBtn = live.querySelector("#copy-psbt");
+    if (copyBtn)
+      copyBtn.onclick = () => {
+        const u = live.querySelector("#unsigned-psbt");
+        if (!u) return;
+        const done = () => {
+          copyBtn.textContent = "Copied";
+          setTimeout(() => (copyBtn.textContent = "Copy"), 1200);
+        };
+        if (navigator.clipboard)
+          navigator.clipboard.writeText(u.value).then(done, () => u.select());
+        else {
+          u.select();
+          document.execCommand("copy");
+          done();
+        }
+      };
+    const pasteBtn = live.querySelector("#paste-psbt");
+    if (pasteBtn)
+      pasteBtn.onclick = async () => {
+        try {
+          const t = await navigator.clipboard.readText();
+          if (ta && t) {
+            ta.value = t.trim();
+            psbtDrafts[id] = ta.value;
+          }
+        } catch (e) {
+          if (ta) ta.focus(); // clipboard read blocked: let the user paste manually
+        }
+      };
     const btn = live.querySelector("#submit-psbt");
     if (btn)
       btn.onclick = async () => {
@@ -677,6 +764,7 @@ async function fillSwapDetail(id, box) {
         msg.textContent = "Submitting…";
         try {
           await api("POST", "/swaps/" + id + "/signed-psbt", { psbt });
+          delete psbtDrafts[id];
           msg.textContent = "Funded. The swap will proceed.";
           fillSwapDetail(id, live);
         } catch (e) {
@@ -728,7 +816,16 @@ async function subscribe() {
 }
 function onEvent() {
   const active = $(".view.active").id;
-  refresh(active); // re-renders the active table, which re-fills any open inline detail
+  const st = active === "swaps" && $("#swaps-table")._v;
+  if (st && st.open) {
+    // A swap detail is open: refresh only it (confirmations/phase change per block), so the whole
+    // table is not torn down on every event and the open signing inputs survive (#265). The row list
+    // catches up on the next tab switch, detail close, or 30s tick.
+    const box = $("#swaps-table").querySelector(".detail-box");
+    if (box) fillSwapDetail(st.open, box);
+  } else {
+    refresh(active); // re-renders the active table, which re-fills any open inline detail
+  }
   loadStatus();
 }
 
