@@ -48,23 +48,27 @@ Each chain's node must provide, over RPC:
   `getaddressinfo`, `getdescriptorinfo`). A node started with `disablewallet=1` cannot be used. In cold
   or interactive funding the wallet is watch-only and the client parks an unsigned PSBT for you to sign
   elsewhere, so `walletprocesspsbt` must be available.
-- **A transaction index, or an Electrum server in front.** To settle a swap the client reads the
-  counterparty's on-chain claim to learn the revealed preimage; this is a lookup of an arbitrary,
-  non-wallet transaction by txid (`getrawtransaction` with no block hash). Run the node with
-  **`txindex=1`**, or place a Fulcrum/Shulcrum Electrum server in front and configure it. Without one of
-  the two, settlement reads can fail.
+- **The swap wallet as a watch wallet.** The client imports each swap's lock as a descriptor into the
+  node wallet and reads the counterparty's spend from the wallet's own transaction history to learn the
+  revealed preimage; so the wallet must be loadable and see those transactions. An Electrum server
+  (Fulcrum for BTC, Shulcrum for xBTC) in front gives thinner chain reads but is optional. `txindex=1`
+  is **not required** (a node without it settles fine); it only makes the fee-proof prevout lookup
+  (`getrawtransaction` on a counterparty's older funding inputs) more robust, so it is a reasonable
+  extra on a busy market-making node, not a prerequisite.
 - **Fee estimation and broadcast** (`estimatesmartfee`, `sendrawtransaction`).
 - **Reachable for the life of a swap.** Do not restart a node while a swap is mid-flight: the client
   reports the chain down until RPC returns, then resumes. Node software version does not otherwise
   matter, only that these RPCs work.
 
-### Assign each chain to the right node (there is no auto-guard)
+### Assign each chain to the right node (there is no automatic guard)
 
 BTC and xBTC share Bitcoin's network parameters and address format (they descend from the same chain),
-so the client does **not** auto-detect which node is which; it trusts your configuration. Point the BTC
+so the client **cannot** auto-detect which node is which; it trusts your configuration. Point the BTC
 node setting at your Bitcoin Core/Knots node and the xBTC node setting at your Bitcoin Knots BLAKE2b
-node. Swapping them would direct a leg to the wrong chain. The per-chain fee address is the real
-wrong-chain guard ([design 0013](/design/)).
+node. There is **no automatic wrong-chain guard** on the node assignment, so a swapped pair would direct
+a leg to the wrong chain. Set each carefully and confirm with the status read before any real value.
+(The per-chain fee **address** is a separate per-chain field, so that fees land on the right chain; it
+does not police which node you assigned, see [design 0013](/design/).)
 
 ### Reaching onion relays and nodes (Tor)
 
