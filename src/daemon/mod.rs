@@ -340,14 +340,27 @@ impl Daemon {
                 }
                 // E2 (design 0017): a watch-only funding wallet as for cold, but the user signs out of
                 // band. Funding parks the unsigned PSBT; the user submits it via /swaps/{id}/signed-psbt.
-                FundingMode::Interactive => ChainNode::open_cold(
-                    client,
-                    &wallet,
-                    &funding.descriptor_receive,
-                    &funding.descriptor_change,
-                    Box::new(InteractiveSigner),
-                )
-                .map_err(|e| format!("{e:?}")),
+                FundingMode::Interactive => {
+                    if funding.descriptor_receive.trim().is_empty()
+                        && funding.descriptor_change.trim().is_empty()
+                    {
+                        // Output-only (design 0032): no descriptors, no funding wallet. Only the
+                        // contract watch wallet is opened; the user funds the whole lock from their own
+                        // wallet. Validation guarantees the per-chain payout address is set, so a
+                        // claim/refund never falls back to a (nonexistent) funding-wallet address.
+                        ChainNode::open_watch_only(client, &wallet, Box::new(InteractiveSigner))
+                            .map_err(|e| format!("{e:?}"))
+                    } else {
+                        ChainNode::open_cold(
+                            client,
+                            &wallet,
+                            &funding.descriptor_receive,
+                            &funding.descriptor_change,
+                            Box::new(InteractiveSigner),
+                        )
+                        .map_err(|e| format!("{e:?}"))
+                    }
+                }
             }
         };
         let btc = open_chain(

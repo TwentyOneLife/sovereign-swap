@@ -615,10 +615,14 @@ fn duplicate_messages_do_not_create_duplicate_swaps() {
         1,
         "taker made a duplicate swap"
     );
-    // The filled offer was pruned, so a replayed bid finds nothing to take.
-    assert!(
-        maker.engine().own_offers().is_empty(),
-        "a filled offer must be pruned"
+    // design 0250: a taken offer is NOT pruned - it stays reserved while its swap is in flight (so it
+    // returns to the market if the swap abandons), and a replayed or second bid is refused rather than
+    // creating a second swap (the swaps().count() == 1 above proves the double-fill is prevented). The
+    // offer is removed only when the swap completes.
+    assert_eq!(
+        maker.engine().own_offers().len(),
+        1,
+        "a taken offer stays reserved (not pruned) until its swap completes"
     );
 }
 
