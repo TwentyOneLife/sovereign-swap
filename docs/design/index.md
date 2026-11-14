@@ -47,6 +47,9 @@ The notes below are listed in order. Each links to the full text.
   recognising a lock the user broadcast themselves.
 - [0027 - User-held claim/refund signing and watchtower broadcast](/design/0027-user-held-claim-refund-and-watchtower) -
   moving claim, refund and the secret off a hosted engine, with an optional non-custodial watchtower.
+- [0031 - Watchtower broadcast, refund-first and secret-safe](/design/0031-watchtower-refund-first-secret-safe) -
+  refines the watchtower so it holds no not-yet-public secret: refunds for everyone, taker claims gated on
+  the public reveal, and never a maker claim.
 
 ## Fees
 
