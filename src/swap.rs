@@ -429,7 +429,24 @@ impl Swap {
         if self.phase == Phase::Locking {
             self.phase = Phase::Locked;
         }
-        if let Some(spend) = own.spend.as_ref().filter(|s| s.ours) {
+        // #275: We claimed the taker's lock, which reveals the secret and completes the swap. Decide
+        // this BEFORE interpreting our own lock's spend: with a shared payout address the taker's
+        // claim of our lock "pays us" (`ours`) and carries the secret, and would otherwise be read as
+        // our own refund below. Record the revealed secret so the status reflects it.
+        if let Some(theirs) = &view.taker_lock {
+            if let Some(spend) = theirs.spend.as_ref().filter(|s| s.ours) {
+                self.learned_secret = spend.preimage.or(self.learned_secret);
+                self.phase = final_or(spend, self.depths.taker_final, Phase::Done, Phase::Claiming);
+                return vec![];
+            }
+        }
+        // Our own lock spent by *us* as a refund: only a spend with no preimage (the timelock path)
+        // is a refund; a preimage-bearing spend is the counterparty's claim, handled above (#275).
+        if let Some(spend) = own
+            .spend
+            .as_ref()
+            .filter(|s| s.ours && s.preimage.is_none())
+        {
             self.phase = final_or(
                 spend,
                 self.depths.maker_final,
@@ -439,10 +456,6 @@ impl Swap {
             return vec![];
         }
         if let Some(theirs) = &view.taker_lock {
-            if let Some(spend) = theirs.spend.as_ref().filter(|s| s.ours) {
-                self.phase = final_or(spend, self.depths.taker_final, Phase::Done, Phase::Claiming);
-                return vec![];
-            }
             let deep = Self::depth(theirs, hb) >= self.depths.taker_lock;
             // Room for our claim to become final before the taker's refund opens.
             let needed = i64::from(self.offer.margin_blocks) + i64::from(self.depths.taker_final);
@@ -556,7 +569,13 @@ impl Swap {
             return vec![];
         };
 
-        if let Some(spend) = own.spend.as_ref().filter(|s| s.ours) {
+        // Only a spend with no preimage (the timelock path) is our refund; a preimage-bearing spend
+        // of our own lock is the counterparty's claim, handled by the maker-lock branch above (#275).
+        if let Some(spend) = own
+            .spend
+            .as_ref()
+            .filter(|s| s.ours && s.preimage.is_none())
+        {
             self.phase = final_or(
                 spend,
                 self.depths.taker_final,
@@ -940,6 +959,54 @@ mod tests {
             }]
         );
         assert_eq!(s.phase, Phase::Refunding);
+    }
+
+    #[test]
+    fn maker_is_done_not_refunding_when_its_own_claimed_lock_pays_a_shared_address() {
+        // #275: with a shared payout address the taker's claim of the maker's own lock "pays us"
+        // (`ours`) AND carries the secret. The maker must read that as the counterparty's claim
+        // (the swap is done), not as its own refund, and it must record the revealed secret.
+        let mut s = swap(Role::Maker);
+        let mut own = lock(1, Some(100));
+        own.spend = Some(SpendView {
+            preimage: Some([9; 32]),
+            depth: 3,
+            ours: true,
+        });
+        let mut theirs = lock(2, Some(100));
+        theirs.spend = Some(SpendView {
+            preimage: Some([9; 32]),
+            depth: 3,
+            ours: true,
+        });
+        assert_eq!(
+            s.decide(&view(110, 110, Some(own), Some(theirs)), SECRET),
+            vec![]
+        );
+        assert_eq!(
+            s.phase,
+            Phase::Done,
+            "a fully-claimed swap is Done, never Refunding"
+        );
+        assert!(
+            s.learned_secret.is_some(),
+            "secret_revealed must be true on the maker once its claim is out"
+        );
+    }
+
+    #[test]
+    fn maker_refund_without_a_preimage_still_settles_to_refunded() {
+        // The #275 guard must not reclassify a genuine refund: our own lock spent with no preimage
+        // (the timelock path) still settles to Refunded.
+        let mut s = swap(Role::Maker);
+        let mut own = lock(1, Some(100));
+        own.spend = Some(SpendView {
+            preimage: None,
+            depth: 3,
+            ours: true,
+        });
+        assert_eq!(s.decide(&view(150, 150, Some(own), None), SECRET), vec![]);
+        assert_eq!(s.phase, Phase::Refunded);
     }
 
     #[test]
