@@ -50,9 +50,14 @@ pub enum FundingMode {
     #[default]
     Hot,
     Cold,
-    /// The user signs funding in their own wallet out of band (E2, design 0017): a watch-only funding
-    /// wallet from the account descriptors (as cold), but no external signer. Funding parks the
-    /// unsigned PSBT; the user submits the signed one via `POST /swaps/{id}/signed-psbt`.
+    /// The user signs funding in their own wallet out of band (E2, design 0017): no external signer.
+    /// The account descriptors are OPTIONAL (design 0032): with both set, the daemon opens a
+    /// watch-only funding wallet from them (as cold) and parks a fully-funded unsigned PSBT the user
+    /// signs; with both empty ("output-only"), the daemon holds no funding wallet and parks an
+    /// output-only PSBT (just the HTLC + fee output, no inputs) the user's own wallet funds and signs.
+    /// Either way the user submits the signed PSBT via `POST /swaps/{id}/signed-psbt`. Output-only
+    /// requires the per-chain payout address, since there is no funding wallet to draw a claim/refund
+    /// destination from.
     Interactive,
 }
 
@@ -437,6 +442,32 @@ impl Settings {
         ] {
             e.extend(validate_funding(name, cfg, &self.tor_socks));
         }
+        // Output-only interactive funding (design 0032) has no funding wallet, so a claim/refund on
+        // that chain cannot draw a fresh address from it: `Engine::destination` would reach
+        // `new_destination()` and fail. The per-chain payout address is then mandatory.
+        for (fname, cfg, pname, payout) in [
+            (
+                "btc_funding",
+                &self.btc_funding,
+                "btc_payout_address",
+                &self.btc_payout_address,
+            ),
+            (
+                "xbtc_funding",
+                &self.xbtc_funding,
+                "xbtc_payout_address",
+                &self.xbtc_payout_address,
+            ),
+        ] {
+            let output_only = cfg.mode == FundingMode::Interactive
+                && cfg.descriptor_receive.trim().is_empty()
+                && cfg.descriptor_change.trim().is_empty();
+            if output_only && payout.trim().is_empty() {
+                e.push(format!(
+                    "{fname} is output-only (interactive, no descriptors) but {pname} is unset: a claim/refund on this chain has no destination without a funding wallet (design 0032)"
+                ));
+            }
+        }
         if self.btc_conf < 1 || self.btc_conf > 100 {
             e.push("btc_conf: 1..=100".to_owned());
         }
@@ -812,21 +843,31 @@ fn valid_host_port(s: &str) -> bool {
 /// descriptor or a credential: the messages are logged.
 fn validate_funding(name: &str, cfg: &FundingConfig, tor_socks: &str) -> Vec<String> {
     let mut e = Vec::new();
-    // Hot needs nothing. Cold and Interactive both fund from a watch-only wallet built from account
-    // descriptors; only Cold also needs an external signer endpoint (Interactive's signer is the user).
+    // Hot needs nothing. Cold needs a signer endpoint and both account descriptors. Interactive's
+    // descriptors are OPTIONAL (design 0032): both set = the daemon builds a funded PSBT the user
+    // signs; both empty = output-only (the user funds the whole lock from their own wallet and the
+    // daemon holds no funding wallet). Interactive's signer is the user, so no signer endpoint.
     if cfg.mode == FundingMode::Hot {
         return e;
     }
+    let have_receive = !cfg.descriptor_receive.trim().is_empty();
+    let have_change = !cfg.descriptor_change.trim().is_empty();
     if cfg.mode == FundingMode::Cold {
         if cfg.signer_endpoint.trim().is_empty() {
             e.push(format!("{name}: cold mode needs a signer_endpoint"));
         } else if let Err(msg) = validate_node(&cfg.signer_endpoint, &cfg.signer_ca, tor_socks) {
             e.push(format!("{name} signer_endpoint: {msg}"));
         }
+        if !have_receive || !have_change {
+            e.push(format!(
+                "{name}: cold mode needs a receive and a change account descriptor"
+            ));
+        }
     }
-    if cfg.descriptor_receive.trim().is_empty() || cfg.descriptor_change.trim().is_empty() {
+    // A half-set descriptor pair under Interactive is a mistake, not a mode: require both or neither.
+    if cfg.mode == FundingMode::Interactive && have_receive != have_change {
         e.push(format!(
-            "{name}: cold and interactive modes need a receive and a change account descriptor"
+            "{name}: interactive mode needs both the receive and change descriptor, or neither (empty = output-only funding, design 0032)"
         ));
     }
     e
@@ -1318,6 +1359,53 @@ mod tests {
             .validate()
             .iter()
             .any(|m| m.contains("signer_endpoint") && m.contains("Root CA")));
+    }
+
+    #[test]
+    fn interactive_descriptors_optional_and_output_only_requires_payout() {
+        let normal = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        // Interactive with both descriptors empty = output-only (design 0032): the funding config is
+        // valid on its own, but output-only has no funding wallet, so the per-chain payout address is
+        // mandatory (else a claim/refund would reach new_destination() on a wallet that does not exist).
+        let mut s = Settings {
+            btc_funding: FundingConfig {
+                mode: FundingMode::Interactive,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            s.validate()
+                .iter()
+                .any(|m| m.contains("btc_payout_address") && m.contains("output-only")),
+            "output-only funding with no payout address must be refused: {:?}",
+            s.validate()
+        );
+        // With the payout address set, output-only validates.
+        s.btc_payout_address = normal.to_owned();
+        assert!(
+            s.validate().is_empty(),
+            "output-only with a payout address must validate: {:?}",
+            s.validate()
+        );
+        // A half-set descriptor pair under Interactive is a mistake, not a mode.
+        s.btc_funding.descriptor_receive = "wpkh(tpub.../0/*)".to_owned();
+        assert!(
+            s.validate()
+                .iter()
+                .any(|m| m.contains("both the receive and change")),
+            "a half-set interactive descriptor pair must be refused: {:?}",
+            s.validate()
+        );
+        // Both descriptors set = descriptor-backed interactive: a funding wallet supplies the
+        // claim/refund address, so no payout is required even with it cleared.
+        s.btc_funding.descriptor_change = "wpkh(tpub.../1/*)".to_owned();
+        s.btc_payout_address = String::new();
+        assert!(
+            s.validate().is_empty(),
+            "descriptor-backed interactive needs no payout: {:?}",
+            s.validate()
+        );
     }
 
     #[test]

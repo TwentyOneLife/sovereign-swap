@@ -335,6 +335,11 @@ pub struct ChainNode {
     watch: Client,
     network: Network,
     signer: Box<dyn FundingSigner>,
+    /// Output-only funding (design 0032): no funding wallet. `wallet` is then a placeholder (the watch
+    /// wallet) never used to select coins; `fund` builds an inputless PSBT and the user's own wallet
+    /// adds inputs/change/signs. `new_destination` must never be called (config requires a payout
+    /// address). False for hot, cold, and descriptor-backed interactive funding.
+    output_only: bool,
 }
 
 fn parse<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T, NodeError> {
@@ -458,6 +463,7 @@ impl ChainNode {
             signer,
             rpc,
             network,
+            output_only: false,
         })
     }
 
@@ -523,7 +529,44 @@ impl ChainNode {
             signer,
             rpc,
             network,
+            output_only: false,
         })
+    }
+
+    /// Opens the chain for output-only (interactive, no descriptors) funding (design 0032): only the
+    /// `<name>-watch` wallet is created/loaded, to track contracts. There is NO funding wallet, so the
+    /// daemon never selects the user's coins; `fund` builds an inputless PSBT the user's own wallet
+    /// funds and signs. The `wallet` field is set to the watch wallet as a harmless placeholder that
+    /// `output_only` keeps off every coin-selection path, so no code reads a missing wallet.
+    pub fn open_watch_only(
+        rpc: Client,
+        name: &str,
+        signer: Box<dyn FundingSigner>,
+    ) -> Result<ChainNode, NodeError> {
+        let network = chain_network(&rpc)?;
+        let watch_name = format!("{name}-watch");
+        let loaded = rpc.call("listwallets", json!([]))?;
+        let is_loaded = |w: &str| loaded.as_array().is_some_and(|l| l.iter().any(|v| v == w));
+        if !is_loaded(&watch_name) && rpc.call("loadwallet", json!([&watch_name])).is_err() {
+            // disable_private_keys=true, blank=true: a watch-only wallet that holds no key.
+            rpc.call("createwallet", json!([&watch_name, true, true]))?;
+        }
+        let watch = rpc.wallet(&watch_name);
+        Ok(ChainNode {
+            wallet: watch.clone(),
+            watch,
+            signer,
+            rpc,
+            network,
+            output_only: true,
+        })
+    }
+
+    /// Whether this node funds output-only (design 0032): no funding wallet, the user supplies the
+    /// whole lock. The engine marks a parked swap so its terminal watch (0019) keys off the contract
+    /// address, not a pre-known txid (output-only changes the txid when the user adds inputs).
+    pub fn is_output_only(&self) -> bool {
+        self.output_only
     }
 
     /// Replaces the signer, e.g. an external cold signer in production so no funding key is on the
@@ -575,6 +618,38 @@ impl ChainNode {
         other_chain: &impl UtxoLookup<Error = RpcError>,
         fee: Option<(Amount, &FeeDest)>,
     ) -> Result<(Transaction, Option<FeeProof>), NodeError> {
+        // Output-only funding (design 0032): build an inputless PSBT with just the HTLC output (and a
+        // normal-address fee output), then hand it to the interactive signer, which parks it for the
+        // user. The user's own wallet adds the inputs and change and signs. There is no coin selection
+        // and no input-replay check here: the daemon never sees the inputs, so the user is responsible
+        // for not funding from a coin still spendable on the other chain. A silent-payment fee derives
+        // its output from the spending inputs' keys (BIP352), which only the user's wallet holds, so it
+        // cannot be built output-only (design 0018); a normal fee address is a plain output and works.
+        if self.output_only {
+            if matches!(fee, Some((_, FeeDest::SilentPayment(_)))) {
+                return Err(NodeError::Unexpected(
+                    "a silent-payment fee cannot be built with output-only funding; use a normal fee address"
+                        .into(),
+                ));
+            }
+            let mut outputs = vec![json!({ self.address(contract).to_string(): amount.to_btc() })];
+            if let Some((fee_amount, FeeDest::Normal(addr))) = fee {
+                outputs.push(json!({ addr.to_string(): fee_amount.to_btc() }));
+            }
+            let created = self
+                .rpc
+                .call("createpsbt", json!([[], json!(outputs), 0, true]))?;
+            let psbt = created
+                .as_str()
+                .ok_or_else(|| NodeError::Unexpected("createpsbt returned no psbt".into()))?;
+            // InteractiveSigner returns `AwaitingSignature`, which the `?` propagates so the engine
+            // parks the swap. A signer that instead returns Ok here is not the interactive signer and
+            // must not be used for output-only (it would yield an inputless, unbroadcastable tx).
+            self.signer.sign(psbt)?;
+            return Err(NodeError::Unexpected(
+                "output-only funding requires the interactive signer".into(),
+            ));
+        }
         let mut outputs = vec![json!({ self.address(contract).to_string(): amount.to_btc() })];
         // A silent-payment fee needs a placeholder P2TR output the signer rewrites into the fresh
         // output (P2TR so its size, and the miner fee, match the final transaction). A normal-address
@@ -662,7 +737,12 @@ impl ChainNode {
                 .map(|psbt| psbt.unsigned_tx.compute_txid())
                 .map_err(|e| NodeError::Unexpected(format!("psbt: {e}")))
         };
-        if unsigned_txid(pending_psbt)? != unsigned_txid(signed_psbt)? {
+        // Descriptor-backed interactive funding hands out a fully-funded PSBT the user may only sign,
+        // so the unsigned tx (hence the txid) must be unchanged. Output-only funding (design 0032)
+        // hands out an inputless PSBT the user funds themselves, so the inputs - and the txid - legitimately
+        // change; we do not pin the txid there and instead rely on `find_lock_output` below to confirm
+        // the committed HTLC output (script + amount) is present in what the user built.
+        if !self.output_only && unsigned_txid(pending_psbt)? != unsigned_txid(signed_psbt)? {
             return Err(NodeError::Unexpected(
                 "the submitted PSBT is a different transaction than the one to sign".into(),
             ));

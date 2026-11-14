@@ -230,6 +230,14 @@ pub struct Record {
     /// an unboundedly-watched marker. Cleared with `expected_lock_txid`. Absent in older records.
     #[serde(default)]
     pub watch_from_height: Option<u32>,
+    /// Output-only funding (design 0032): this swap parked an inputless PSBT the user funds themselves,
+    /// so the lock txid is not known in advance (the user's inputs change it) and `expected_lock_txid`
+    /// stays `None`. This flag keeps the design-0019 terminal watch alive for such a swap - so a lock
+    /// the user broadcasts, even after the swap abandons, is still recognised (by its contract address,
+    /// not a txid) and refunded. Cleared once the swap is funded or the watch horizon passes. Absent in
+    /// older records, hence `serde(default)`.
+    #[serde(default)]
+    pub awaiting_external_funding: bool,
     /// The voluntary fee output's share and proof, stored with the lock so a restart resends the
     /// same proof to the counterparty (design 0010). `None` when no fee is due. Absent in older
     /// records, hence `serde(default)`.
@@ -861,6 +869,7 @@ impl<T: Transport> Engine<T> {
         self.records[i].funding = Some(tx);
         self.records[i].pending_lock_psbt = None;
         self.records[i].expected_lock_txid = None;
+        self.records[i].awaiting_external_funding = false;
         self.save(&self.records[i])?;
         Ok(())
     }
@@ -1571,6 +1580,7 @@ impl<T: Transport> Engine<T> {
             pending_spend: None,
             expected_lock_txid: None,
             watch_from_height: None,
+            awaiting_external_funding: false,
             fee: None,
             received_fee: None,
             spend_fee_sat: None,
@@ -1757,11 +1767,14 @@ impl<T: Transport> Engine<T> {
         self.reannounce_offers();
         for i in 0..self.records.len() {
             // Terminal swaps are skipped, with one exception (design 0019): a swap that abandoned while
-            // a handed-out funding PSBT could still land keeps its `expected_lock_txid` marker and is
-            // still advanced, so a lock the user broadcasts late is adopted and refunded.
+            // a handed-out funding PSBT could still land keeps watching, so a lock the user broadcasts
+            // late is adopted and refunded. The marker is `expected_lock_txid` for descriptor-backed
+            // interactive funding, or `awaiting_external_funding` for output-only funding (design 0032,
+            // where the txid is not known in advance so the watch keys off the contract address).
             if matches!(self.records[i].swap.phase, Phase::Done | Phase::Refunded)
                 || (self.records[i].swap.phase == Phase::Abandoned
-                    && self.records[i].expected_lock_txid.is_none())
+                    && self.records[i].expected_lock_txid.is_none()
+                    && !self.records[i].awaiting_external_funding)
             {
                 continue;
             }
@@ -1839,6 +1852,7 @@ impl<T: Transport> Engine<T> {
                 self.records[i].funding = Some(tx);
                 self.records[i].expected_lock_txid = None;
                 self.records[i].watch_from_height = None;
+                self.records[i].awaiting_external_funding = false;
                 self.records[i].swap.phase = Phase::Refunding;
                 self.save(&self.records[i])?;
                 // fall through to decide -> self.keys refund
@@ -1854,6 +1868,7 @@ impl<T: Transport> Engine<T> {
                     if own_height > from.saturating_add(self.adopt_watch_cap_blocks) {
                         self.records[i].expected_lock_txid = None;
                         self.records[i].watch_from_height = None;
+                        self.records[i].awaiting_external_funding = false;
                         self.save(&self.records[i])?;
                     }
                 }
@@ -1895,6 +1910,7 @@ impl<T: Transport> Engine<T> {
                 self.records[i].pending_lock_psbt = None;
                 self.records[i].expected_lock_txid = None;
                 self.records[i].watch_from_height = None;
+                self.records[i].awaiting_external_funding = false;
             }
         }
         self.save(&self.records[i])?;
@@ -2024,11 +2040,20 @@ impl<T: Transport> Engine<T> {
                         // already passed the replay guard) and wait for submit_signed_lock; do not
                         // broadcast anything now.
                         Err(NodeError::AwaitingSignature { psbt }) => {
-                            // Record the expected lock txid as a watch that outlives the prompt
-                            // (design 0019), so a lock the user broadcasts, even after the swap later
-                            // abandons, is still recognised and refunded. The watch horizon is stamped
-                            // in advance() from the view height (consistent with the give-up check).
-                            self.records[i].expected_lock_txid = Some(funding_psbt_txid(&psbt)?);
+                            // Keep a watch that outlives the prompt (design 0019), so a lock the user
+                            // broadcasts, even after the swap later abandons, is still recognised and
+                            // refunded. A descriptor-backed interactive PSBT fixes the lock txid (segwit),
+                            // so stamp expected_lock_txid. Output-only funding (design 0032) does not:
+                            // the user adds inputs, changing the txid, so flag the swap instead and the
+                            // terminal watch keys off the contract address (advance()'s abandoned block
+                            // adopts any lock on our contract). The watch horizon is stamped in advance()
+                            // from the view height (consistent with the give-up check), for both.
+                            if self.nodes[&own_chain].is_output_only() {
+                                self.records[i].awaiting_external_funding = true;
+                            } else {
+                                self.records[i].expected_lock_txid =
+                                    Some(funding_psbt_txid(&psbt)?);
+                            }
                             self.records[i].pending_lock_psbt = Some(psbt);
                             self.save(&self.records[i])?;
                             return Ok(());
