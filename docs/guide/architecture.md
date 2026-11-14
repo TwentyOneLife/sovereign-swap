@@ -37,7 +37,8 @@ The engine supports three ways to fund the on-chain lock, chosen per chain:
 | **Interactive** | with you | you sign the funding PSBT out of band and submit it |
 
 Hot is the simplest (good for testing); cold keeps spending keys off the hot machine; interactive hands
-you the unsigned funding transaction to sign in your own wallet and hand back
+you the unsigned funding transaction to sign in your own wallet and hand back - **Sparrow for the BTC
+leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (Sparrow does not sign on xBTC)
 ([design 0017](/design/), [0019](/design/)).
 
 ## How it is packaged

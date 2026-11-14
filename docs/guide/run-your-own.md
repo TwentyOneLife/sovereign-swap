@@ -90,7 +90,9 @@ In the client's config actions, set:
 - **Relays** - one or more Nostr relay addresses, a Tor `.onion` preferred. You and a counterparty must
   share at least one relay to find each other.
 - **Funding mode per chain** - hot, cold, or interactive (see [architecture](/guide/architecture)). Cold
-  or interactive keeps spending keys off the hot node.
+  or interactive keeps spending keys off the hot node. In interactive mode you sign each funding PSBT in
+  your own wallet: **Sparrow for the BTC leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain
+  Bitcoin wallet such as Sparrow does not sign on xBTC).
 - **Fee** - on by default to the project addresses; adjust or set your own ([fees](/guide/fees)).
 - **Minimums and the beta cap** - the smallest tradeable leg and a safety cap on the real-value (BTC)
   leg while the software is young.
