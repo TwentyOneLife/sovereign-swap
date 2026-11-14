@@ -2,10 +2,9 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
@@ -16,7 +15,19 @@ use sovereign_swap::electrum::ElectrumBackend;
 use sovereign_swap::htlc::Contract;
 use sovereign_swap::rpc::{Client, RpcError};
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+/// `n` distinct free loopback ports. All are bound at once (so they differ), then released just before
+/// the caller hands them to a child process. Because the OS never hands out a port that is currently in
+/// use, this collides far less than a computed per-pid counter (whose fixed-width buckets overlap once a
+/// binary spawns enough nodes); a caller's retry loop heals the rare bind-time race.
+fn free_ports(n: usize) -> Vec<u16> {
+    let held: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind a free loopback port"))
+        .collect();
+    held.iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect()
+    // `held` is dropped here, freeing the ports for the child to bind.
+}
 
 pub struct Node {
     child: Child,
@@ -36,14 +47,14 @@ impl Node {
     /// (`split::require_txindex`) must refuse on a node whose txindex is off, so that path needs a
     /// `txindex=0` node to test against.
     pub fn start_with(binary: &str, fork_height: Option<u32>, txindex: bool) -> Node {
-        // Concurrent test binaries share no port counter and can land in the same pid bucket, so two
-        // can pick the same rpcport; bitcoind then fails to bind its RPC server and exits. Try a fresh
-        // port (a new `n`) if the node does not come up, so a collision self-heals instead of flaking.
+        // Each attempt takes OS-assigned free ports; if bitcoind still fails to bind (a rare race, or a
+        // port grabbed between release and bind), the node does not come up and the loop retries with
+        // fresh ports, so a collision self-heals instead of flaking.
         for _ in 0..8 {
-            let n = NEXT_PORT.fetch_add(2, Ordering::SeqCst);
-            let base = 20_000 + (std::process::id() % 2_000) as u16 * 10;
-            let (rpc_port, p2p_port) = (base + n, base + n + 1);
-            let datadir = std::env::temp_dir().join(format!("sovswap-{}-{n}", std::process::id()));
+            let ports = free_ports(2);
+            let (rpc_port, p2p_port) = (ports[0], ports[1]);
+            let datadir =
+                std::env::temp_dir().join(format!("sovswap-{}-{rpc_port}", std::process::id()));
             std::fs::create_dir_all(&datadir).unwrap();
             let ti = u8::from(txindex);
             let mut conf = format!(
@@ -276,9 +287,8 @@ pub struct Fulcrum {
 impl Fulcrum {
     pub fn start(node: &Node) -> Option<Fulcrum> {
         let binary = std::env::var("FULCRUM_BIN").ok()?;
-        let n = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
-        let port = 40_000 + (std::process::id() % 2_000) as u16 * 10 + n;
-        let datadir = std::env::temp_dir().join(format!("fulcrum-{}-{n}", std::process::id()));
+        let port = free_ports(1)[0];
+        let datadir = std::env::temp_dir().join(format!("fulcrum-{}-{port}", std::process::id()));
         std::fs::create_dir_all(&datadir).unwrap();
         let conf = format!(
             "datadir = {dd}\nbitcoind = 127.0.0.1:{rpc}\nrpcuser = u\nrpcpassword = p\n\
