@@ -42,6 +42,23 @@ The guarantee from the [security model](/guide/security-model) holds at every st
 that you get your own coin back. See the [lifecycle](/guide/lifecycle) for the states a swap moves
 through.
 
+### What can and can't happen to your locked coins
+
+Once your lock is **confirmed on chain** it is immutable: it can only be spent two ways, both of them
+yours to fall back on. The counterparty, the relay, and a stranger can do nothing to it.
+
+- **Before it confirms** you can still cancel your *own* lock (it is replaceable), and before you
+  broadcast anything you can simply **abort** the swap. Nobody else can alter or redirect a lock you
+  signed, in or out of the mempool.
+- **If the counterparty never locks their leg**, you do not lose your coins. After your refund timelock
+  passes, your lock refunds back to you automatically. The only cost of an aborted swap is the small
+  on-chain miner fee and, if the offer set one, the voluntary fee; your principal always comes home.
+- **Why the wait for confirmations matters.** A taker commits its coin only after the maker's lock is
+  several blocks deep (the security depth, set deeper on the lower-hashrate chain). That is what makes a
+  "cancel after the other side commits" move impossible: by the time you lock, the other leg is already
+  too deep to reverse. It is also why a swap appears to wait before funding the second leg, and why the
+  detail screen shows each lock's confirmations against the depth it still needs.
+
 ## Before your first real trade
 
 - Confirm you are sending each leg to the **right chain** (BTC vs xBTC share an address format).

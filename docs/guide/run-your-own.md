@@ -105,6 +105,38 @@ In the client's config actions, set:
 Settings that change the daemon's wiring restart it cleanly; your swap data is preserved in place across
 an update.
 
+### Signing a funding PSBT (interactive mode)
+
+In interactive mode the node never signs the lock. When a swap reaches its funding step, the swap-detail
+screen shows a parked funding PSBT for you to sign in your own wallet and hand back. The node has already
+selected your inputs and added the change and fee output, so you are only adding a signature. Use
+**Sparrow for the BTC leg and Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain Bitcoin wallet does not
+sign on xBTC).
+
+1. **Load the PSBT.** Copy the base64 from the "Sign your funding" box and open it in your wallet
+   (`File > Open Transaction`, paste). Confirm the outputs: the lock amount to the HTLC address, your
+   change back to you, and the fee. Leave the sighash at **All**; the HTLC requires a `SIGHASH_ALL`
+   signature.
+2. **Sign it.** Two ways, your choice:
+   - **Air-gapped (recommended for real value):** display the PSBT as a QR, scan it with an offline signer
+     (e.g. SeedSigner), sign on the device, scan the signed QR back into your wallet. The spending key
+     never touches a networked machine.
+   - **Hot:** if the wallet itself holds the keys (loaded from the seed, not a watch-only xpub), sign
+     directly, no second device. Faster, but the key is on a networked machine - fine for dust tests, keep
+     real value on the air-gapped path.
+3. **Export the signed PSBT as base64.** In Sparrow/Shrike: `File > Save PSBT > To Clipboard > As Base64`.
+   It must be the **base64** PSBT (it starts `cHNidP8...`), **not** hex and **not** the final raw
+   transaction.
+4. **Paste it back and submit.** Paste into the "Signed PSBT (paste)" box and click **Submit**. The engine
+   finalizes and broadcasts the lock itself and drives the rest of the swap.
+
+**Do not broadcast the funding transaction from your wallet.** The engine must broadcast it so it can pin
+the lock's txid and track the swap; if your wallet broadcasts first, the engine never receives the signed
+PSBT and the swap stalls. Sign, export, paste, submit - never "Broadcast".
+
+The counterparty's leg works the same way: once your lock confirms, the other chain's node parks its own
+funding PSBT for you to sign and submit by the same steps.
+
 ## 4. Verify it is healthy
 
 The client exposes a small status read: it should report the engine up, both chain nodes reachable, and
