@@ -39,7 +39,30 @@ The engine supports three ways to fund the on-chain lock, chosen per chain:
 Hot is the simplest (good for testing); cold keeps spending keys off the hot machine; interactive hands
 you the unsigned funding transaction to sign in your own wallet and hand back - **Sparrow for the BTC
 leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (Sparrow does not sign on xBTC)
-([design 0017](/design/), [0019](/design/)).
+([design 0017](/design/), [0019](/design/)). Interactive has two shapes: with your **account descriptor**
+configured, the node builds a **fully-funded** PSBT you only sign (this is the right fit for an
+**air-gapped / QR signer** such as a SeedSigner, since it needs no coin selection in the signer); with no
+descriptor ("output-only"), the node builds an **inputless** PSBT and your own wallet adds the inputs,
+change and signature (a good fit for a software wallet that can fund a template).
+
+### What the node holds: watch-only wallets
+
+In every mode except Hot, the node holds **no private keys** - it works through **watch-only** wallets. A
+watch-only wallet has only public keys (from an account descriptor / xpub): it can **see** your coins and
+**build** transactions, but it **cannot spend**. That is exactly what lets your spending keys stay off the
+node. The node keeps up to two watch-only wallets per chain, and they do different jobs:
+
+- A **funding** watch-only wallet (in Cold and in descriptor-backed Interactive - in Hot this is instead a
+  full key-holding wallet, and in output-only Interactive there is none). The node imports **your** account
+  descriptor, so it can watch **your** balance and build a **funded** PSBT for the lock - selecting your
+  inputs and adding change. You sign that PSBT yourself; the node assembled it but can never sign it.
+- A **contract** watch-only wallet (the `…-watch` wallet, in every mode). The node imports **each swap's
+  HTLC lock** as a watched address, so the engine can tell when a lock confirms, observe the counterparty's
+  claim (to learn the revealed secret), and drive the claim or refund. It holds no keys and none of your
+  funds - only the swap's own addresses.
+
+So the **funding** watch-only wallet watches *your coins* to build the funding transaction, and the
+**contract** watch-only wallet watches *the swap's locks* to run the swap. Both can look; neither can spend.
 
 ## How it is packaged
 

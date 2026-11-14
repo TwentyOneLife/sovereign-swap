@@ -89,10 +89,15 @@ In the client's config actions, set:
 - **Nodes** - the BTC and xBTC RPC endpoints, credentials, and (for HTTPS) the Root CA.
 - **Relays** - one or more Nostr relay addresses, a Tor `.onion` preferred. You and a counterparty must
   share at least one relay to find each other.
-- **Funding mode per chain** - hot, cold, or interactive (see [architecture](/guide/architecture)). Cold
-  or interactive keeps spending keys off the hot node. In interactive mode you sign each funding PSBT in
-  your own wallet: **Sparrow for the BTC leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain
-  Bitcoin wallet such as Sparrow does not sign on xBTC).
+- **Funding mode per chain** - hot, cold, or interactive (see [architecture](/guide/architecture), which
+  explains the **watch-only wallets** the node uses to see and build without ever being able to spend).
+  Cold or interactive keeps spending keys off the hot node. In interactive mode you sign each funding PSBT
+  in your own wallet: **Sparrow for the BTC leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain
+  Bitcoin wallet such as Sparrow does not sign on xBTC). **Pick the interactive shape to fit your signer:**
+  configure your **account descriptor** and the node builds a **fully-funded** PSBT you only sign - the
+  right choice for an **air-gapped / QR signer** (e.g. SeedSigner), since it adds no coins in the signer;
+  leave the descriptor empty ("output-only") and the node builds an **inputless** PSBT your own wallet
+  funds and signs - fine for a software wallet that can fund a template, awkward for an air-gapped signer.
 - **Fee** - on by default to the project addresses; adjust or set your own ([fees](/guide/fees)).
 - **Minimums and the beta cap** - the smallest tradeable leg and a safety cap on the real-value (BTC)
   leg while the software is young.
