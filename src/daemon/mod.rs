@@ -311,6 +311,8 @@ impl Daemon {
          -> Result<ChainNode, String> {
             let client = connect_client(node_addr, node_user, node_pass, node_ca, &tor_socks)
                 .map_err(|e| format!("node {node_addr}: {e}"))?;
+            // Guard against a node assigned to the wrong chain before using it for any funds.
+            crate::node::check_chain_pow(&client, chain).map_err(|e| format!("{e:?}"))?;
             match funding.mode {
                 FundingMode::Hot => ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}")),
                 FundingMode::Cold => {
