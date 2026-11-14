@@ -249,6 +249,8 @@ pub(crate) fn handle_engine_cmd(
                         "maker": contract_json(&s.maker_contract),
                         "taker": contract_json(&s.taker_contract),
                     }),
+                    s.depths.maker_lock,
+                    s.depths.taker_lock,
                 )
             });
             // E2 (0017): if the swap is parked awaiting the user's funding signature, surface the
@@ -258,7 +260,7 @@ pub(crate) fn handle_engine_cmd(
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
             let spend_template = engine.pending_spend_template(id);
-            let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts)| {
+            let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts, mld, tld)| {
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
@@ -302,7 +304,7 @@ pub(crate) fn handle_engine_cmd(
                     j["contracts"] = contracts;
                 }
                 match engine.chain_view(id) {
-                    Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb),
+                    Some(Ok(view)) => j["chain"] = chain_view_json(&view, side, mlb, tlb, mld, tld),
                     Some(Err(e)) => j["chain_error"] = json!(format!("{e:?}")),
                     None => {}
                 }
@@ -442,6 +444,8 @@ pub(crate) fn chain_view_json(
     own_side: Side,
     maker_lock_blocks: u16,
     taker_lock_blocks: u16,
+    maker_lock_depth: u32,
+    taker_lock_depth: u32,
 ) -> Value {
     let (own_lock, own_height, own_lock_blocks) = match own_side {
         Side::Maker => (&view.maker_lock, view.maker_chain_height, maker_lock_blocks),
@@ -455,18 +459,21 @@ pub(crate) fn chain_view_json(
     json!({
         "maker_height": view.maker_chain_height,
         "taker_height": view.taker_chain_height,
-        "maker_lock": lock_json(&view.maker_lock, view.maker_chain_height),
-        "taker_lock": lock_json(&view.taker_lock, view.taker_chain_height),
+        "maker_lock": lock_json(&view.maker_lock, view.maker_chain_height, maker_lock_depth),
+        "taker_lock": lock_json(&view.taker_lock, view.taker_chain_height, taker_lock_depth),
         "refund_in_blocks": refund_in,
     })
 }
 
-pub(crate) fn lock_json(lock: &Option<LockView>, height: u32) -> Value {
+pub(crate) fn lock_json(lock: &Option<LockView>, height: u32, required_depth: u32) -> Value {
     match lock {
+        // `required_depth` is the confirmations this lock must reach before it drives the swap (the
+        // security depth); the GUI renders confirmations as count/required (#268).
         Some(l) => json!({
             "txid": l.outpoint.txid.to_string(),
             "vout": l.outpoint.vout,
             "confirmations": l.confirmed_height.map(|h| height.saturating_sub(h) + 1),
+            "required_depth": required_depth,
             "amount_ok": l.amount_ok,
             "spent": l.spend.is_some(),
         }),
@@ -604,8 +611,9 @@ mod tests {
             own_funded: false,
         };
         // We are the maker, so our lock is on the maker chain with 40 lock blocks.
-        let j = chain_view_json(&view, Side::Maker, 40, 20);
+        let j = chain_view_json(&view, Side::Maker, 40, 20, 6, 1);
         assert_eq!(j["maker_lock"]["confirmations"], 6); // 105 - 100 + 1
+        assert_eq!(j["maker_lock"]["required_depth"], 6); // the security depth, for count/required
         assert_eq!(j["refund_in_blocks"], 34); // 100 + 40 - 1 - 105
         assert_eq!(j["taker_lock"], Value::Null);
         assert_eq!(j["maker_lock"]["spent"], false);
