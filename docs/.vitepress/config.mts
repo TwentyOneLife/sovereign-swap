@@ -1,8 +1,22 @@
 import { defineConfig } from 'vitepress'
 
-// Published to GitHub Pages at /sovereign-swap/ and linked from the Ghost home at twentyone.life/swap
-// (later swap.twentyone.life via Cloudflare). This is the technical and trust documentation; the Ghost
-// page is the marketing landing. Content is PUBLIC: no infrastructure details ever.
+// Published to GitHub Pages at /sovereign-swap/. The marketing / coming-soon landing for the hosted
+// service is the Ghost page at twentyone.life/swap (served at swap.twentyone.life). This site is the
+// technical and trust documentation it links to. Content is PUBLIC: no infrastructure details ever.
+
+// Practical, task-oriented how-tos (docs/guides/*). Listed in the sidebar so a reader can actually find
+// them: the coin-split / replay-protection guides in particular are a headline feature for pre-fork
+// holders and were previously reachable only by a direct URL.
+const howToGuides = {
+  text: 'Guides (how-to)',
+  items: [
+    { text: 'Your first swap', link: '/guides/your-first-swap' },
+    { text: 'Protect your coins (replay protection)', link: '/guides/protect-your-coins' },
+    { text: 'Separate your coins', link: '/guides/separating-coins' },
+    { text: 'Set a silent-payment fee address', link: '/guides/fee-silent-payment-address' },
+  ],
+}
+
 export default defineConfig({
   lang: 'en-US',
   title: 'Sovereign Swap',
@@ -21,6 +35,7 @@ export default defineConfig({
     logo: '/logo.svg',
     nav: [
       { text: 'Guide', link: '/guide/overview' },
+      { text: 'Guides (how-to)', link: '/guides/your-first-swap' },
       { text: 'How it works', link: '/guide/how-it-works' },
       { text: 'Architecture', link: '/guide/architecture' },
       { text: 'Security', link: '/guide/security-model' },
@@ -56,6 +71,18 @@ export default defineConfig({
           items: [
             { text: 'Security model', link: '/guide/security-model' },
             { text: 'Run your own', link: '/guide/run-your-own' },
+          ],
+        },
+        howToGuides,
+      ],
+      '/guides/': [
+        howToGuides,
+        {
+          text: 'Reference',
+          items: [
+            { text: 'Overview', link: '/guide/overview' },
+            { text: 'How it works', link: '/guide/how-it-works' },
+            { text: 'Security model', link: '/guide/security-model' },
           ],
         },
       ],
