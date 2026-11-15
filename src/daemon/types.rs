@@ -704,6 +704,13 @@ pub(crate) struct NewOffer {
     #[serde(default)]
     pub(crate) valid_days: Option<u32>,
     pub(crate) min_amount_sat: u64,
+    /// Per-trade destinations for THIS offer (#257): where our claimed proceeds land (the chain we
+    /// receive on) and where our own lock refunds (the chain we lock). Local only, never on the wire
+    /// offer. Empty falls back to the configured per-chain payout, then a fresh node address.
+    #[serde(default)]
+    pub(crate) claim_dest: Option<String>,
+    #[serde(default)]
+    pub(crate) refund_dest: Option<String>,
 }
 
 impl NewOffer {
@@ -962,6 +969,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 50_000_000,
+            claim_dest: None,
+            refund_dest: None,
         }
     }
 
@@ -1315,6 +1324,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 1_000_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(
             o.validate(DUST_SAT, u64::MAX).is_empty(),
@@ -1337,6 +1348,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 1_000_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(partial
             .validate(DUST_SAT, u64::MAX)
@@ -1346,6 +1359,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 2_000_000,
+            claim_dest: None,
+            refund_dest: None,
             ..partial
         };
         assert!(atomic.validate(DUST_SAT, u64::MAX).is_empty());
@@ -1362,6 +1377,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 1_000_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(both
             .validate(DUST_SAT, u64::MAX)
@@ -1377,6 +1394,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 1_000_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(
             neither.validate(DUST_SAT, u64::MAX).is_empty(),
@@ -1391,6 +1410,8 @@ mod tests {
             margin_pct: Some(2),
             valid_days: None,
             min_amount_sat: 1_000_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(margin_and_price
             .validate(DUST_SAT, u64::MAX)
@@ -1434,6 +1455,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 4_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(
             !priced.validate(DUST_SAT, u64::MAX).is_empty(),
@@ -1452,6 +1475,8 @@ mod tests {
             margin_pct: None,
             valid_days: None,
             min_amount_sat: 4_000,
+            claim_dest: None,
+            refund_dest: None,
         };
         assert!(
             exact.validate(3_000, u64::MAX).is_empty(),

@@ -710,6 +710,49 @@ fn own_offers_carry_a_posted_time_pruned_on_withdraw() {
     );
 }
 
+/// #257: a maker that sets per-trade claim/refund destinations still drives the swap all the way to
+/// Done. This re-tests #275 (maker settles Done) under the per-trade-destination path, so a wrong or
+/// mishandled destination cannot silently break settlement, which is the catastrophic failure mode.
+#[test]
+fn a_per_trade_destination_still_settles_the_swap_to_done() {
+    let Some(w) = World::start() else { return };
+    let maker_chain = Chain::Xbtc;
+    let offer = offer(maker_chain);
+    let maker_part = offer.maker_amount;
+    let (a, b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let mut taker = Party::new("taker", b, &w.btc, &w.xbtc);
+    maker.deposit(w.node(maker_chain), 2.0);
+    taker.deposit(w.node(maker_chain.other()), 2.0);
+    w.mine();
+    // Distinct per-trade destinations: the maker claims on the chain it receives (the other chain) and
+    // refunds on its own; a fresh address from each node's wallet.
+    let addr = |n: &Node| {
+        n.wallet()
+            .call("getnewaddress", json!([]))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let claim_dest = addr(w.node(maker_chain.other()));
+    let refund_dest = addr(w.node(maker_chain));
+    maker
+        .engine()
+        .publish_with_dest(offer.clone(), Some(claim_dest), Some(refund_dest))
+        .unwrap();
+    taker.tick();
+    assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));
+    taker.engine().bid(&offer, maker_part, [9; 16]).unwrap();
+    w.run(&mut maker, &mut taker, 30, always, false, both(Phase::Done));
+    assert_eq!(
+        maker.phase(),
+        Some(Phase::Done),
+        "the maker settles Done even with a per-trade destination set"
+    );
+    assert_eq!(taker.phase(), Some(Phase::Done));
+}
+
 /// Withdrawing an id that is not one of our own offers is an error, not a silent success: a never-ours
 /// id and an already-withdrawn id both report, so the HTTP layer can return 422 instead of a
 /// misleading `{"withdrawn":...}` 200 (#78).

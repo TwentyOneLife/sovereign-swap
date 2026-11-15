@@ -426,6 +426,12 @@ function offerForm(o) {
         <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
         rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
       <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
+      <details style="margin:.4rem 0"><summary class="muted">Send this trade's coins to a specific address (optional)</summary>
+        <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+          Claim destination (${chainTag(o.sell_chain)}) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where your own coin refunds if this swap stalls. Leave blank to use your configured payout.">
+          Refund destination (${chainTag(o.taker_chain)}) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+      </details>
       <div class="row between">
         <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
         <button class="primary" id="f-go">Take</button>
@@ -447,6 +453,12 @@ function offerForm(o) {
       Your maker margin (%) <input id="f-margin" type="number" step="1" value="0"></label>
     <label title="What the taker pays you for the whole amount, priced from the nonkyc rate and your margin. Computed from the market, not editable.">
       You receive (<span id="f-recv-coin">${chainShort("btc")}</span>) <input id="f-recv" readonly></label>
+    <details style="margin:.4rem 0"><summary class="muted">Send this offer's coins to a specific address (optional)</summary>
+      <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+        Claim destination (<span id="f-claim-coin">${chainShort("btc")}</span>) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+      <label title="Where your own coin refunds if the swap stalls. Leave blank to use your configured payout.">
+        Refund destination (<span id="f-refund-coin">${chainShort("xbtc")}</span>) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+    </details>
     <p id="f-eff" class="muted"></p>
     <label title="How many days the offer stays valid. After this it is dropped from the market and can no longer be taken. Leave blank for no explicit expiry (it still ages out if you stop re-announcing).">
       Valid for (days, optional) <input id="f-days" type="number" min="1" step="1" placeholder="no expiry"></label>
@@ -501,6 +513,10 @@ function createSheet() {
     // Keep the leg labels in step with the direction.
     $("#f-sell-coin").textContent = chainShort(sell);
     $("#f-recv-coin").textContent = chainShort(taker);
+    // #257: claim is on the chain you receive, refund on the chain you lock (sell).
+    const cc = $("#f-claim-coin"), rc = $("#f-refund-coin");
+    if (cc) cc.textContent = chainShort(taker);
+    if (rc) rc.textContent = chainShort(sell);
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
       // No market-derived price. The form prices only from the market, so it cannot publish until the
@@ -566,6 +582,10 @@ function createSheet() {
     };
     const days = parseInt($("#f-days").value, 10);
     if (Number.isFinite(days) && days > 0) body.valid_days = days;
+    // #257: optional per-trade destinations (blank falls back to the configured payout).
+    const cd = ($("#f-claim-dest") || {}).value, rd = ($("#f-refund-dest") || {}).value;
+    if (cd && cd.trim()) body.claim_dest = cd.trim();
+    if (rd && rd.trim()) body.refund_dest = rd.trim();
     try {
       await api("POST", "/offers", body);
       $("#modal").classList.add("hidden");
@@ -582,7 +602,12 @@ function takeSheet(o) {
   openSheet(offerForm(o));
   $("#f-go").onclick = async () => {
     try {
-      const r = await api("POST", `/offers/${o.id}/take`, { amount_sat: o.amount_sat });
+      // #257: optional per-trade destinations (blank falls back to the configured payout).
+      const tb = { amount_sat: o.amount_sat };
+      const cd = ($("#f-claim-dest") || {}).value, rd = ($("#f-refund-dest") || {}).value;
+      if (cd && cd.trim()) tb.claim_dest = cd.trim();
+      if (rd && rd.trim()) tb.refund_dest = rd.trim();
+      const r = await api("POST", `/offers/${o.id}/take`, tb);
       $("#modal").classList.add("hidden");
       $$(".tab").find((t) => t.dataset.tab === "swaps").click();
       void r;

@@ -63,7 +63,12 @@ pub(crate) const TAKER_LOCK_BLOCKS: u16 = 20;
 /// A command to the engine thread. The engine never leaves that thread; only these messages cross it,
 /// so none of the engine's internals need to be shared or `Send` across a lock.
 pub(crate) enum EngineCmd {
-    Publish(SwapOffer, Sender<Result<(), String>>),
+    Publish(
+        SwapOffer,
+        Option<String>,
+        Option<String>,
+        Sender<Result<(), String>>,
+    ),
     Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     /// Our own live offers, for the "My offers" view so the maker can withdraw them (#211).
     OwnOffers(Sender<Vec<(SwapOffer, Option<u64>)>>),
@@ -75,6 +80,8 @@ pub(crate) enum EngineCmd {
     Take {
         offer_id: [u8; 16],
         maker_part: Amount,
+        claim_dest: Option<String>,
+        refund_dest: Option<String>,
         reply: Sender<Result<[u8; 16], String>>,
     },
     /// Take one of our offers off the market.
@@ -228,8 +235,12 @@ pub(crate) fn handle_engine_cmd(
     engine: &mut Engine<RelayTransport<MultiConn<WsConn>>>,
 ) {
     match cmd {
-        EngineCmd::Publish(offer, reply) => {
-            let _ = reply.send(engine.publish(offer).map_err(|e| format!("{e:?}")));
+        EngineCmd::Publish(offer, claim_dest, refund_dest, reply) => {
+            let _ = reply.send(
+                engine
+                    .publish_with_dest(offer, claim_dest, refund_dest)
+                    .map_err(|e| format!("{e:?}")),
+            );
         }
         EngineCmd::Offers(reply) => {
             let _ = reply.send(engine.seen_offers_with_time());
@@ -330,6 +341,8 @@ pub(crate) fn handle_engine_cmd(
         EngineCmd::Take {
             offer_id,
             maker_part,
+            claim_dest,
+            refund_dest,
             reply,
         } => {
             let found = engine
@@ -341,7 +354,7 @@ pub(crate) fn handle_engine_cmd(
                 Some(o) => {
                     let id = random16();
                     engine
-                        .bid(&o, maker_part, id)
+                        .bid_with_dest(&o, maker_part, id, claim_dest, refund_dest)
                         .map(|_| id)
                         .map_err(|e| format!("{e:?}"))
                 }
@@ -558,7 +571,7 @@ mod tests {
         // A stale Publish or Take is a double-trade risk: drop it.
         let (tx, _rx) = mpsc::channel();
         let publish = Dispatch {
-            cmd: EngineCmd::Publish(test_offer(), tx),
+            cmd: EngineCmd::Publish(test_offer(), None, None, tx),
             deadline: past,
         };
         assert!(
@@ -571,6 +584,8 @@ mod tests {
             cmd: EngineCmd::Take {
                 offer_id: [0u8; 16],
                 maker_part: Amount::from_sat(0),
+                claim_dest: None,
+                refund_dest: None,
                 reply: tx,
             },
             deadline: past,
@@ -605,6 +620,8 @@ mod tests {
             cmd: EngineCmd::Take {
                 offer_id: [0u8; 16],
                 maker_part: Amount::from_sat(0),
+                claim_dest: None,
+                refund_dest: None,
                 reply: tx,
             },
             deadline: future,
