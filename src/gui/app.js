@@ -487,6 +487,7 @@ function createSheet() {
   openSheet(offerForm(null));
   let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
   let refLoaded = false; // whether the first /reference-rate fetch has returned yet (#263)
+  let refVerify = ""; // #254: the nonkyc verify URL, kept even when the rate is unavailable, for a link
   const go = $("#f-go");
 
   // The market price (counter coin per unit of the sold coin) for the current direction.
@@ -496,6 +497,7 @@ function createSheet() {
   async function loadReference() {
     try {
       const r = await api("GET", "/reference-rate");
+      refVerify = r && r.verify_url ? r.verify_url : refVerify;
       ref =
         r.enabled && !r.error && isFinite(r.rate) && r.rate > 0
           ? { rate: r.rate, band: Number.isFinite(r.price_band_pct) ? r.price_band_pct : 10, verify: r.verify_url }
@@ -533,8 +535,15 @@ function createSheet() {
       }
       eff.textContent = "";
       d6.classList.remove("hidden");
+      // #254: a clickable fallback to read the rate at the source, plus a Refresh that re-fetches live.
+      const link = refVerify
+        ? ` <a href="${escapeHtml(refVerify)}" target="_blank" rel="noopener noreferrer">Check the rate at nonkyc</a>.`
+        : "";
       d6.innerHTML =
-        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference and reopen this form.";
+        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference, then " +
+        `<button type="button" id="f-refresh" class="link">refresh</button>.${link}`;
+      const rf = $("#f-refresh");
+      if (rf) rf.onclick = () => loadReference();
       return;
     }
     d6.classList.add("hidden");
