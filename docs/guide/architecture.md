@@ -39,11 +39,15 @@ The engine supports three ways to fund the on-chain lock, chosen per chain:
 Hot is the simplest (good for testing); cold keeps spending keys off the hot machine; interactive hands
 you the unsigned funding transaction to sign in your own wallet and hand back - **Sparrow for the BTC (SHA256)
 leg, Shrike for the BTC (Blake2b) leg** (Sparrow does not sign on the Blake2b chain)
-([design 0017](/design/), [0019](/design/)). Interactive has two shapes: with your **account descriptor**
-configured, the node builds a **fully-funded** PSBT you only sign (this is the right fit for an
-**air-gapped / QR signer** such as a SeedSigner, since it needs no coin selection in the signer); with no
-descriptor ("output-only"), the node builds an **inputless** PSBT and your own wallet adds the inputs,
-change and signature (a good fit for a software wallet that can fund a template).
+([design 0017](/design/), [0019](/design/)). Interactive has two shapes. **Descriptor-backed interactive
+is the standard, recommended mode**: with your **account descriptor** configured, the node builds a
+**fully-funded** PSBT you only sign, so a normal wallet (Sparrow for the BTC (SHA256) leg, Shrike for the
+BTC (Blake2b) leg) or an **air-gapped / QR signer** such as a SeedSigner just opens and signs it, no coin
+selection in the signer. The other shape, **output-only** (no descriptor), is **advanced**: the node
+builds an **inputless** PSBT and your own wallet must add the inputs, change and signature. A 0-input PSBT
+cannot be opened by Sparrow or Shrike, so output-only needs a wallet that can fund a template (for example
+Bitcoin Core or Electrum), or you pay the lock and fee outputs directly as a normal send; prefer
+descriptor-backed unless you specifically need this.
 
 **Cold vs Interactive, the real difference.** Your spending keys are off the hot node in both, so the
 distinction is not "do you sign", it is **who selects the coins and whether the signer is reachable**.

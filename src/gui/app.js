@@ -456,18 +456,19 @@ function updateFundWarn(chain) {
 
 function offerForm(o) {
   if (o) {
-    // Take: the terms are the maker's; you take the whole offer, nothing to set.
+    // Take: framed from the TAKER's side (#296), the mirror of the maker's offer, so the destination
+    // fields read as "receive what you buy" / "refund what you lock" rather than the maker's wording.
     return `<div class="row between"><h2>Take offer</h2>
         <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
-      <p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for
-        <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
+      <p class="muted">You pay <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong>
+        and receive <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> ·
         rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
       <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
       <details style="margin:.4rem 0"><summary class="muted">Send this trade's coins to a specific address (optional)</summary>
-        <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
-          Claim destination (${chainTag(o.sell_chain)}) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
-        <label title="Where your own coin refunds if this swap stalls. Leave blank to use your configured payout.">
-          Refund destination (${chainTag(o.taker_chain)}) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where you receive the ${chainShort(o.sell_chain)} you are buying. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+          Receive your ${chainTag(o.sell_chain)} at <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where your own ${chainShort(o.taker_chain)} refunds if this swap stalls. Leave blank to use your configured payout.">
+          Refund your ${chainTag(o.taker_chain)} to <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
       </details>
       <div class="hidden" id="f-fund-warn"></div>
       <div class="row between">

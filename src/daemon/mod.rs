@@ -349,6 +349,14 @@ impl Daemon {
                         // contract watch wallet is opened; the user funds the whole lock from their own
                         // wallet. Validation guarantees the per-chain payout address is set, so a
                         // claim/refund never falls back to a (nonexistent) funding-wallet address.
+                        // #293: output-only is the advanced mode; Sparrow/Shrike cannot sign its
+                        // inputless PSBT. Warn so an operator who meant to use the standard
+                        // descriptor-backed interactive mode notices the missing descriptor.
+                        eprintln!(
+                            "funding[{chain}]: output-only (interactive, no descriptor) - advanced. \
+                             Sparrow/Shrike cannot sign its inputless PSBT; set an account descriptor \
+                             for descriptor-backed interactive (the standard) to sign in your wallet."
+                        );
                         ChainNode::open_watch_only(client, &wallet, Box::new(InteractiveSigner))
                             .map_err(|e| format!("{e:?}"))
                     } else {
