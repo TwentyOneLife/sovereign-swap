@@ -688,6 +688,28 @@ fn a_dismissed_peer_offer_stays_gone_without_a_wire_withdraw() {
     taker.engine().dismiss(offer.id).unwrap();
 }
 
+/// #264: an own offer carries a posted-at time in the My-offers view, and that time is pruned when the
+/// offer leaves (withdraw), so the local `posted_at` map does not grow without bound.
+#[test]
+fn own_offers_carry_a_posted_time_pruned_on_withdraw() {
+    let Some(w) = World::start() else { return };
+    let (a, _b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let offer = offer(Chain::Xbtc);
+    maker.engine().publish(offer.clone()).unwrap();
+    let own = maker.engine().own_offers_with_time();
+    assert_eq!(own.len(), 1);
+    assert!(
+        own[0].1.is_some(),
+        "a freshly posted offer carries a posted time"
+    );
+    maker.engine().withdraw(offer.id).unwrap();
+    assert!(
+        maker.engine().own_offers_with_time().is_empty(),
+        "withdraw removes the offer and prunes its posted-at entry"
+    );
+}
+
 /// Withdrawing an id that is not one of our own offers is an error, not a silent success: a never-ours
 /// id and an already-withdrawn id both report, so the HTTP layer can return 422 instead of a
 /// misleading `{"withdrawn":...}` 200 (#78).

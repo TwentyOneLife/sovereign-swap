@@ -66,7 +66,7 @@ pub(crate) enum EngineCmd {
     Publish(SwapOffer, Sender<Result<(), String>>),
     Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     /// Our own live offers, for the "My offers" view so the maker can withdraw them (#211).
-    OwnOffers(Sender<Vec<SwapOffer>>),
+    OwnOffers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
@@ -235,7 +235,7 @@ pub(crate) fn handle_engine_cmd(
             let _ = reply.send(engine.seen_offers_with_time());
         }
         EngineCmd::OwnOffers(reply) => {
-            let _ = reply.send(engine.own_offers().to_vec());
+            let _ = reply.send(engine.own_offers_with_time());
         }
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
@@ -293,7 +293,11 @@ pub(crate) fn handle_engine_cmd(
                         ps["output_value_sat"] = json!(out_sat);
                         ps["destination_script_pubkey_hex"] =
                             json!(txout.script_pubkey.as_bytes().to_lower_hex_string());
-                        ps["fee_sat"] = json!(t.input_value.to_sat() - out_sat);
+                        // #270: output-only funding builds an inputless PSBT, so `input_value` is 0
+                        // and a plain subtraction underflows (u64). The miner fee is unknown until the
+                        // user's wallet adds inputs; `saturating_sub` yields 0, which the GUI renders
+                        // as "set by your wallet" rather than a bogus number.
+                        ps["fee_sat"] = json!(t.input_value.to_sat().saturating_sub(out_sat));
                         ps["witness_script_hex"] =
                             json!(t.witness_script.as_bytes().to_lower_hex_string());
                         ps["unsigned_tx_hex"] = json!(serialize_hex(&t.unsigned_tx));

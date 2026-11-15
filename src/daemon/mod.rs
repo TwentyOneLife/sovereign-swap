@@ -918,7 +918,7 @@ impl Daemon {
                 200,
                 json!(offers
                     .iter()
-                    .map(|o| offer_to_json(o, None))
+                    .map(|(o, posted_at)| offer_to_json(o, *posted_at))
                     .collect::<Vec<_>>()),
             ),
             Err(e) => (503, json!({ "error": e })),

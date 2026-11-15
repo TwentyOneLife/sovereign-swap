@@ -308,6 +308,13 @@ struct State {
     /// time column too.
     #[serde(default)]
     seen_at: Vec<([u8; 16], u64)>,
+    /// When each of our OWN offers was first posted (unix secs), by offer id, so the My-offers view can
+    /// show a created time (#264). Local only, never on the wire `Offer` (which is signed and public).
+    /// Absent in older state files, hence `serde(default)`; an own offer with no stamp (posted before
+    /// this field) reads as "unknown" rather than being stamped at load, which would make an old offer
+    /// look newly posted, the exact confusion #264 is about.
+    #[serde(default)]
+    posted_at: Vec<([u8; 16], u64)>,
     /// Bids we sent and wait to see accepted: swap id to (offer, maker part, key index).
     bids: Vec<([u8; 16], Offer, Amount, u32)>,
     /// Ids of offers a maker has withdrawn. Kept so a relay that replays the original offer event
@@ -551,6 +558,7 @@ impl<T: Transport> Engine<T> {
             return Ok(());
         }
         self.state.own_offers.retain(|o| !completed.contains(&o.id));
+        self.state.posted_at.retain(|(i, _)| !completed.contains(i)); // #264
         self.save_state()?;
         // Tell peers to drop these too, so a filled offer does not linger in their discovery (#70).
         // The send queues on the transport and goes out once the relay connection is up.
@@ -619,6 +627,10 @@ impl<T: Transport> Engine<T> {
         let now = now_unix();
         let before = self.state.own_offers.len();
         self.state.own_offers.retain(|o| !o.is_expired(now));
+        // #264: prune posted-at for offers that just expired out of own_offers.
+        let live: std::collections::HashSet<[u8; 16]> =
+            self.state.own_offers.iter().map(|o| o.id).collect();
+        self.state.posted_at.retain(|(i, _)| live.contains(i));
         if self.state.own_offers.len() != before {
             let _ = self.save_state();
         }
@@ -652,6 +664,7 @@ impl<T: Transport> Engine<T> {
             return Ok(());
         }
         self.state.own_offers.retain(|o| !consumed.contains(&o.id));
+        self.state.posted_at.retain(|(i, _)| !consumed.contains(i)); // #264
         self.save_state()?;
         for offer_id in consumed {
             self.transport.send(&Message::Withdraw { offer_id });
@@ -738,8 +751,12 @@ impl<T: Transport> Engine<T> {
                 }
             }
             let id: String = s.id.iter().map(|b| format!("{b:02x}")).collect();
+            // #251: the originating offer's id, so History can show a completed swap as a "done deal"
+            // linked back to the offer it filled. Many-to-one: one offer can produce several swaps.
+            let offer_id: String = s.offer.id.iter().map(|b| format!("{b:02x}")).collect();
             entries.push(serde_json::json!({
                 "id": id,
+                "offer_id": offer_id,
                 "role": match s.role { Role::Maker => "maker", Role::Taker => "taker" },
                 "phase": format!("{:?}", s.phase).to_lowercase(),
                 "maker_chain": chain(s.offer.maker_chain),
@@ -773,6 +790,24 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
+    /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
+    /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
+    pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
+        self.state
+            .own_offers
+            .iter()
+            .map(|o| {
+                let t = self
+                    .state
+                    .posted_at
+                    .iter()
+                    .find(|(id, _)| *id == o.id)
+                    .map(|(_, t)| *t);
+                (o.clone(), t)
+            })
+            .collect()
+    }
+
     pub fn seen_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
         let now = now_unix();
         self.state
@@ -847,6 +882,7 @@ impl<T: Transport> Engine<T> {
     pub fn withdraw(&mut self, offer_id: [u8; 16]) -> Result<(), EngineError> {
         let before = self.state.own_offers.len();
         self.state.own_offers.retain(|o| o.id != offer_id);
+        self.state.posted_at.retain(|(i, _)| *i != offer_id); // #264
         if self.state.own_offers.len() == before {
             // Nothing was removed: the id is not one of our own offers (never ours, or already
             // withdrawn/filled). Report it rather than reporting a no-op as success (#78).
@@ -1309,6 +1345,11 @@ impl<T: Transport> Engine<T> {
             *existing = offer.clone();
         } else {
             self.state.own_offers.push(offer.clone());
+        }
+        // #264: stamp the first-posted time, keyed by offer id. Keep the original time on a re-publish
+        // of the same id (refreshed terms), so "posted" reflects when the offer first went to market.
+        if !self.state.posted_at.iter().any(|(i, _)| *i == offer.id) {
+            self.state.posted_at.push((offer.id, now_unix()));
         }
         self.save_state()?;
         self.transport.send(&Message::Offer(offer));
