@@ -251,6 +251,39 @@ function renderStatus() {
     item(priceState, priceTitle, "price"),
     `<span class="stat" title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`,
   ].join(sep);
+  applyHealthGating();
+}
+
+// #253: what the last /status says we can safely do. Create offer and Take need the engine, both
+// nodes, and at least one relay (an offer with no relay goes nowhere). Split needs the engine and
+// both nodes but NOT the relay (it is a local on-chain action, no counterparty). Operator brakes
+// (submit signed PSBT, Withdraw, Abort, Dismiss) are never gated: a relay drop mid-swap must not lock
+// the user out of funding or teardown.
+function health() {
+  const s = statusData;
+  if (!s) return { trade: false, split: false, reason: "the daemon is unreachable" };
+  const relays = Array.isArray(s.relay_list) ? s.relay_list : [];
+  const relayOk = relays.length ? relays.some((r) => r.connected) : s.relays > 0;
+  const nodes = s.btc_node && s.xbtc_node;
+  let reason = "";
+  if (!s.engine) reason = "the swap engine is stopped";
+  else if (!nodes) reason = "a chain node is unreachable";
+  else if (!relayOk) reason = "no relay is connected";
+  return { trade: !!(s.engine && nodes && relayOk), split: !!(s.engine && nodes), reason };
+}
+function gateBtn(el, ok, reason) {
+  if (!el) return;
+  if (el.dataset.basetitle === undefined) el.dataset.basetitle = el.title || "";
+  el.disabled = !ok;
+  el.title = ok
+    ? el.dataset.basetitle
+    : "Unavailable: " + reason + (el.dataset.basetitle ? " (" + el.dataset.basetitle + ")" : "");
+}
+function applyHealthGating() {
+  const h = health();
+  gateBtn($("#new-offer"), h.trade, h.reason);
+  gateBtn($("#sp-classify"), h.split, h.reason);
+  document.querySelectorAll(".take-btn, .take-btn2").forEach((b) => gateBtn(b, h.trade, h.reason));
 }
 
 async function loadStatus() {
@@ -289,6 +322,7 @@ async function loadMyOffers() {
     `<div class="row between" data-id="${escapeHtml(o.id)}" style="padding:.35rem 0;border-bottom:1px solid var(--line)">` +
     `<span>Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
     `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}` +
+    ` · posted ${o.seen_at ? escapeHtml(fmtTime(o.seen_at).text) : "unknown"}` +
     (o.valid_until ? ` · expires ${escapeHtml(fmtUntil(o.valid_until))}` : "") + `</span>` +
     `<button class="ghost wd-btn" title="Remove this offer from the market (cannot be undone; re-create to re-post)">Withdraw</button></div>`
   ).join("");
@@ -435,6 +469,9 @@ function openSheet(html) {
 }
 
 function createSheet() {
+  // #253: refuse at the handler too, not only by disabling the button, since the status may change.
+  const h = health();
+  if (!h.trade) { alert("Create offer is unavailable right now: " + h.reason + "."); return; }
   openSheet(offerForm(null));
   let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
   let refLoaded = false; // whether the first /reference-rate fetch has returned yet (#263)
@@ -540,6 +577,8 @@ function createSheet() {
 }
 
 function takeSheet(o) {
+  const h = health();
+  if (!h.trade) { alert("Taking an offer is unavailable right now: " + h.reason + "."); return; }
   openSheet(offerForm(o));
   $("#f-go").onclick = async () => {
     try {
@@ -686,7 +725,13 @@ async function loadHistory() {
         return;
       }
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
+      // #251: a completed swap reads as a "done deal" linked back to the offer it filled.
+      const dealHead =
+        s.phase === "done"
+          ? `<p><strong>✓ Done deal</strong>${s.offer_id ? ` from offer #${escapeHtml(String(s.offer_id).slice(0, 6))}` : ""}</p>`
+          : "";
       box.innerHTML =
+        dealHead +
         `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ` +
         `${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)} · realized rate ${fmtRate(s.rate)}` +
         (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
@@ -724,6 +769,29 @@ async function fillSwapDetail(id, box) {
     `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
     `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
+    // #270: what this swap costs and what you net. The funding miner fee is set by your own wallet in
+    // interactive mode (unknown here until you sign), so it is named rather than numbered; "you
+    // receive" is the counter-leg, less a small claim miner fee you pay when you claim it.
+    (function () {
+      const youLock = s.role === "maker" ? s.maker_amount_sat : s.taker_amount_sat;
+      const youRecv = s.role === "maker" ? s.taker_amount_sat : s.maker_amount_sat;
+      const vfee = s.voluntary_fee_sat;
+      const row = (t) => `<p class="muted" style="margin:.15rem 0">${t}</p>`;
+      return (
+        `<div class="card"><strong>What this swap costs you</strong>` +
+        row(`You lock: <strong>${fmtSats(youLock)} ${chainTag(ownChain)}</strong>`) +
+        row(
+          vfee != null
+            ? `Voluntary fee: -${fmtSats(vfee)} ${chainTag(ownChain)} (to the protocol fee address)`
+            : "Voluntary fee: none",
+        ) +
+        row("Funding miner fee: set by your wallet (you sign the funding transaction)") +
+        row(
+          `You receive: ~<strong>${fmtSats(youRecv)} ${chainTag(cpChain)}</strong> (the counter-leg, less a small claim miner fee)`,
+        ) +
+        `</div>`
+      );
+    })() +
     // Once the secret is on chain the swap settles by claims, so the refund countdown no longer
     // applies; hiding it avoids the "refund available" text looking like a refund is happening (#275).
     (c.refund_in_blocks != null && !s.secret_revealed ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
@@ -734,7 +802,7 @@ async function fillSwapDetail(id, box) {
         `<p><strong>Sign your funding (${chainShort(ownChain)})</strong></p>` +
         `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
         `in your own wallet (Sparrow for ${chainShort("btc")}, Shrike for ${chainShort("xbtc")}), and paste the signed PSBT back. Your keys ` +
-        `never leave your wallet.</p>` +
+        `never leave your wallet. <a href="https://twentyonelife.github.io/sovereign-swap/guide/run-your-own" target="_blank" rel="noopener noreferrer">Signing guide</a>.</p>` +
         `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
         `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
         `lock only the engine can refund.</p>` +

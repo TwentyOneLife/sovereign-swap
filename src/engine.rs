@@ -790,6 +790,38 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
+    /// The voluntary fee this swap owes on our own lock, in sats, for the swap-detail breakdown (#270).
+    /// Computed with the same `fee_amount_min` funding and History use (a floor + per-role bps), so the
+    /// breakdown matches what is actually paid. `None` when the swap pays no fee on our chain.
+    pub fn voluntary_fee_sat(&self, swap_id: [u8; 16]) -> Option<u64> {
+        let s = &self.records.iter().find(|r| r.swap.id == swap_id)?.swap;
+        let own_chain = match s.role {
+            Role::Maker => s.offer.maker_chain,
+            Role::Taker => s.offer.maker_chain.other(),
+        };
+        let own_locked = match s.role {
+            Role::Maker => s.maker_part,
+            Role::Taker => s.taker_part,
+        };
+        s.offer
+            .fee
+            .as_ref()
+            .filter(|t| t.address(own_chain).is_some())
+            .and_then(|t| {
+                fee::fee_amount_min(
+                    FeeRates {
+                        maker_bps: t.maker_bps,
+                        taker_bps: t.taker_bps,
+                    },
+                    s.role,
+                    own_locked,
+                    self.min_trade_sat,
+                )
+                .ok()
+            })
+            .map(|a| a.to_sat())
+    }
+
     /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
     /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
     pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {

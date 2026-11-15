@@ -265,7 +265,10 @@ pub(crate) fn handle_engine_cmd(
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
             let spend_template = engine.pending_spend_template(id);
+            // #270: the voluntary fee this swap owes on our lock, for the swap-detail fee breakdown.
+            let voluntary_fee_sat = engine.voluntary_fee_sat(id);
             let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts, mld, tld)| {
+                j["voluntary_fee_sat"] = json!(voluntary_fee_sat);
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
