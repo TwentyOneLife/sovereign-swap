@@ -602,7 +602,7 @@ impl ChainNode {
         Ok(parsed.script_pubkey())
     }
 
-    fn address(&self, contract: &Contract) -> Address {
+    pub fn address(&self, contract: &Contract) -> Address {
         Address::from_script(&contract.script_pubkey(), self.network).expect("P2WSH has an address")
     }
 

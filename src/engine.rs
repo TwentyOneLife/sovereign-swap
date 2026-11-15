@@ -839,6 +839,46 @@ impl<T: Transport> Engine<T> {
             .map(|a| a.to_sat())
     }
 
+    /// Whether a parked swap is awaiting *external* (output-only, design 0032) funding, where the
+    /// daemon built an inputless PSBT and the user funds the whole lock from their own wallet (#291).
+    /// Lets the GUI distinguish this from descriptor-backed interactive funding (a funded PSBT the
+    /// wallet just signs), which it cannot otherwise tell apart from `pending_lock_psbt` alone.
+    pub fn awaiting_external_funding(&self, id: [u8; 16]) -> bool {
+        self.records
+            .iter()
+            .find(|r| r.swap.id == id)
+            .is_some_and(|r| r.awaiting_external_funding)
+    }
+
+    /// For a swap awaiting external (output-only) funding, the exact outputs the user must pay from
+    /// their own wallet to fund the lock: the HTLC lock output, and the voluntary-fee output when a fee
+    /// is owed (#291). `None` unless the swap is awaiting external funding. Mirrors the output-only
+    /// branch of `node::fund` (lock output + a normal-address fee output), so the pay-to instruction
+    /// the GUI shows matches the parked inputless PSBT exactly. A silent-payment fee cannot be built
+    /// output-only, so a parked swap only ever carries a normal fee address here.
+    pub fn external_funding_outputs(&self, id: [u8; 16]) -> Option<Vec<(String, u64)>> {
+        let r = self.records.iter().find(|r| r.swap.id == id)?;
+        if !r.awaiting_external_funding {
+            return None;
+        }
+        let s = &r.swap;
+        let (own_chain, contract, amount) = match s.role {
+            Role::Maker => (s.offer.maker_chain, &s.maker_contract, s.maker_part),
+            Role::Taker => (s.offer.maker_chain.other(), &s.taker_contract, s.taker_part),
+        };
+        let mut outs = vec![(
+            self.nodes[&own_chain].address(contract).to_string(),
+            amount.to_sat(),
+        )];
+        if let (Some(fee_sat), Some(fee_addr)) = (
+            self.voluntary_fee_sat(id),
+            s.offer.fee.as_ref().and_then(|t| t.address(own_chain)),
+        ) {
+            outs.push((fee_addr.to_string(), fee_sat));
+        }
+        Some(outs)
+    }
+
     /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
     /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
     pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
