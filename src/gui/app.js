@@ -27,9 +27,9 @@ const CHAIN = {
     url: "https://bitcoin.org/en/",
   },
   xbtc: {
-    short: "XBT",
+    short: "B2B",
     long: "BTC (Blake2b)",
-    note: "Bitcoin Blake2b, a different asset from Bitcoin",
+    note: "BTC (Blake2b), a separate asset and chain from BTC (SHA256)",
     url: "https://bitcoinknots.org/",
   },
 };
@@ -37,6 +37,9 @@ const chainShort = (c) => (CHAIN[c] || {}).short || String(c).toUpperCase();
 const chainLong = (c) => (CHAIN[c] || {}).long || String(c).toUpperCase();
 const chainNote = (c) => (CHAIN[c] || {}).note || String(c).toUpperCase();
 const chainUrl = (c) => (CHAIN[c] || {}).url || "";
+// Compact chain label for terse table cells: the short tag (BTC / B2B) with the full name
+// (BTC (SHA256) / BTC (Blake2b)) as a hover tooltip, so B2B is never a mystery abbreviation.
+const chainTag = (c) => `<span title="${escapeHtml(chainLong(c))}">${escapeHtml(chainShort(c))}</span>`;
 // The chain's long name as a link to its official site (detail/donate panels). External navigation is
 // allowed under the CSP (script-src 'self' governs scripts, not <a> links).
 const chainLink = (c) => {
@@ -354,9 +357,9 @@ async function loadMarket() {
     defaultDir: "desc",
     columns: [
       { label: "Seen", get: (o) => o.seen_at || 0, cell: (o) => { const t = fmtTime(o.seen_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
-      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => chainShort(o.sell_chain) },
+      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => chainTag(o.sell_chain) },
       { label: "Amount", num: true, get: (o) => o.amount_sat, cell: (o) => fmtSats(o.amount_sat) },
-      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}` },
+      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainTag(o.taker_chain)}` },
       { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => fmtRate(o.counter_amount_sat / o.amount_sat) },
     ],
     actions: () => `<button class="link take-btn">Take</button> <button class="link dismiss-btn" title="Hide this offer from your market on this node only (for a stale ghost offer)">Dismiss</button> `,
@@ -602,7 +605,7 @@ async function loadSwaps() {
       { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const t = fmtTime(s.started_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
       { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainTag(s.maker_chain)}→${chainTag(s.taker_chain)}` },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => fillSwapDetail(s.id, box),
@@ -668,7 +671,7 @@ async function loadHistory() {
       { label: "Started", get: (s) => (isSplit(s) ? s.time : s.started_at) || 0, cell: (s) => { const tt = fmtTime(isSplit(s) ? s.time : s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
       { label: "Ref", get: (s) => (isSplit(s) ? s.txid : s.id), cell: (s) => "#" + String(isSplit(s) ? s.txid : s.id).slice(0, 6) },
       { label: "Role", get: (s) => (isSplit(s) ? "split" : s.role), cell: (s) => (isSplit(s) ? "split" : s.role) },
-      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainShort("xbtc")}` : `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}`) },
+      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainTag("xbtc")}` : `${chainTag(s.maker_chain)}→${chainTag(s.taker_chain)}`) },
       { label: "Rate", num: true, get: (s) => (isSplit(s) ? 0 : s.rate || 0), cell: (s) => (isSplit(s) ? "-" : fmtRate(s.rate)) },
       { label: "Fee paid", num: true, get: (s) => (isSplit(s) ? s.fee_sat || 0 : s.voluntary_fee_paid_sat || 0), cell: (s) => (isSplit(s) ? fmtSats(s.fee_sat) : s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat)) },
       { label: "Phase", get: (s) => (isSplit(s) ? "split" : s.phase), cell: (s) => { if (isSplit(s)) return `<span class="pill phase-done">split</span>`; const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
