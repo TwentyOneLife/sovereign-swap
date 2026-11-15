@@ -94,7 +94,7 @@ The operator has confirmed (2026-11-10) that rotation **is required** for obfusc
 the distribution mechanism below, not whether to rotate. It is still sequenced after enabling
 Interactive, since it is not needed to run the fee'd end-to-end test or to turn Interactive on.
 
-- **Time-based.** Rotate the configured BTC and xBTC fee addresses on a randomized interval of 25 to 40
+- **Time-based.** Rotate the configured BTC (SHA256) and BTC (Blake2b) fee addresses on a randomized interval of 25 to 40
   days. **Open sub-decision: distribution.** The default fee address ships inside third-party installs,
   so rotation means either (a) a client release per window, with every old address watched forever
   because stale installs keep paying it, or (b) a signed remote fetch of the current address, where the

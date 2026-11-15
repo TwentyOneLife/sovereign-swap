@@ -1,6 +1,6 @@
 # Your first swap: a walkthrough
 
-A plain-language, end-to-end walkthrough of doing one BTC/xBTC swap, with the things a real
+A plain-language, end-to-end walkthrough of doing one swap between BTC (SHA256) and BTC (Blake2b), with the things a real
 operator actually runs into. For the protocol mechanics and diagrams see
 [how it works](../guide/how-it-works.md); this guide is the "what do I do, and what will I see" companion.
 
@@ -10,14 +10,14 @@ party can take your funds or freeze the trade.
 
 ## Before you start
 
-- **You need a reachable node for each chain** you touch: a Bitcoin node for BTC and a Bitcoin
-  BLAKE2b node for xBTC. An offer that sells only BTC still needs the xBTC node to verify the
+- **You need a reachable node for each chain** you touch: a Bitcoin node for BTC (SHA256) and a Bitcoin
+  BLAKE2b node for BTC (Blake2b). An offer that sells only BTC (SHA256) still needs the BTC (Blake2b) node to verify the
   counterparty's lock, and vice versa.
 - **Funding mode matters.** In hot mode the deposit address is a wallet whose keys live on the node;
   the funds are recoverable but they are not your cold-storage wallet. In cold mode the node holds a
   watch-only wallet and an external signer you control signs each lock. Know which you are using
   before you deposit.
-- **Fund the chain you will lock.** A maker selling xBTC funds xBTC; a taker paying BTC funds BTC,
+- **Fund the chain you will lock.** A maker selling BTC (Blake2b) funds BTC (Blake2b); a taker paying BTC (SHA256) funds BTC (SHA256),
   plus the per-chain fee and a little for miner fees.
 
 ## Making an offer (maker)
@@ -53,7 +53,7 @@ You do not both lock at once. The sequence is deliberate so neither side can be 
 
 In the interface each swap shows "Your leg" and "Counterparty", with the transaction and whether it
 is unconfirmed, locked, or spent, plus a reminder that funds are safe. A swap can sit for a while:
-confirmations depend on the chains, and the xBTC (BLAKE2b) chain can be slow, so a swap may take
+confirmations depend on the chains, and the BTC (Blake2b) chain can be slow, so a swap may take
 hours. That is normal; the timelocks are sized with margin.
 
 ## Fees: what you pay, and who pays it

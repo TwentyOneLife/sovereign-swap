@@ -1,8 +1,8 @@
 # Creating a silent payment address for the voluntary fee
 
 The voluntary fee pays to a BIP352 silent payment address (one that starts with `sp1`). This guide
-explains what that address is, how to create one in Sparrow (for BTC) and Shrike (for xBTC, Bitcoin
-Knots BLAKE2b), and what you need in order to receive and spend what it collects. The same address
+explains what that address is, how to create one in Sparrow for BTC (SHA256) and in Shrike for BTC
+(Blake2b), and what you need in order to receive and spend what it collects. The same address
 type works as a donation address.
 
 ## Why a silent payment address, not a normal one
@@ -33,13 +33,13 @@ When you create the wallet:
 
 Create a separate silent payment address on each chain, in the wallet that watches that chain:
 
-- **BTC:** a Single Signature SP wallet in **Sparrow**. Collects the fee paid on BTC swap legs.
-- **xBTC (Bitcoin Knots BLAKE2b):** a Single Signature SP wallet in **Shrike**. Collects the fee paid
-  on xBTC swap legs.
+- **BTC (SHA256):** a Single Signature SP wallet in **Sparrow**. Collects the fee paid on BTC (SHA256) swap legs.
+- **BTC (Blake2b):** a Single Signature SP wallet in **Shrike**. Collects the fee paid
+  on BTC (Blake2b) swap legs.
 
 Each swap pays the fee in the coin each side locks, so fees arrive on both chains. The scan and spend
-keys of a silent payment address live in one wallet's seed, so use the BTC address for the BTC side
-and the xBTC address for the xBTC side rather than trying to make one address serve both wallets.
+keys of a silent payment address live in one wallet's seed, so use the BTC (SHA256) address for the BTC (SHA256) side
+and the BTC (Blake2b) address for the BTC (Blake2b) side rather than trying to make one address serve both wallets.
 
 ## What you need to actually receive (not just publish)
 
@@ -48,8 +48,8 @@ payments, the wallet has to scan the chain, and for that it must be connected to
 server that supports silent payments indexing (BIP352). A wallet pointed at a server without that
 support will show the address but never find the payments.
 
-- **BTC (Sparrow):** connect to an Electrum server that advertises silent payments support.
-- **xBTC (Shrike):** connect Shrike to your own Bitcoin Knots BLAKE2b node and a BLAKE2b indexer that
+- **BTC (SHA256) in Sparrow:** connect to an Electrum server that advertises silent payments support.
+- **BTC (Blake2b) in Shrike:** connect Shrike to your own Bitcoin Knots BLAKE2b node and a BLAKE2b indexer that
   supports silent payments. The public servers that predate the BLAKE2b activation do not serve this
   chain, so a self-hosted indexer is the expected setup.
 
@@ -64,8 +64,8 @@ The same `sp1` address doubles as a donation address, and silent payments are a 
 
 - Many wallets still cannot send to an `sp1` address, so also offer a normal address for donors whose
   wallet does not support silent payments.
-- The xBTC (Bitcoin Knots BLAKE2b) chain shares Bitcoin's address format. Anywhere you publish the
-  xBTC address, state clearly that coins sent there are BitcoinB2B, a different asset than Bitcoin.
+- The BTC (Blake2b) chain shares Bitcoin's address format. Anywhere you publish the
+  BTC (Blake2b) address, state clearly that coins sent there are BTC (Blake2b), a different asset than BTC (SHA256).
 
 ## Summary
 

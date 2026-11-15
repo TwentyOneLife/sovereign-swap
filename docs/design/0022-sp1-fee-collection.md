@@ -71,7 +71,7 @@ to sp1 instead, which requires:
 3. **Switching the configured addresses.** Once 1 and 2 exist, change the baked DEFAULT
    `fee_btc_address`/`fee_xbtc_address` in the client (`settings.json.ts`) and the published donation
    address to the project's sp1 addresses. The daemon needs no change. Remember the per-chain rule
-   (0013): the BTC sp1 and the xBTC sp1 address must each stay on their own chain, and this chain shares
+   (0013): the BTC (SHA256) sp1 and the BTC (Blake2b) sp1 address must each stay on their own chain, and this chain shares
    Bitcoin's address format, so a published sp1 address still needs the note that coin sent there is a
    different asset.
 

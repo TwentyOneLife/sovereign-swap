@@ -70,5 +70,5 @@ The code is tested the way an attacker would probe it ([design 0003](/design/)):
   delay a swap into a refund. That is an annoyance, never a loss.
 - The software is young and the posture is a **soft launch**; the engine has not yet run for years under
   adversarial load. Size positions accordingly.
-- **xBTC is a different asset from BTC.** The single biggest user risk is sending to an address on the
+- **BTC (Blake2b) is a different asset from BTC (SHA256).** The single biggest user risk is sending to an address on the
   wrong chain, which no software can detect. Check the chain every time.

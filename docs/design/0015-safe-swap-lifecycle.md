@@ -122,7 +122,7 @@ Bump the envelope note / protocol version alongside the `Message` change and rec
 - Build in containers: `cargo build --locked --release` and `cargo test`; existing abandon/refund tests
   must still pass.
 - Live gate (dust, clean relay), in order: upgrade both nodes, withdraw any remaining stale offers via
-  the new endpoint, purge the relay event store, then run Test B (reverse xBTC to BTC) and Test C2
+  the new endpoint, purge the relay event store, then run Test B (reverse, Blake2b to SHA256) and Test C2
   (timelock refund). Confirm teardown uses the endpoints with no file edits, an unfunded maker
   self-abandons on schedule, a client restart re-animates nothing, and `active_swaps` reads correctly
   throughout. Run the monitoring agent and log to the infra findings runbook.

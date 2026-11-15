@@ -18,7 +18,7 @@ only our own code and our own isolated lab.
 - **The relay and transport** (from M3) can drop, reorder, duplicate and forge-at-the-transport
   messages, and is assumed fully hostile: every guarantee rests on the end-to-end envelope.
 - **The network** can flood a running service with connections and requests.
-- **The chains** can reorg; xBTC cheaply, given its hashrate.
+- **The chains** can reorg; BTC (Blake2b) cheaply, given its hashrate.
 
 ## The invariant
 

@@ -1,6 +1,6 @@
 # Overview
 
-Sovereign Swap lets two people trade **Bitcoin (BTC)** for **Bitcoin Blake2b (xBTC)** and back, peer to
+Sovereign Swap lets two people trade **BTC (SHA256)** for **BTC (Blake2b)** and back, peer to
 peer, with no exchange and no custodian in the middle. Each trade is enforced by cryptography on both
 chains, so neither side has to trust the other, and no third party can take or freeze the coins.
 
@@ -13,7 +13,7 @@ chains, so neither side has to trust the other, and no third party can take or f
 | Node | Bitcoin Core / Knots | Bitcoin Knots BLAKE2b |
 
 ::: warning The address format is shared, the coins are not
-A BTC address and an xBTC address look identical. They are different assets on different chains. Coin
+A BTC (SHA256) address and a BTC (Blake2b) address look identical. They are different assets on different chains. Coin
 sent to an address on the wrong chain is lost, and nothing on either chain can catch the mistake. Every
 step in this documentation names the chain it is on.
 :::
@@ -33,7 +33,7 @@ step in this documentation names the chain it is on.
 <img class="diagram" src="/diagrams/overview-1.svg" alt="The pieces, at a glance (diagram)" loading="lazy" />
 
 **Reading the diagram:** your node runs the **engine** (the state machine that drives a swap), talks to
-a **BTC node** and an **xBTC node** (yours, so you trust the chain data), and a **client** that carries
+a **BTC (SHA256) node** and a **BTC (Blake2b) node** (yours, so you trust the chain data), and a **client** that carries
 messages over **Nostr** relays through **Tor**. The relay is untrusted plumbing: it forwards sealed
 messages between peers but never holds coins or keys and cannot read a directed message. The
 counterparty is just another node like yours.

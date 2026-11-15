@@ -31,12 +31,12 @@ keyring exactly as a fresh user would, is in
 
 You need a node for each chain, reachable by the client:
 
-- **BTC**: Bitcoin Core or Knots, with RPC enabled.
-- **xBTC**: Bitcoin Knots BLAKE2b, with RPC enabled.
+- **BTC (SHA256)**: Bitcoin Core or Knots, with RPC enabled.
+- **BTC (Blake2b)**: Bitcoin Knots BLAKE2b, with RPC enabled.
 
 On StartOS each exposes an RPC interface; point the client at each node's RPC endpoint and credentials.
 Over a LAN use the node's HTTPS RPC with its StartOS Root CA; over Tor use the node's `.onion`
-([design 0011](/design/)). Optionally put an Electrum server (Fulcrum for BTC, Shulcrum for xBTC) in
+([design 0011](/design/)). Optionally put an Electrum server, Fulcrum for BTC (SHA256) and Shulcrum for BTC (Blake2b), in
 front for thinner chain reads ([design 0016](/design/)).
 
 ### Minimum node requirements
@@ -50,8 +50,8 @@ Each chain's node must provide, over RPC:
   elsewhere, so `walletprocesspsbt` must be available.
 - **The swap wallet as a watch wallet.** The client imports each swap's lock as a descriptor into the
   node wallet and reads the counterparty's spend from the wallet's own transaction history to learn the
-  revealed preimage; so the wallet must be loadable and see those transactions. An Electrum server
-  (Fulcrum for BTC, Shulcrum for xBTC) in front gives thinner chain reads but is optional. `txindex=1`
+  revealed preimage; so the wallet must be loadable and see those transactions. An Electrum server,
+  Fulcrum for BTC (SHA256) and Shulcrum for BTC (Blake2b), in front gives thinner chain reads but is optional. `txindex=1`
   is **not required** (a node without it settles fine); it only makes the fee-proof prevout lookup
   (`getrawtransaction` on a counterparty's older funding inputs) more robust, so it is a reasonable
   extra on a busy market-making node, not a prerequisite.
@@ -62,9 +62,9 @@ Each chain's node must provide, over RPC:
 
 ### Assign each chain to the right node (there is no automatic guard)
 
-BTC and xBTC share Bitcoin's network parameters and address format (they descend from the same chain),
-so the client **cannot** auto-detect which node is which; it trusts your configuration. Point the BTC
-node setting at your Bitcoin Core/Knots node and the xBTC node setting at your Bitcoin Knots BLAKE2b
+BTC (SHA256) and BTC (Blake2b) share Bitcoin's network parameters and address format (they descend from the same chain),
+so the client **cannot** auto-detect which node is which; it trusts your configuration. Point the BTC (SHA256)
+node setting at your Bitcoin Core/Knots node and the BTC (Blake2b) node setting at your Bitcoin Knots BLAKE2b
 node. There is **no automatic wrong-chain guard** on the node assignment, so a swapped pair would direct
 a leg to the wrong chain. Set each carefully and confirm with the status read before any real value.
 (The per-chain fee **address** is a separate per-chain field, so that fees land on the right chain; it
@@ -86,20 +86,20 @@ marketplace for others to discover offers over.
 
 In the client's config actions, set:
 
-- **Nodes** - the BTC and xBTC RPC endpoints, credentials, and (for HTTPS) the Root CA.
+- **Nodes** - the BTC (SHA256) and BTC (Blake2b) RPC endpoints, credentials, and (for HTTPS) the Root CA.
 - **Relays** - one or more Nostr relay addresses, a Tor `.onion` preferred. You and a counterparty must
   share at least one relay to find each other.
 - **Funding mode per chain** - hot, cold, or interactive (see [architecture](/guide/architecture), which
   explains the **watch-only wallets** the node uses to see and build without ever being able to spend).
   Cold or interactive keeps spending keys off the hot node. In interactive mode you sign each funding PSBT
-  in your own wallet: **Sparrow for the BTC leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain
-  Bitcoin wallet such as Sparrow does not sign on xBTC). **Pick the interactive shape to fit your signer:**
+  in your own wallet: **Sparrow for the BTC (SHA256) leg, Shrike for the BTC (Blake2b) leg** (a plain
+  Bitcoin wallet such as Sparrow does not sign on the Blake2b chain). **Pick the interactive shape to fit your signer:**
   configure your **account descriptor** and the node builds a **fully-funded** PSBT you only sign - the
   right choice for an **air-gapped / QR signer** (e.g. SeedSigner), since it adds no coins in the signer;
   leave the descriptor empty ("output-only") and the node builds an **inputless** PSBT your own wallet
   funds and signs - fine for a software wallet that can fund a template, awkward for an air-gapped signer.
 - **Fee** - on by default to the project addresses; adjust or set your own ([fees](/guide/fees)).
-- **Minimums and the beta cap** - the smallest tradeable leg and a safety cap on the real-value (BTC)
+- **Minimums and the beta cap** - the smallest tradeable leg and a safety cap on the real-value BTC (SHA256)
   leg while the software is young.
 
 Settings that change the daemon's wiring restart it cleanly; your swap data is preserved in place across
@@ -110,8 +110,8 @@ an update.
 In interactive mode the node never signs the lock. When a swap reaches its funding step, the swap-detail
 screen shows a parked funding PSBT for you to sign in your own wallet and hand back. The node has already
 selected your inputs and added the change and fee output, so you are only adding a signature. Use
-**Sparrow for the BTC leg and Shrike for the xBTC (Bitcoin Blake2b) leg** (a plain Bitcoin wallet does not
-sign on xBTC).
+**Sparrow for the BTC (SHA256) leg and Shrike for the BTC (Blake2b) leg** (a plain Bitcoin wallet does not
+sign on the Blake2b chain).
 
 1. **Load the PSBT.** Copy the base64 from the "Sign your funding" box and open it in your wallet
    (`File > Open Transaction`, paste). Confirm the outputs: the lock amount to the HTLC address, your

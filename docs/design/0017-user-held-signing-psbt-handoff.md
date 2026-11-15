@@ -5,8 +5,8 @@ E1 (design 0016) lets the engine read chain data and broadcast over an Electrum 
 no full node for **reads**. E2 and E3 remove the remaining full-node / hot-wallet requirement: the
 **user's own wallet funds and signs**, and the operator's side never holds a spendable key. This is the
 heart of the thin client and the hosted service (#46, Model 2a/2b), and it is the mechanism the owner
-described: the site builds unsigned PSBTs, the user signs in their own wallet (Sparrow for BTC, Shrike
-for xBTC, both speak PSBT today), and submits the signed PSBT back.
+described: the site builds unsigned PSBTs, the user signs in their own wallet, Sparrow for BTC (SHA256) and Shrike
+for BTC (Blake2b), both of which speak PSBT today, and submits the signed PSBT back.
 
 Builds on 0012 (the cold-signer seam: `FundingSigner`, watch-only funding wallet, `RemoteSigner` ->
 `signer_server`) and 0014 (the custody line). The one invariant: **no key that can move a user's coin
@@ -73,7 +73,7 @@ operator never imports a spendable key. This is the E3 funding half.
 - **Self-hosted client (open):** the daemon GUI shows the pending unsigned PSBT and accepts the signed
   one (copy/paste, file, or QR). This is the manual handoff, which works for both chains today.
 - **Hosted service (private, #46):** the same handshake per session in the proprietary web frontend;
-  for xBTC the signer is Shrike (no browser extension exists). A slicker one-click connector is a later
+  for BTC (Blake2b) the signer is Shrike (no browser extension exists). A slicker one-click connector is a later
   upgrade, not a launch blocker (the manual PSBT round-trip works now).
 
 ## What stays out of scope (the custody line)
@@ -106,7 +106,7 @@ operator never imports a spendable key. This is the E3 funding half.
 1. **State-machine correctness** , parking/resuming a half-funded swap across restarts must never fund
    twice, never broadcast a stale PSBT, and must survive the replay guards (handled in E2a: a pending
    PSBT is never rebuilt, funding and pending are mutually exclusive).
-2. **xBTC signing UX** , manual PSBT via Shrike works; a smooth flow is a later upgrade, not a blocker.
+2. **BTC (Blake2b) signing UX** , manual PSBT via Shrike works; a smooth flow is a later upgrade, not a blocker.
 3. **Hosted multi-tenant claim/refund keys** , only for #46: the per-session HTLC keys must be the
    user's, not the operator's. Out of scope for the self-hosted thin client.
 

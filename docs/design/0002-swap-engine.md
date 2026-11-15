@@ -71,17 +71,17 @@ Rules taken over from BasicSwap's failure handling (`docs/edge-cases.md`):
 Depths are not the maker's to choose: the maker writes the offer, and the depth that protects the
 taker cannot be left to the maker. Each engine applies its own `Policy`, by chain and by the swap's
 BTC-side amount, and uses the larger of the policy and the offer. A spend counts as final, and stops
-being watched, only at the policy depth of its chain, so a reorg on xBTC cannot undo a claim we
+being watched, only at the policy depth of its chain, so a reorg on BTC (Blake2b) cannot undo a claim we
 already stopped watching. Offers whose timelocks cannot fit these depths are refused, and so are
 amounts above the policy's limit. Lock inputs need `minconf` confirmations. The standard table
 (xBTC 6 / 12 / 36, BTC 1 / 2 / 3 up to 0.01 / 0.1 / 1 BTC) is provisional until a reorg-cost
-study of xBTC.
+study of BTC (Blake2b).
 
 ## Swap wallet
 
 Funding goes through a dedicated wallet on the user's own node of each chain (`walletcreatefundedpsbt`,
 then `walletprocesspsbt`). The node keeps the keys of the user's balance, chooses coins and, on
-xBTC, signs with the replay-protected signature hash. **Every funded transaction passes the replay
+BTC (Blake2b), signs with the replay-protected signature hash. **Every funded transaction passes the replay
 guard before it is signed.** The engine itself holds only per-swap keys for the contracts, derived
 from its own seed by hardened BIP32 derivation at a per-swap index. Each secret is the SHA-256 of a
 separate hardened derived private key, so no public key ever reveals it, and a restored seed recovers
@@ -104,7 +104,7 @@ and the secret hash; the secret itself never travels.
 ## Test plan
 
 Two engines on regtest (Core and Knots BLAKE2b), connected by the in-memory transport:
-- success in both directions (maker sells BTC, maker sells xBTC);
+- success in both directions, maker sells BTC (SHA256) and maker sells BTC (Blake2b);
 - taker never locks: maker refunds after `T_maker`;
 - maker never claims: taker refunds after `T_taker`, maker refunds after `T_maker`;
 - wrong lock amount or script from the counterparty: no further step, refund;

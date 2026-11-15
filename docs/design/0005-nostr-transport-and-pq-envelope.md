@@ -75,7 +75,7 @@ what a swap needs.
   behind the `Transport` trait so the two-engine tests run on the encrypted envelope, and publish
   cross-implementation test vectors. **Done:** an `EnvelopeTransport` wraps a byte transport and
   carries every `Message` as a format-3 envelope (offers broadcast-signed, the rest sealed to the
-  peer; frames that do not verify or decrypt are dropped). A full BTC/xBTC swap runs over it end to
+  peer; frames that do not verify or decrypt are dropped). A full swap between BTC (SHA256) and BTC (Blake2b) runs over it end to
   end (`tests/envelope_swap.rs`). **Remaining:** cross-implementation test vectors. Peer discovery
   and routing to more than one counterparty is M3b (the Nostr client).
 - M3b: the Nostr client and Tor transport; a relay (`sovereign-swap-relay`) for tests.

@@ -57,8 +57,8 @@ the payer's own cost. A trade below the minimum trade is refused before any tran
 
 The minimum trade is **configurable** (daemon setting `min_trade_sat`, default 100,000 sat = 0.001
 BTC), threaded into both the funding path and the counterparty's verify path so the two sides agree.
-Lowering it lets the fee apply to a small real-rate leg (xBTC is far cheaper than BTC, so a realistic
-swap's BTC side is tiny). It travels in the settings, not in the offer's `FeeTerms`, so both operators
+Lowering it lets the fee apply to a small real-rate leg (the Blake2b coin is far cheaper than the SHA256 coin, so a realistic
+swap's SHA256 side is tiny). It travels in the settings, not in the offer's `FeeTerms`, so both operators
 must set the same value; a mismatch fails safely (the verifier marks the fee `Failed`, or funding
 errors loudly, before anything commits) and never loses funds. The floor (1,000 sat) is **not**
 configurable: it guards Bitcoin's dust limit.
@@ -311,7 +311,7 @@ appears, since the relay may drop it; receiving it twice is harmless.
   each input key from `listdescriptors true` plus `getaddressinfo(addr).hdkeypath`, reusing the bip32
   code in `keys.rs`; or fund the e2e from an imported known single-key descriptor.
 - Silent payment address network: regtest uses the `sprt` HRP, which `parse` and `looks_like_sp_address`
-  must accept, and the parsed network is checked against the chain on both BTC and xBTC.
+  must accept, and the parsed network is checked against the chain on both BTC (SHA256) and BTC (Blake2b).
 
 ### Order of work
 

@@ -8,7 +8,7 @@ the web UI's **Split** tab.
 
 ## Problem
 
-Bitcoin and Bitcoin Blake2b share byte-identical history up to mainnet block **961,631** and first differ
+BTC (SHA256) and BTC (Blake2b) share byte-identical history up to mainnet block **961,631** and first differ
 at **961,632** (the BIP-110 split; BLAKE2b proof-of-work follows at 961,640). A coin that existed at or
 before 961,631 therefore exists on **both** chains under the same key, and a transaction spending it can
 be valid on both — it is **replayable**: a spend you make on one chain can be copied onto the other and
@@ -19,7 +19,7 @@ exist on **one chain only**.
 
 1. **Unified signature hash (free, no service).** The fork defines an opt-in signature hash that the
    SHA256 chain rejects at consensus. A spend signed that way is valid on Blake2b only, so it separates
-   the coin by itself. A Bitcoin Blake2b (Knots) wallet — e.g. Shrike — signs this way by default, so its
+   the coin by itself. A BTC (Blake2b) wallet, e.g. Shrike, signs this way by default, so its
    spends are already non-replayable. This is the by-hand guide, and it is the right path when you sign
    with such a wallet.
 

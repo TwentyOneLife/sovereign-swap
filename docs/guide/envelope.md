@@ -70,7 +70,7 @@ regardless of the transport, which is why the relay can be completely untrusted.
 
 ## Why hybrid, and why now
 
-Bitcoin Blake2b and this software are built for the long term. A message signed or sealed today could be
+BTC (Blake2b) and this software are built for the long term. A message signed or sealed today could be
 recorded by an adversary and attacked years later with a quantum computer ("harvest now, decrypt later").
 Using a post-quantum scheme **in addition to** a battle-tested classical one means:
 
