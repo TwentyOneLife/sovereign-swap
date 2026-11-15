@@ -308,6 +308,23 @@ struct State {
     /// time column too.
     #[serde(default)]
     seen_at: Vec<([u8; 16], u64)>,
+    /// When each of our OWN offers was first posted (unix secs), by offer id, so the My-offers view can
+    /// show a created time (#264). Local only, never on the wire `Offer` (which is signed and public).
+    /// Absent in older state files, hence `serde(default)`; an own offer with no stamp (posted before
+    /// this field) reads as "unknown" rather than being stamped at load, which would make an old offer
+    /// look newly posted, the exact confusion #264 is about.
+    #[serde(default)]
+    posted_at: Vec<([u8; 16], u64)>,
+    /// Per-trade claim/refund destination overrides (#257), local only, NEVER on the wire `Offer`
+    /// (which is signed and public). `offer_dest` is keyed by a maker's own offer id, `bid_dest` by a
+    /// taker's bid swap id. Each entry is (claim_dest, refund_dest): where our claimed proceeds land,
+    /// and where our own lock refunds, for THAT trade. An absent or empty value falls back to the
+    /// configured per-chain payout, then a fresh node address. Absent in older state, hence
+    /// `serde(default)`.
+    #[serde(default)]
+    offer_dest: Vec<([u8; 16], Option<String>, Option<String>)>,
+    #[serde(default)]
+    bid_dest: Vec<([u8; 16], Option<String>, Option<String>)>,
     /// Bids we sent and wait to see accepted: swap id to (offer, maker part, key index).
     bids: Vec<([u8; 16], Offer, Amount, u32)>,
     /// Ids of offers a maker has withdrawn. Kept so a relay that replays the original offer event
@@ -551,6 +568,10 @@ impl<T: Transport> Engine<T> {
             return Ok(());
         }
         self.state.own_offers.retain(|o| !completed.contains(&o.id));
+        self.state.posted_at.retain(|(i, _)| !completed.contains(i)); // #264
+        self.state
+            .offer_dest
+            .retain(|(i, _, _)| !completed.contains(i)); // #257
         self.save_state()?;
         // Tell peers to drop these too, so a filled offer does not linger in their discovery (#70).
         // The send queues on the transport and goes out once the relay connection is up.
@@ -619,6 +640,11 @@ impl<T: Transport> Engine<T> {
         let now = now_unix();
         let before = self.state.own_offers.len();
         self.state.own_offers.retain(|o| !o.is_expired(now));
+        // #264: prune posted-at for offers that just expired out of own_offers.
+        let live: std::collections::HashSet<[u8; 16]> =
+            self.state.own_offers.iter().map(|o| o.id).collect();
+        self.state.posted_at.retain(|(i, _)| live.contains(i));
+        self.state.offer_dest.retain(|(i, _, _)| live.contains(i)); // #257
         if self.state.own_offers.len() != before {
             let _ = self.save_state();
         }
@@ -652,6 +678,10 @@ impl<T: Transport> Engine<T> {
             return Ok(());
         }
         self.state.own_offers.retain(|o| !consumed.contains(&o.id));
+        self.state.posted_at.retain(|(i, _)| !consumed.contains(i)); // #264
+        self.state
+            .offer_dest
+            .retain(|(i, _, _)| !consumed.contains(i)); // #257
         self.save_state()?;
         for offer_id in consumed {
             self.transport.send(&Message::Withdraw { offer_id });
@@ -738,8 +768,12 @@ impl<T: Transport> Engine<T> {
                 }
             }
             let id: String = s.id.iter().map(|b| format!("{b:02x}")).collect();
+            // #251: the originating offer's id, so History can show a completed swap as a "done deal"
+            // linked back to the offer it filled. Many-to-one: one offer can produce several swaps.
+            let offer_id: String = s.offer.id.iter().map(|b| format!("{b:02x}")).collect();
             entries.push(serde_json::json!({
                 "id": id,
+                "offer_id": offer_id,
                 "role": match s.role { Role::Maker => "maker", Role::Taker => "taker" },
                 "phase": format!("{:?}", s.phase).to_lowercase(),
                 "maker_chain": chain(s.offer.maker_chain),
@@ -773,6 +807,56 @@ impl<T: Transport> Engine<T> {
     }
 
     /// Discovered offers paired with when each was last seen (unix secs), for the market view (#88).
+    /// The voluntary fee this swap owes on our own lock, in sats, for the swap-detail breakdown (#270).
+    /// Computed with the same `fee_amount_min` funding and History use (a floor + per-role bps), so the
+    /// breakdown matches what is actually paid. `None` when the swap pays no fee on our chain.
+    pub fn voluntary_fee_sat(&self, swap_id: [u8; 16]) -> Option<u64> {
+        let s = &self.records.iter().find(|r| r.swap.id == swap_id)?.swap;
+        let own_chain = match s.role {
+            Role::Maker => s.offer.maker_chain,
+            Role::Taker => s.offer.maker_chain.other(),
+        };
+        let own_locked = match s.role {
+            Role::Maker => s.maker_part,
+            Role::Taker => s.taker_part,
+        };
+        s.offer
+            .fee
+            .as_ref()
+            .filter(|t| t.address(own_chain).is_some())
+            .and_then(|t| {
+                fee::fee_amount_min(
+                    FeeRates {
+                        maker_bps: t.maker_bps,
+                        taker_bps: t.taker_bps,
+                    },
+                    s.role,
+                    own_locked,
+                    self.min_trade_sat,
+                )
+                .ok()
+            })
+            .map(|a| a.to_sat())
+    }
+
+    /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
+    /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
+    pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
+        self.state
+            .own_offers
+            .iter()
+            .map(|o| {
+                let t = self
+                    .state
+                    .posted_at
+                    .iter()
+                    .find(|(id, _)| *id == o.id)
+                    .map(|(_, t)| *t);
+                (o.clone(), t)
+            })
+            .collect()
+    }
+
     pub fn seen_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
         let now = now_unix();
         self.state
@@ -847,6 +931,8 @@ impl<T: Transport> Engine<T> {
     pub fn withdraw(&mut self, offer_id: [u8; 16]) -> Result<(), EngineError> {
         let before = self.state.own_offers.len();
         self.state.own_offers.retain(|o| o.id != offer_id);
+        self.state.posted_at.retain(|(i, _)| *i != offer_id); // #264
+        self.state.offer_dest.retain(|(i, _, _)| *i != offer_id); // #257
         if self.state.own_offers.len() == before {
             // Nothing was removed: the id is not one of our own offers (never ours, or already
             // withdrawn/filled). Report it rather than reporting a no-op as success (#78).
@@ -1286,7 +1372,18 @@ impl<T: Transport> Engine<T> {
             .ok_or(EngineError::NoCommitment)
     }
 
+    /// Publish an offer with no per-trade destination: the configured payout applies (today's path).
     pub fn publish(&mut self, offer: Offer) -> Result<(), EngineError> {
+        self.publish_with_dest(offer, None, None)
+    }
+
+    /// Publish an offer carrying this trade's own claim/refund destinations (#257), stored locally.
+    pub fn publish_with_dest(
+        &mut self,
+        offer: Offer,
+        claim_dest: Option<String>,
+        refund_dest: Option<String>,
+    ) -> Result<(), EngineError> {
         self.config
             .policy
             .depths(&offer, offer.maker_amount, offer.taker_amount)
@@ -1310,17 +1407,41 @@ impl<T: Transport> Engine<T> {
         } else {
             self.state.own_offers.push(offer.clone());
         }
+        // #264: stamp the first-posted time, keyed by offer id. Keep the original time on a re-publish
+        // of the same id (refreshed terms), so "posted" reflects when the offer first went to market.
+        if !self.state.posted_at.iter().any(|(i, _)| *i == offer.id) {
+            self.state.posted_at.push((offer.id, now_unix()));
+        }
+        // #257: remember the maker's per-trade destinations for this offer (overwrite on a re-publish).
+        self.state.offer_dest.retain(|(i, _, _)| *i != offer.id);
+        if claim_dest.is_some() || refund_dest.is_some() {
+            self.state
+                .offer_dest
+                .push((offer.id, claim_dest, refund_dest));
+        }
         self.save_state()?;
         self.transport.send(&Message::Offer(offer));
         Ok(())
     }
 
-    /// Bids for `maker_part` of a seen offer.
+    /// Bids for `maker_part` of a seen offer, with no per-trade destination (today's path).
     pub fn bid(
         &mut self,
         offer: &Offer,
         maker_part: Amount,
         swap_id: [u8; 16],
+    ) -> Result<(), EngineError> {
+        self.bid_with_dest(offer, maker_part, swap_id, None, None)
+    }
+
+    /// Bids for `maker_part` of a seen offer, carrying this take's own claim/refund destinations (#257).
+    pub fn bid_with_dest(
+        &mut self,
+        offer: &Offer,
+        maker_part: Amount,
+        swap_id: [u8; 16],
+        claim_dest: Option<String>,
+        refund_dest: Option<String>,
     ) -> Result<(), EngineError> {
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
@@ -1412,6 +1533,10 @@ impl<T: Transport> Engine<T> {
         self.state
             .bids
             .push((swap_id, offer.clone(), maker_part, index));
+        // #257: stash this take's per-trade destinations, consumed when the Accept starts the swap.
+        if claim_dest.is_some() || refund_dest.is_some() {
+            self.state.bid_dest.push((swap_id, claim_dest, refund_dest));
+        }
         self.save_state()?;
         self.transport.send(&Message::Bid {
             offer_id: offer.id,
@@ -1563,7 +1688,9 @@ impl<T: Transport> Engine<T> {
                     started_at: Some(now_unix()),
                     offer,
                 };
-                self.start(swap)?;
+                // #257: as maker, our per-trade destinations come from the offer we published.
+                let (cd, rd) = self.dest_for_offer(swap.offer.id);
+                self.start(swap, cd, rd)?;
                 // design 0250: do NOT consume the offer on take. The swap is now in flight, so the
                 // offer is reserved: `reannounce_offers` stops advertising it and a second take is
                 // refused above. It stays in `own_offers` so it returns to the market if this swap
@@ -1651,7 +1778,9 @@ impl<T: Transport> Engine<T> {
                     offer,
                 };
                 self.state.bids.remove(pos);
-                self.start(swap)?;
+                // #257: as taker, our per-trade destinations were stashed with the bid at take time.
+                let (cd, rd) = self.take_bid_dest(swap_id);
+                self.start(swap, cd, rd)?;
             }
             Message::FeeProof { swap_id, proof } => {
                 // Store the counterparty's fee proof so `view` can verify their lock's fee output
@@ -1672,6 +1801,44 @@ impl<T: Transport> Engine<T> {
     /// fresh address from the node's own wallet (today's default). A configured address is
     /// network-checked by the node, so a misconfigured one fails the swap start rather than paying
     /// into the void.
+    /// #257: resolve a per-trade destination for `chain`. A non-empty override address is
+    /// network-checked here (so a wrong address fails the swap start loudly, exactly like the config
+    /// payout), otherwise this falls back to the configured payout / a fresh node address.
+    fn dest_override(&self, chain: Chain, over: &Option<String>) -> Result<ScriptBuf, EngineError> {
+        match over {
+            Some(a) if !a.trim().is_empty() => self.nodes[&chain]
+                .script_for(a.trim())
+                .map_err(EngineError::Node),
+            _ => self.destination(chain),
+        }
+    }
+
+    /// The maker's per-trade destination override for one of our own offers (#257), taken from the
+    /// local `offer_dest` map. `(None, None)` when the offer set none, so the config payout applies.
+    fn dest_for_offer(&self, offer_id: [u8; 16]) -> (Option<String>, Option<String>) {
+        self.state
+            .offer_dest
+            .iter()
+            .find(|(i, _, _)| *i == offer_id)
+            .map(|(_, c, r)| (c.clone(), r.clone()))
+            .unwrap_or((None, None))
+    }
+
+    /// The taker's per-trade destination override for a bid, consumed from `bid_dest` at Accept (#257).
+    fn take_bid_dest(&mut self, swap_id: [u8; 16]) -> (Option<String>, Option<String>) {
+        if let Some(pos) = self
+            .state
+            .bid_dest
+            .iter()
+            .position(|(i, _, _)| *i == swap_id)
+        {
+            let (_, c, r) = self.state.bid_dest.remove(pos);
+            (c, r)
+        } else {
+            (None, None)
+        }
+    }
+
     fn destination(&self, chain: Chain) -> Result<ScriptBuf, EngineError> {
         let configured = match chain {
             Chain::Btc => self.config.btc_payout.as_deref(),
@@ -1683,7 +1850,12 @@ impl<T: Transport> Engine<T> {
         }
     }
 
-    fn start(&mut self, swap: Swap) -> Result<(), EngineError> {
+    fn start(
+        &mut self,
+        swap: Swap,
+        claim_dest: Option<String>,
+        refund_dest: Option<String>,
+    ) -> Result<(), EngineError> {
         let maker_chain = swap.offer.maker_chain;
         let (claim_chain, refund_chain) = match swap.role {
             Role::Maker => (maker_chain.other(), maker_chain),
@@ -1693,9 +1865,12 @@ impl<T: Transport> Engine<T> {
             .watch_contract(&swap.maker_contract)?;
         self.backend(maker_chain.other())
             .watch_contract(&swap.taker_contract)?;
+        // #257: a per-trade destination override (where our claimed proceeds / our refund go for THIS
+        // swap) takes precedence over the configured payout; absent, `destination` keeps today's
+        // behaviour (the config address, else a fresh node address).
         let record = Record {
-            claim_to: self.destination(claim_chain)?,
-            refund_to: self.destination(refund_chain)?,
+            claim_to: self.dest_override(claim_chain, &claim_dest)?,
+            refund_to: self.dest_override(refund_chain, &refund_dest)?,
             funding: None,
             pending_lock_psbt: None,
             pending_spend: None,

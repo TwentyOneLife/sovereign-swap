@@ -63,10 +63,15 @@ pub(crate) const TAKER_LOCK_BLOCKS: u16 = 20;
 /// A command to the engine thread. The engine never leaves that thread; only these messages cross it,
 /// so none of the engine's internals need to be shared or `Send` across a lock.
 pub(crate) enum EngineCmd {
-    Publish(SwapOffer, Sender<Result<(), String>>),
+    Publish(
+        SwapOffer,
+        Option<String>,
+        Option<String>,
+        Sender<Result<(), String>>,
+    ),
     Offers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     /// Our own live offers, for the "My offers" view so the maker can withdraw them (#211).
-    OwnOffers(Sender<Vec<SwapOffer>>),
+    OwnOffers(Sender<Vec<(SwapOffer, Option<u64>)>>),
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
@@ -75,6 +80,8 @@ pub(crate) enum EngineCmd {
     Take {
         offer_id: [u8; 16],
         maker_part: Amount,
+        claim_dest: Option<String>,
+        refund_dest: Option<String>,
         reply: Sender<Result<[u8; 16], String>>,
     },
     /// Take one of our offers off the market.
@@ -228,14 +235,18 @@ pub(crate) fn handle_engine_cmd(
     engine: &mut Engine<RelayTransport<MultiConn<WsConn>>>,
 ) {
     match cmd {
-        EngineCmd::Publish(offer, reply) => {
-            let _ = reply.send(engine.publish(offer).map_err(|e| format!("{e:?}")));
+        EngineCmd::Publish(offer, claim_dest, refund_dest, reply) => {
+            let _ = reply.send(
+                engine
+                    .publish_with_dest(offer, claim_dest, refund_dest)
+                    .map_err(|e| format!("{e:?}")),
+            );
         }
         EngineCmd::Offers(reply) => {
             let _ = reply.send(engine.seen_offers_with_time());
         }
         EngineCmd::OwnOffers(reply) => {
-            let _ = reply.send(engine.own_offers().to_vec());
+            let _ = reply.send(engine.own_offers_with_time());
         }
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
@@ -265,7 +276,10 @@ pub(crate) fn handle_engine_cmd(
             // which spend it is and the sighash to sign, for POST /swaps/{id}/signed-spend.
             let pending_spend = engine.pending_spend(id);
             let spend_template = engine.pending_spend_template(id);
+            // #270: the voluntary fee this swap owes on our lock, for the swap-detail fee breakdown.
+            let voluntary_fee_sat = engine.voluntary_fee_sat(id);
             let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts, mld, tld)| {
+                j["voluntary_fee_sat"] = json!(voluntary_fee_sat);
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
                 }
@@ -293,7 +307,11 @@ pub(crate) fn handle_engine_cmd(
                         ps["output_value_sat"] = json!(out_sat);
                         ps["destination_script_pubkey_hex"] =
                             json!(txout.script_pubkey.as_bytes().to_lower_hex_string());
-                        ps["fee_sat"] = json!(t.input_value.to_sat() - out_sat);
+                        // #270: output-only funding builds an inputless PSBT, so `input_value` is 0
+                        // and a plain subtraction underflows (u64). The miner fee is unknown until the
+                        // user's wallet adds inputs; `saturating_sub` yields 0, which the GUI renders
+                        // as "set by your wallet" rather than a bogus number.
+                        ps["fee_sat"] = json!(t.input_value.to_sat().saturating_sub(out_sat));
                         ps["witness_script_hex"] =
                             json!(t.witness_script.as_bytes().to_lower_hex_string());
                         ps["unsigned_tx_hex"] = json!(serialize_hex(&t.unsigned_tx));
@@ -323,6 +341,8 @@ pub(crate) fn handle_engine_cmd(
         EngineCmd::Take {
             offer_id,
             maker_part,
+            claim_dest,
+            refund_dest,
             reply,
         } => {
             let found = engine
@@ -334,7 +354,7 @@ pub(crate) fn handle_engine_cmd(
                 Some(o) => {
                     let id = random16();
                     engine
-                        .bid(&o, maker_part, id)
+                        .bid_with_dest(&o, maker_part, id, claim_dest, refund_dest)
                         .map(|_| id)
                         .map_err(|e| format!("{e:?}"))
                 }
@@ -551,7 +571,7 @@ mod tests {
         // A stale Publish or Take is a double-trade risk: drop it.
         let (tx, _rx) = mpsc::channel();
         let publish = Dispatch {
-            cmd: EngineCmd::Publish(test_offer(), tx),
+            cmd: EngineCmd::Publish(test_offer(), None, None, tx),
             deadline: past,
         };
         assert!(
@@ -564,6 +584,8 @@ mod tests {
             cmd: EngineCmd::Take {
                 offer_id: [0u8; 16],
                 maker_part: Amount::from_sat(0),
+                claim_dest: None,
+                refund_dest: None,
                 reply: tx,
             },
             deadline: past,
@@ -598,6 +620,8 @@ mod tests {
             cmd: EngineCmd::Take {
                 offer_id: [0u8; 16],
                 maker_part: Amount::from_sat(0),
+                claim_dest: None,
+                refund_dest: None,
                 reply: tx,
             },
             deadline: future,

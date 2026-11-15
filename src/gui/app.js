@@ -27,9 +27,9 @@ const CHAIN = {
     url: "https://bitcoin.org/en/",
   },
   xbtc: {
-    short: "XBT",
+    short: "B2B",
     long: "BTC (Blake2b)",
-    note: "Bitcoin Blake2b, a different asset from Bitcoin",
+    note: "BTC (Blake2b), a separate asset and chain from BTC (SHA256)",
     url: "https://bitcoinknots.org/",
   },
 };
@@ -37,6 +37,9 @@ const chainShort = (c) => (CHAIN[c] || {}).short || String(c).toUpperCase();
 const chainLong = (c) => (CHAIN[c] || {}).long || String(c).toUpperCase();
 const chainNote = (c) => (CHAIN[c] || {}).note || String(c).toUpperCase();
 const chainUrl = (c) => (CHAIN[c] || {}).url || "";
+// Compact chain label for terse table cells: the short tag (BTC / B2B) with the full name
+// (BTC (SHA256) / BTC (Blake2b)) as a hover tooltip, so B2B is never a mystery abbreviation.
+const chainTag = (c) => `<span title="${escapeHtml(chainLong(c))}">${escapeHtml(chainShort(c))}</span>`;
 // The chain's long name as a link to its official site (detail/donate panels). External navigation is
 // allowed under the CSP (script-src 'self' governs scripts, not <a> links).
 const chainLink = (c) => {
@@ -248,6 +251,39 @@ function renderStatus() {
     item(priceState, priceTitle, "price"),
     `<span class="stat" title="${activeTitle}">${s.active_swaps ?? "?"} active</span>`,
   ].join(sep);
+  applyHealthGating();
+}
+
+// #253: what the last /status says we can safely do. Create offer and Take need the engine, both
+// nodes, and at least one relay (an offer with no relay goes nowhere). Split needs the engine and
+// both nodes but NOT the relay (it is a local on-chain action, no counterparty). Operator brakes
+// (submit signed PSBT, Withdraw, Abort, Dismiss) are never gated: a relay drop mid-swap must not lock
+// the user out of funding or teardown.
+function health() {
+  const s = statusData;
+  if (!s) return { trade: false, split: false, reason: "the daemon is unreachable" };
+  const relays = Array.isArray(s.relay_list) ? s.relay_list : [];
+  const relayOk = relays.length ? relays.some((r) => r.connected) : s.relays > 0;
+  const nodes = s.btc_node && s.xbtc_node;
+  let reason = "";
+  if (!s.engine) reason = "the swap engine is stopped";
+  else if (!nodes) reason = "a chain node is unreachable";
+  else if (!relayOk) reason = "no relay is connected";
+  return { trade: !!(s.engine && nodes && relayOk), split: !!(s.engine && nodes), reason };
+}
+function gateBtn(el, ok, reason) {
+  if (!el) return;
+  if (el.dataset.basetitle === undefined) el.dataset.basetitle = el.title || "";
+  el.disabled = !ok;
+  el.title = ok
+    ? el.dataset.basetitle
+    : "Unavailable: " + reason + (el.dataset.basetitle ? " (" + el.dataset.basetitle + ")" : "");
+}
+function applyHealthGating() {
+  const h = health();
+  gateBtn($("#new-offer"), h.trade, h.reason);
+  gateBtn($("#sp-classify"), h.split, h.reason);
+  document.querySelectorAll(".take-btn, .take-btn2").forEach((b) => gateBtn(b, h.trade, h.reason));
 }
 
 async function loadStatus() {
@@ -286,6 +322,7 @@ async function loadMyOffers() {
     `<div class="row between" data-id="${escapeHtml(o.id)}" style="padding:.35rem 0;border-bottom:1px solid var(--line)">` +
     `<span>Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for ` +
     `<strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> · rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}` +
+    ` · posted ${o.seen_at ? escapeHtml(fmtTime(o.seen_at).text) : "unknown"}` +
     (o.valid_until ? ` · expires ${escapeHtml(fmtUntil(o.valid_until))}` : "") + `</span>` +
     `<button class="ghost wd-btn" title="Remove this offer from the market (cannot be undone; re-create to re-post)">Withdraw</button></div>`
   ).join("");
@@ -354,9 +391,9 @@ async function loadMarket() {
     defaultDir: "desc",
     columns: [
       { label: "Seen", get: (o) => o.seen_at || 0, cell: (o) => { const t = fmtTime(o.seen_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
-      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => chainShort(o.sell_chain) },
+      { label: "Selling", get: (o) => o.sell_chain, cell: (o) => chainTag(o.sell_chain) },
       { label: "Amount", num: true, get: (o) => o.amount_sat, cell: (o) => fmtSats(o.amount_sat) },
-      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}` },
+      { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainTag(o.taker_chain)}` },
       { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => fmtRate(o.counter_amount_sat / o.amount_sat) },
     ],
     actions: () => `<button class="link take-btn">Take</button> <button class="link dismiss-btn" title="Hide this offer from your market on this node only (for a stale ghost offer)">Dismiss</button> `,
@@ -389,6 +426,12 @@ function offerForm(o) {
         <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
         rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
       <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
+      <details style="margin:.4rem 0"><summary class="muted">Send this trade's coins to a specific address (optional)</summary>
+        <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+          Claim destination (${chainTag(o.sell_chain)}) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where your own coin refunds if this swap stalls. Leave blank to use your configured payout.">
+          Refund destination (${chainTag(o.taker_chain)}) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+      </details>
       <div class="row between">
         <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
         <button class="primary" id="f-go">Take</button>
@@ -410,6 +453,12 @@ function offerForm(o) {
       Your maker margin (%) <input id="f-margin" type="number" step="1" value="0"></label>
     <label title="What the taker pays you for the whole amount, priced from the nonkyc rate and your margin. Computed from the market, not editable.">
       You receive (<span id="f-recv-coin">${chainShort("btc")}</span>) <input id="f-recv" readonly></label>
+    <details style="margin:.4rem 0"><summary class="muted">Send this offer's coins to a specific address (optional)</summary>
+      <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+        Claim destination (<span id="f-claim-coin">${chainShort("btc")}</span>) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+      <label title="Where your own coin refunds if the swap stalls. Leave blank to use your configured payout.">
+        Refund destination (<span id="f-refund-coin">${chainShort("xbtc")}</span>) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+    </details>
     <p id="f-eff" class="muted"></p>
     <label title="How many days the offer stays valid. After this it is dropped from the market and can no longer be taken. Leave blank for no explicit expiry (it still ages out if you stop re-announcing).">
       Valid for (days, optional) <input id="f-days" type="number" min="1" step="1" placeholder="no expiry"></label>
@@ -432,9 +481,13 @@ function openSheet(html) {
 }
 
 function createSheet() {
+  // #253: refuse at the handler too, not only by disabling the button, since the status may change.
+  const h = health();
+  if (!h.trade) { alert("Create offer is unavailable right now: " + h.reason + "."); return; }
   openSheet(offerForm(null));
   let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
   let refLoaded = false; // whether the first /reference-rate fetch has returned yet (#263)
+  let refVerify = ""; // #254: the nonkyc verify URL, kept even when the rate is unavailable, for a link
   const go = $("#f-go");
 
   // The market price (counter coin per unit of the sold coin) for the current direction.
@@ -444,6 +497,7 @@ function createSheet() {
   async function loadReference() {
     try {
       const r = await api("GET", "/reference-rate");
+      refVerify = r && r.verify_url ? r.verify_url : refVerify;
       ref =
         r.enabled && !r.error && isFinite(r.rate) && r.rate > 0
           ? { rate: r.rate, band: Number.isFinite(r.price_band_pct) ? r.price_band_pct : 10, verify: r.verify_url }
@@ -461,6 +515,10 @@ function createSheet() {
     // Keep the leg labels in step with the direction.
     $("#f-sell-coin").textContent = chainShort(sell);
     $("#f-recv-coin").textContent = chainShort(taker);
+    // #257: claim is on the chain you receive, refund on the chain you lock (sell).
+    const cc = $("#f-claim-coin"), rc = $("#f-refund-coin");
+    if (cc) cc.textContent = chainShort(taker);
+    if (rc) rc.textContent = chainShort(sell);
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
       // No market-derived price. The form prices only from the market, so it cannot publish until the
@@ -477,8 +535,15 @@ function createSheet() {
       }
       eff.textContent = "";
       d6.classList.remove("hidden");
+      // #254: a clickable fallback to read the rate at the source, plus a Refresh that re-fetches live.
+      const link = refVerify
+        ? ` <a href="${escapeHtml(refVerify)}" target="_blank" rel="noopener noreferrer">Check the rate at nonkyc</a>.`
+        : "";
       d6.innerHTML =
-        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference and reopen this form.";
+        "<strong>Market rate unavailable.</strong> The nonkyc reference is off or unreachable, so an offer cannot be priced from the market. Enable the price reference, then " +
+        `<button type="button" id="f-refresh" class="link">refresh</button>.${link}`;
+      const rf = $("#f-refresh");
+      if (rf) rf.onclick = () => loadReference();
       return;
     }
     d6.classList.add("hidden");
@@ -526,6 +591,10 @@ function createSheet() {
     };
     const days = parseInt($("#f-days").value, 10);
     if (Number.isFinite(days) && days > 0) body.valid_days = days;
+    // #257: optional per-trade destinations (blank falls back to the configured payout).
+    const cd = ($("#f-claim-dest") || {}).value, rd = ($("#f-refund-dest") || {}).value;
+    if (cd && cd.trim()) body.claim_dest = cd.trim();
+    if (rd && rd.trim()) body.refund_dest = rd.trim();
     try {
       await api("POST", "/offers", body);
       $("#modal").classList.add("hidden");
@@ -537,10 +606,17 @@ function createSheet() {
 }
 
 function takeSheet(o) {
+  const h = health();
+  if (!h.trade) { alert("Taking an offer is unavailable right now: " + h.reason + "."); return; }
   openSheet(offerForm(o));
   $("#f-go").onclick = async () => {
     try {
-      const r = await api("POST", `/offers/${o.id}/take`, { amount_sat: o.amount_sat });
+      // #257: optional per-trade destinations (blank falls back to the configured payout).
+      const tb = { amount_sat: o.amount_sat };
+      const cd = ($("#f-claim-dest") || {}).value, rd = ($("#f-refund-dest") || {}).value;
+      if (cd && cd.trim()) tb.claim_dest = cd.trim();
+      if (rd && rd.trim()) tb.refund_dest = rd.trim();
+      const r = await api("POST", `/offers/${o.id}/take`, tb);
       $("#modal").classList.add("hidden");
       $$(".tab").find((t) => t.dataset.tab === "swaps").click();
       void r;
@@ -602,7 +678,7 @@ async function loadSwaps() {
       { label: "Started", get: (s) => s.started_at || 0, cell: (s) => { const t = fmtTime(s.started_at); return `<span title="${escapeHtml(t.title)}">${t.text}</span>`; } },
       { label: "Swap", get: (s) => s.id, cell: (s) => "#" + s.id.slice(0, 6) },
       { label: "Role", get: (s) => s.role, cell: (s) => s.role },
-      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}` },
+      { label: "Direction", get: (s) => s.maker_chain, cell: (s) => `${chainTag(s.maker_chain)}→${chainTag(s.taker_chain)}` },
       { label: "Phase", get: (s) => s.phase, cell: (s) => { const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
     ],
     detailInto: (s, box) => fillSwapDetail(s.id, box),
@@ -668,7 +744,7 @@ async function loadHistory() {
       { label: "Started", get: (s) => (isSplit(s) ? s.time : s.started_at) || 0, cell: (s) => { const tt = fmtTime(isSplit(s) ? s.time : s.started_at); return `<span title="${escapeHtml(tt.title)}">${tt.text}</span>`; } },
       { label: "Ref", get: (s) => (isSplit(s) ? s.txid : s.id), cell: (s) => "#" + String(isSplit(s) ? s.txid : s.id).slice(0, 6) },
       { label: "Role", get: (s) => (isSplit(s) ? "split" : s.role), cell: (s) => (isSplit(s) ? "split" : s.role) },
-      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainShort("xbtc")}` : `${chainShort(s.maker_chain)}→${chainShort(s.taker_chain)}`) },
+      { label: "Direction", get: (s) => (isSplit(s) ? "split" : s.maker_chain), cell: (s) => (isSplit(s) ? `protect ${fmtSats(s.protected_sat)} ${chainTag("xbtc")}` : `${chainTag(s.maker_chain)}→${chainTag(s.taker_chain)}`) },
       { label: "Rate", num: true, get: (s) => (isSplit(s) ? 0 : s.rate || 0), cell: (s) => (isSplit(s) ? "-" : fmtRate(s.rate)) },
       { label: "Fee paid", num: true, get: (s) => (isSplit(s) ? s.fee_sat || 0 : s.voluntary_fee_paid_sat || 0), cell: (s) => (isSplit(s) ? fmtSats(s.fee_sat) : s.voluntary_fee_paid_sat == null ? "-" : fmtSats(s.voluntary_fee_paid_sat)) },
       { label: "Phase", get: (s) => (isSplit(s) ? "split" : s.phase), cell: (s) => { if (isSplit(s)) return `<span class="pill phase-done">split</span>`; const cls = isTerminal(s) ? "phase-" + s.phase : "phase-active"; return `<span class="pill ${cls}">${s.phase}</span>`; } },
@@ -683,7 +759,13 @@ async function loadHistory() {
         return;
       }
       const ownChain = s.role === "maker" ? s.maker_chain : s.taker_chain;
+      // #251: a completed swap reads as a "done deal" linked back to the offer it filled.
+      const dealHead =
+        s.phase === "done"
+          ? `<p><strong>✓ Done deal</strong>${s.offer_id ? ` from offer #${escapeHtml(String(s.offer_id).slice(0, 6))}` : ""}</p>`
+          : "";
       box.innerHTML =
+        dealHead +
         `<p class="muted">${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ` +
         `${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)} · realized rate ${fmtRate(s.rate)}` +
         (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
@@ -721,6 +803,29 @@ async function fillSwapDetail(id, box) {
     `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
     `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
     `</div>` +
+    // #270: what this swap costs and what you net. The funding miner fee is set by your own wallet in
+    // interactive mode (unknown here until you sign), so it is named rather than numbered; "you
+    // receive" is the counter-leg, less a small claim miner fee you pay when you claim it.
+    (function () {
+      const youLock = s.role === "maker" ? s.maker_amount_sat : s.taker_amount_sat;
+      const youRecv = s.role === "maker" ? s.taker_amount_sat : s.maker_amount_sat;
+      const vfee = s.voluntary_fee_sat;
+      const row = (t) => `<p class="muted" style="margin:.15rem 0">${t}</p>`;
+      return (
+        `<div class="card"><strong>What this swap costs you</strong>` +
+        row(`You lock: <strong>${fmtSats(youLock)} ${chainTag(ownChain)}</strong>`) +
+        row(
+          vfee != null
+            ? `Voluntary fee: -${fmtSats(vfee)} ${chainTag(ownChain)} (to the protocol fee address)`
+            : "Voluntary fee: none",
+        ) +
+        row("Funding miner fee: set by your wallet (you sign the funding transaction)") +
+        row(
+          `You receive: ~<strong>${fmtSats(youRecv)} ${chainTag(cpChain)}</strong> (the counter-leg, less a small claim miner fee)`,
+        ) +
+        `</div>`
+      );
+    })() +
     // Once the secret is on chain the swap settles by claims, so the refund countdown no longer
     // applies; hiding it avoids the "refund available" text looking like a refund is happening (#275).
     (c.refund_in_blocks != null && !s.secret_revealed ? `<p class="muted">Refund available in ${Math.max(0, c.refund_in_blocks)} blocks (if it stalls).</p>` : "") +
@@ -731,7 +836,7 @@ async function fillSwapDetail(id, box) {
         `<p><strong>Sign your funding (${chainShort(ownChain)})</strong></p>` +
         `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
         `in your own wallet (Sparrow for ${chainShort("btc")}, Shrike for ${chainShort("xbtc")}), and paste the signed PSBT back. Your keys ` +
-        `never leave your wallet.</p>` +
+        `never leave your wallet. <a href="https://twentyonelife.github.io/sovereign-swap/guide/run-your-own" target="_blank" rel="noopener noreferrer">Signing guide</a>.</p>` +
         `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
         `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
         `lock only the engine can refund.</p>` +

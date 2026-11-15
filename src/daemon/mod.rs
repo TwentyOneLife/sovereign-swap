@@ -918,7 +918,7 @@ impl Daemon {
                 200,
                 json!(offers
                     .iter()
-                    .map(|o| offer_to_json(o, None))
+                    .map(|(o, posted_at)| offer_to_json(o, *posted_at))
                     .collect::<Vec<_>>()),
             ),
             Err(e) => (503, json!({ "error": e })),
@@ -1519,10 +1519,20 @@ impl Daemon {
         #[derive(Deserialize)]
         struct Take {
             amount_sat: u64,
+            #[serde(default)]
+            claim_dest: Option<String>,
+            #[serde(default)]
+            refund_dest: Option<String>,
         }
         let Ok(take) = serde_json::from_slice::<Take>(body) else {
             return (400, json!({"error": "take needs amount_sat"}));
         };
+        // #257: the taker's per-trade destinations (local; stashed with the bid until Accept).
+        if let Some(err) =
+            dest_shape_error(&take.claim_dest).or_else(|| dest_shape_error(&take.refund_dest))
+        {
+            return (422, json!({ "error": err }));
+        }
         if !self.engine_running() {
             return Self::not_running();
         }
@@ -1576,9 +1586,12 @@ impl Daemon {
             }
         }
         let maker_part = Amount::from_sat(take.amount_sat);
+        let (claim_dest, refund_dest) = (take.claim_dest, take.refund_dest);
         match self.engine_call(move |reply| EngineCmd::Take {
             offer_id,
             maker_part,
+            claim_dest,
+            refund_dest,
             reply,
         }) {
             Ok(Ok(swap_id)) => (
@@ -1927,9 +1940,17 @@ impl Daemon {
             new.price = None;
             new.margin_pct = None;
         }
+        // #257: the maker's per-trade destinations travel with the offer locally (never on the wire).
+        let (claim_dest, refund_dest) = (new.claim_dest.take(), new.refund_dest.take());
+        if let Some(err) = dest_shape_error(&claim_dest).or_else(|| dest_shape_error(&refund_dest))
+        {
+            return (422, json!({ "error": err }));
+        }
         let offer = new.into_swap_offer(&self.state.lock().unwrap().settings);
         let id = offer.id.to_hex_string(Case::Lower);
-        match self.engine_call(move |reply| EngineCmd::Publish(offer, reply)) {
+        match self
+            .engine_call(move |reply| EngineCmd::Publish(offer, claim_dest, refund_dest, reply))
+        {
             Ok(Ok(())) => (200, json!({ "offer_id": id })),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
@@ -2046,6 +2067,24 @@ fn scan_address(
 }
 
 /// Seconds since the Unix epoch (for marker-reservation timestamps).
+/// #257: a cheap up-front shape check for a per-trade claim/refund destination. The full network
+/// check happens at swap start (the node's `script_for`), but a silent-payment address can never be a
+/// claim/refund destination (it is not a plain spend-to script), so reject it early with a clear
+/// message instead of failing the swap after it has started. `None` = acceptable (or unset).
+fn dest_shape_error(d: &Option<String>) -> Option<String> {
+    match d {
+        Some(a) if !a.trim().is_empty() => {
+            let a = a.trim();
+            if a.starts_with("sp1") || a.starts_with("tsp1") {
+                Some("a claim/refund destination cannot be a silent-payment address".to_owned())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

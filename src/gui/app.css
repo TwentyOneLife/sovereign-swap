@@ -62,6 +62,9 @@ input:focus,select:focus,textarea:focus{outline:1px solid var(--orange);border-c
 
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:1rem}
 .modal.hidden{display:none}
+/* #259: a generic hide utility. Without it, elements toggled with the `hidden` class (e.g. the
+   create-offer warning slot) kept their border/padding and showed as an empty box. */
+.hidden{display:none}
 .sheet{max-width:30rem;width:100%}
 
 footer{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;
