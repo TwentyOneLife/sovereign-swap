@@ -49,11 +49,31 @@ work and fidelity bonds are analysed as optional future deterrents in
 
 The code is tested the way an attacker would probe it ([design 0003](/design/)):
 
-- **Parser fuzzing** of every untrusted input (envelopes, Nostr frames, PSBTs).
+- **Parser fuzzing** of every untrusted input (envelopes, Nostr frames, PSBTs), including
+  coverage-guided fuzzing of the riskiest parsers.
 - **Malicious-counterparty tests** that tamper with messages, lock amounts, and fee outputs and assert
   the honest party never loses: it abandons or refunds, and never reveals the secret to a cheat.
 - **Mutation testing** of new tests, so a test that would pass even against broken code is caught.
 - **Live regtest end-to-end** swaps on both chains, including reorgs, restarts, and refund races.
+
+### External-attacker penetration testing
+
+Beyond the test suite, the daemon and the relay are put through a real **external-attacker pass** from
+a dedicated attack box on an **isolated lab network** with no route to the real node or the internet. A
+Kali machine drives hostile traffic at the running services: unauthenticated and wrong-credential
+requests, path and id fuzzing, oversized and malformed bodies, injection payloads in every string
+field, and connection floods. We run it again on each release that changes the attack surface, and
+**every meaningful attack becomes a permanent regression test** so a future change cannot quietly
+reopen it. The most recent pass (release 0.7.0) found no way to bypass authentication, crash the
+daemon, or leak internals; the one low-severity finding it surfaced, an input-validation guard that
+accepted a destination it should have rejected early, was fixed and pinned with a test in 0.7.1.
+
+The lab, the attack tooling, and a step-by-step "attack your own network to learn to defend it" course
+are open and reproducible in a separate project,
+[sovereign-homelab](https://github.com/TwentyOneLife/sovereign-homelab)
+([course](https://twentyonelife.github.io/sovereign-homelab/)): a sovereign operator should be able to
+verify the environment, not take our word for it. The in-repo security and test report lives in
+[security-testing.md](https://github.com/TwentyOneLife/sovereign-swap/blob/main/docs/security-testing.md).
 
 ## Operational discipline
 
