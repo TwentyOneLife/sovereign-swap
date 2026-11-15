@@ -84,6 +84,12 @@ pub struct FundingConfig {
     pub descriptor_receive: String,
     #[serde(default)]
     pub descriptor_change: String,
+    /// Funding birthday (#294): a unix timestamp (0 = genesis) the daemon imports the account
+    /// descriptors from, so a freshly (re)configured descriptor-backed wallet rescans and sees coins
+    /// received before the import. `None` keeps the no-rescan behaviour (the operator funds the wallet
+    /// after configuring). Only meaningful for descriptor-backed interactive and cold funding.
+    #[serde(default)]
+    pub funding_birthday: Option<i64>,
 }
 
 impl FundingConfig {
@@ -1598,6 +1604,7 @@ mod tests {
             signer_ca: String::new(),
             descriptor_receive: "wpkh(tpub.../0/*)".to_owned(),
             descriptor_change: "wpkh(tpub.../1/*)".to_owned(),
+            funding_birthday: None,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("hunter2"), "password must not be logged");

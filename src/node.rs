@@ -400,6 +400,7 @@ fn ensure_account_descriptor(
     descriptor: &str,
     internal: bool,
     created: bool,
+    birthday: Option<i64>,
 ) -> Result<(), NodeError> {
     let info = rpc.call("getdescriptorinfo", json!([descriptor]))?;
     let canonical = info["descriptor"]
@@ -416,11 +417,20 @@ fn ensure_account_descriptor(
             return Ok(());
         }
     }
+    // #294: import from the configured funding birthday (a unix timestamp; 0 = genesis) so a freshly
+    // (re)configured descriptor rescans and sees coins received before the import. `None` keeps the
+    // historical "now" behaviour (no rescan), for which the operator funds the wallet after configuring.
+    // A birthday below a pruned node's prune height makes bitcoind reject the import; surface that
+    // plainly rather than as a bare RPC error.
+    let timestamp = match birthday {
+        Some(t) => json!(t),
+        None => json!("now"),
+    };
     let result = wallet.call(
         "importdescriptors",
         json!([[{
             "desc": canonical,
-            "timestamp": "now",
+            "timestamp": timestamp,
             "active": true,
             "internal": internal,
             "range": 1000,
@@ -428,10 +438,19 @@ fn ensure_account_descriptor(
     )?;
     match result[0]["success"].as_bool() {
         Some(true) => Ok(()),
-        _ => Err(NodeError::Unexpected(format!(
-            "importdescriptors ({}): {result}",
-            if internal { "change" } else { "receive" }
-        ))),
+        _ => {
+            let err = result[0]["error"]["message"].as_str().unwrap_or("");
+            let hint = if err.contains("prune") || err.contains("pruned") {
+                " (the funding birthday is below this pruned node's prune height; raise the birthday \
+                 or use an unpruned node)"
+            } else {
+                ""
+            };
+            Err(NodeError::Unexpected(format!(
+                "importdescriptors ({}){hint}: {result}",
+                if internal { "change" } else { "receive" }
+            )))
+        }
     }
 }
 
@@ -486,6 +505,28 @@ impl ChainNode {
         descriptor_change: &str,
         signer: Box<dyn FundingSigner>,
     ) -> Result<ChainNode, NodeError> {
+        Self::open_cold_from(
+            rpc,
+            name,
+            descriptor_receive,
+            descriptor_change,
+            signer,
+            None,
+        )
+    }
+
+    /// As `open_cold`, but importing the account descriptors from `birthday` (a unix timestamp, 0 =
+    /// genesis) so a freshly (re)configured descriptor rescans and sees coins received before the
+    /// import (#294). `None` keeps the no-rescan "now" import. The rescan happens here, at wallet open
+    /// (daemon startup), not on a running engine, so a long historical rescan never blocks live ticks.
+    pub fn open_cold_from(
+        rpc: Client,
+        name: &str,
+        descriptor_receive: &str,
+        descriptor_change: &str,
+        signer: Box<dyn FundingSigner>,
+        birthday: Option<i64>,
+    ) -> Result<ChainNode, NodeError> {
         let network = chain_network(&rpc)?;
         let watch_name = format!("{name}-watch");
         let loaded = rpc.call("listwallets", json!([]))?;
@@ -521,8 +562,22 @@ impl ChainNode {
         // walletcreatefundedpsbt can select coins and build a change-handling PSBT. Only on a fresh
         // wallet, or when a descriptor is absent: re-importing an existing one on every restart can
         // be rejected once the keypool has advanced the stored range (design 0012).
-        ensure_account_descriptor(&rpc, &wallet, descriptor_receive, false, funding_created)?;
-        ensure_account_descriptor(&rpc, &wallet, descriptor_change, true, funding_created)?;
+        ensure_account_descriptor(
+            &rpc,
+            &wallet,
+            descriptor_receive,
+            false,
+            funding_created,
+            birthday,
+        )?;
+        ensure_account_descriptor(
+            &rpc,
+            &wallet,
+            descriptor_change,
+            true,
+            funding_created,
+            birthday,
+        )?;
         Ok(ChainNode {
             wallet,
             watch: rpc.wallet(&watch_name),

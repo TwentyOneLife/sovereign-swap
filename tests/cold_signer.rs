@@ -494,3 +494,68 @@ fn an_interactive_lock_resumes_after_the_user_signs_and_submits() {
         .unwrap_or_default();
     assert!(confirmations >= 1, "the resumed lock must be confirmed");
 }
+
+/// #294: a funding birthday imports the account descriptors FROM that timestamp (0 = genesis, a full
+/// rescan), instead of the default "now" (no rescan). This is what lets a freshly (re)configured
+/// descriptor-backed wallet see coins received before the import; the default "now" leaves it at 0.
+/// Asserted on the import timestamp (deterministic) rather than a balance, since on regtest every
+/// block is within bitcoind's 2-hour "now" rescan window and a balance contrast would not be stable.
+#[test]
+fn a_funding_birthday_imports_the_descriptors_from_that_timestamp() {
+    let Some((btc, _)) = binaries() else { return };
+    let node = Node::start(&btc, None);
+    node.mine(101);
+
+    node.call("createwallet", json!(["seed"]));
+    let seed = node.rpc.wallet("seed");
+    let (receive, change) = wpkh_descriptors(&seed.call("listdescriptors", json!([])).unwrap());
+
+    // The smallest import timestamp across a funding wallet's descriptors (the rescan start point).
+    let import_ts = |wallet: &Client| -> i64 {
+        wallet.call("listdescriptors", json!([])).unwrap()["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["timestamp"].as_i64())
+            .min()
+            .expect("the funding wallet has imported descriptors")
+    };
+
+    // Default "now": imported from the current time, no historical rescan.
+    ChainNode::open_cold(
+        node.rpc.clone(),
+        "fundnow",
+        &receive,
+        &change,
+        Box::new(InteractiveSigner),
+    )
+    .unwrap();
+    let now_ts = import_ts(&node.rpc.wallet("fundnow"));
+
+    // Birthday 0: imported from genesis (a full rescan).
+    ChainNode::open_cold_from(
+        node.rpc.clone(),
+        "fundbday",
+        &receive,
+        &change,
+        Box::new(InteractiveSigner),
+        Some(0),
+    )
+    .unwrap();
+    let bday_ts = import_ts(&node.rpc.wallet("fundbday"));
+
+    // bitcoind clamps a timestamp of 0 to the genesis time (reported as 1 on regtest); the point is
+    // that a birthday import starts far earlier than the current-time "now" import.
+    assert!(
+        bday_ts <= 1,
+        "a birthday of 0 imports the descriptors from genesis: {bday_ts}"
+    );
+    assert!(
+        now_ts > 1_000_000_000,
+        "a default (no-birthday) import uses the current unix time, not genesis: {now_ts}"
+    );
+    assert!(
+        bday_ts < now_ts,
+        "a birthday import rescans from far earlier than a now-import: bday={bday_ts} now={now_ts}"
+    );
+}

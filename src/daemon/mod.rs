@@ -329,12 +329,13 @@ impl Daemon {
                     signer
                         .probe()
                         .map_err(|e| format!("{chain} signer probe failed: {e:?}"))?;
-                    ChainNode::open_cold(
+                    ChainNode::open_cold_from(
                         client,
                         &wallet,
                         &funding.descriptor_receive,
                         &funding.descriptor_change,
                         Box::new(signer),
+                        funding.funding_birthday,
                     )
                     .map_err(|e| format!("{e:?}"))
                 }
@@ -351,12 +352,13 @@ impl Daemon {
                         ChainNode::open_watch_only(client, &wallet, Box::new(InteractiveSigner))
                             .map_err(|e| format!("{e:?}"))
                     } else {
-                        ChainNode::open_cold(
+                        ChainNode::open_cold_from(
                             client,
                             &wallet,
                             &funding.descriptor_receive,
                             &funding.descriptor_change,
                             Box::new(InteractiveSigner),
+                            funding.funding_birthday,
                         )
                         .map_err(|e| format!("{e:?}"))
                     }
