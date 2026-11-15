@@ -624,6 +624,24 @@ impl ChainNode {
         self.output_only
     }
 
+    /// The funding wallet's spendable (confirmed) balance in sats, for the funding-readiness display
+    /// (#295). `None` when there is no funding wallet to read (output-only funding, design 0032), so
+    /// the UI shows "fund from your own wallet" rather than a meaningless zero. Hot and descriptor-
+    /// backed/cold modes all keep a `self.wallet` whose confirmed balance is what can fund a lock; a
+    /// zero here on a descriptor-backed wallet is exactly the "configured but unsynced / unfunded"
+    /// state the operator needs to see (it may need a rescan, #294, or a deposit).
+    pub fn funding_balance_sat(&self) -> Result<Option<u64>, NodeError> {
+        if self.output_only {
+            return Ok(None);
+        }
+        let balances = self.wallet.call("getbalances", json!([]))?;
+        let trusted_btc = balances["mine"]["trusted"].as_f64().unwrap_or(0.0);
+        let sats = Amount::from_btc(trusted_btc)
+            .map_err(|e| NodeError::Unexpected(format!("funding balance parse: {e}")))?
+            .to_sat();
+        Ok(Some(sats))
+    }
+
     /// Replaces the signer, e.g. an external cold signer in production so no funding key is on the
     /// engine host. The funding wallet is then watch-only.
     pub fn with_signer(mut self, signer: Box<dyn FundingSigner>) -> ChainNode {

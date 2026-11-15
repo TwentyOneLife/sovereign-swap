@@ -879,6 +879,17 @@ impl<T: Transport> Engine<T> {
         Some(outs)
     }
 
+    /// Per-chain funding-wallet balances for the funding-readiness display (#295): spendable sats, or
+    /// null for a chain with no funding wallet (output-only) or on an RPC error. Read-only; a zero on a
+    /// descriptor-backed chain is the "configured but unfunded/unsynced" state the operator must see.
+    pub fn funding_balances(&self) -> serde_json::Value {
+        let bal = |chain: Chain| match self.node(chain).funding_balance_sat() {
+            Ok(Some(s)) => serde_json::json!(s),
+            _ => serde_json::Value::Null,
+        };
+        serde_json::json!({ "btc": bal(Chain::Btc), "xbtc": bal(Chain::Xbtc) })
+    }
+
     /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
     /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
     pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {

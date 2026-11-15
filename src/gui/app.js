@@ -424,6 +424,11 @@ function fundingOutputOnly(chain) {
   const f = statusData && statusData.funding && statusData.funding[chain];
   return !!(f && f.output_only);
 }
+// #295: the funding wallet's spendable balance for `chain`, or null (output-only / engine down).
+function fundingBalanceSat(chain) {
+  const f = statusData && statusData.funding && statusData.funding[chain];
+  return f && typeof f.balance_sat === "number" ? f.balance_sat : null;
+}
 // Update the funding preflight warning (#f-fund-warn placeholder) for the leg funded on `chain`.
 function updateFundWarn(chain) {
   const el = $("#f-fund-warn");
@@ -435,6 +440,14 @@ function updateFundWarn(chain) {
       `funding (advanced). You fund it by paying exact outputs from a wallet that can build a template, ` +
       `not by signing in Sparrow/Shrike. For the normal sign-in-your-wallet flow, set an account ` +
       `descriptor (descriptor-backed interactive) in Settings.`;
+  } else if (fundingBalanceSat(chain) === 0) {
+    // #295: descriptor-backed but the funding wallet is empty, exactly the configured-but-unsynced
+    // state that silently failed at signing time before.
+    el.className = "warn";
+    el.innerHTML =
+      `<strong>Heads up:</strong> your ${chainShort(chain)} funding wallet shows a <strong>0 ` +
+      `balance</strong>. It may need a rescan (set a funding birthday in Settings) or a deposit before ` +
+      `this leg can fund.`;
   } else {
     el.className = "hidden";
     el.innerHTML = "";
