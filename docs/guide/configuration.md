@@ -8,6 +8,22 @@ you understand the trade-off below.
 The values and ranges given here are the daemon's. Where the StartOS package is stricter, that is called
 out.
 
+## Funding mode (per chain)
+
+How each leg's on-chain lock is funded and signed. **Descriptor-backed interactive is the standard,
+recommended mode**: paste your wallet's **account descriptor** (xpub) for the chain, and the node builds a
+**fully-funded** PSBT that a normal wallet (Sparrow for BTC (SHA256), Shrike for BTC (Blake2b)) or an
+air-gapped signer just opens and signs. **Hot** keeps the keys on the node and signs automatically, good
+for regtest/testing only. **Output-only** interactive (interactive with no descriptor) is **advanced**:
+it builds an inputless PSBT that Sparrow and Shrike cannot open, so it needs a wallet that funds a template
+(Bitcoin Core, Electrum) or a plain pay-to-outputs send; the daemon logs a warning and the web UI flags it
+before you commit a trade.
+
+If you configure a descriptor for a chain whose coins already exist on chain, set a **funding birthday**
+(a unix timestamp, 0 = genesis) so the wallet rescans and sees them; without it the wallet only tracks
+coins received after you configure it, and shows a 0 balance until then. The web UI shows each chain's
+funding balance so you can tell a configured-but-unsynced wallet from a funded one.
+
 ## Signing window headroom
 
 `signing_headroom_blocks`, default 6, range 2 to 144.

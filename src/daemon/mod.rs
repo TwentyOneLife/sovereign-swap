@@ -329,12 +329,13 @@ impl Daemon {
                     signer
                         .probe()
                         .map_err(|e| format!("{chain} signer probe failed: {e:?}"))?;
-                    ChainNode::open_cold(
+                    ChainNode::open_cold_from(
                         client,
                         &wallet,
                         &funding.descriptor_receive,
                         &funding.descriptor_change,
                         Box::new(signer),
+                        funding.funding_birthday,
                     )
                     .map_err(|e| format!("{e:?}"))
                 }
@@ -348,15 +349,24 @@ impl Daemon {
                         // contract watch wallet is opened; the user funds the whole lock from their own
                         // wallet. Validation guarantees the per-chain payout address is set, so a
                         // claim/refund never falls back to a (nonexistent) funding-wallet address.
+                        // #293: output-only is the advanced mode; Sparrow/Shrike cannot sign its
+                        // inputless PSBT. Warn so an operator who meant to use the standard
+                        // descriptor-backed interactive mode notices the missing descriptor.
+                        eprintln!(
+                            "funding[{chain}]: output-only (interactive, no descriptor) - advanced. \
+                             Sparrow/Shrike cannot sign its inputless PSBT; set an account descriptor \
+                             for descriptor-backed interactive (the standard) to sign in your wallet."
+                        );
                         ChainNode::open_watch_only(client, &wallet, Box::new(InteractiveSigner))
                             .map_err(|e| format!("{e:?}"))
                     } else {
-                        ChainNode::open_cold(
+                        ChainNode::open_cold_from(
                             client,
                             &wallet,
                             &funding.descriptor_receive,
                             &funding.descriptor_change,
                             Box::new(InteractiveSigner),
+                            funding.funding_birthday,
                         )
                         .map_err(|e| format!("{e:?}"))
                     }
@@ -859,6 +869,14 @@ impl Daemon {
         } else {
             serde_json::Value::Null
         };
+        // Per-chain funding-wallet balances (#295), for the funding-readiness display. Only with the
+        // engine up (it holds the nodes); on an engine-call error each chain falls back to null.
+        let funding_balances = if running {
+            self.engine_call::<Value>(EngineCmd::FundingBalances)
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
         // Fee scanner totals, per chain (design 0013, scan-only): how many fee outputs the operator
         // has collected and their total sats. Zero and present even when no scanner runs.
         let btc_scan = self.scan_btc.lock().unwrap().clone();
@@ -873,6 +891,14 @@ impl Daemon {
             // Per-chain explorer bases for the web UI to link txids (#67); empty = render as plain text.
             "btc_explorer_url": settings.btc_explorer_url,
             "xbtc_explorer_url": settings.xbtc_explorer_url,
+            // Per-chain funding mode, so the GUI can warn BEFORE a leg commits to output-only funding
+            // (#292). Only the mode and a derived `output_only` boolean are exposed, never the account
+            // descriptors (operator secrets); `output_only` says the leg's PSBT cannot be signed in
+            // Sparrow/Shrike and needs a template-funding wallet instead.
+            "funding": {
+                "btc": funding_status(&settings.btc_funding, funding_balances.get("btc")),
+                "xbtc": funding_status(&settings.xbtc_funding, funding_balances.get("xbtc")),
+            },
             // Fee scanner totals, per chain (design 0013, scan-only): outputs collected and total sats.
             "fees_found_btc": btc_scan.count(),
             "fees_sat_btc": btc_scan.sats(),
@@ -1958,6 +1984,25 @@ impl Daemon {
     }
 }
 
+/// The per-chain funding status for `/status` (#292): the mode as a lowercase string and a derived
+/// `output_only` flag (interactive with no descriptor). Exposes no descriptor (an operator secret),
+/// only whether the leg is output-only, so the GUI can warn before a leg commits to a funding mode
+/// whose inputless PSBT cannot be signed in Sparrow/Shrike.
+fn funding_status(cfg: &FundingConfig, balance_sat: Option<&Value>) -> Value {
+    let mode = match cfg.mode {
+        FundingMode::Hot => "hot",
+        FundingMode::Cold => "cold",
+        FundingMode::Interactive => "interactive",
+    };
+    // balance_sat (#295): spendable sats in the funding wallet, or null when there is no funding wallet
+    // (output-only) or the engine is down. A 0 on a descriptor-backed chain means configured-but-unfunded.
+    json!({
+        "mode": mode,
+        "output_only": cfg.is_output_only(),
+        "balance_sat": balance_sat.cloned().unwrap_or(Value::Null),
+    })
+}
+
 /// Sends one command to the engine thread and waits for its reply, holding the engine lock only for
 /// the moment it takes to clone the command sender, never across the reply wait. The engine is a
 /// single thread, so commands still serialize there; what this buys is that a slow or wedged reply
@@ -2330,6 +2375,59 @@ mod tests {
         assert_eq!(
             resolve_tor_socks(Some("   ".to_owned()), "127.0.0.1:9050"),
             "127.0.0.1:9050"
+        );
+    }
+
+    #[test]
+    fn funding_status_reports_mode_and_output_only_without_leaking_the_descriptor() {
+        use crate::daemon::types::{FundingConfig, FundingMode};
+        use serde_json::json;
+        let hot = super::funding_status(
+            &FundingConfig {
+                mode: FundingMode::Hot,
+                ..Default::default()
+            },
+            Some(&json!(123_456)),
+        );
+        assert_eq!(hot["mode"], "hot");
+        assert_eq!(hot["output_only"], false);
+        assert_eq!(
+            hot["balance_sat"], 123_456,
+            "the funding balance is surfaced (#295)"
+        );
+        // Interactive with no descriptor is output-only (the #292 preflight warning fires on this); a
+        // missing balance (output-only has no funding wallet) serializes as null.
+        let oo = super::funding_status(
+            &FundingConfig {
+                mode: FundingMode::Interactive,
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(oo["mode"], "interactive");
+        assert_eq!(oo["output_only"], true);
+        assert!(
+            oo["balance_sat"].is_null(),
+            "no funding wallet -> null balance"
+        );
+        // Interactive WITH descriptors is descriptor-backed, and the descriptor is never serialized.
+        let backed = super::funding_status(
+            &FundingConfig {
+                mode: FundingMode::Interactive,
+                descriptor_receive: "wpkh(tpub.../0/*)".to_owned(),
+                descriptor_change: "wpkh(tpub.../1/*)".to_owned(),
+                ..Default::default()
+            },
+            Some(&json!(0)),
+        );
+        assert_eq!(backed["output_only"], false);
+        assert_eq!(
+            backed["balance_sat"], 0,
+            "a configured-but-unfunded wallet shows 0"
+        );
+        assert!(
+            !backed.to_string().contains("tpub"),
+            "funding_status must never leak the account descriptor"
         );
     }
 }

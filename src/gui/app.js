@@ -417,21 +417,60 @@ async function loadMarket() {
   });
 }
 
+// #292: whether the leg THIS node will fund on `chain` is output-only (interactive, no descriptor).
+// From /status.funding; the daemon never exposes the descriptor, only this derived flag. An output-only
+// leg cannot be signed by opening the PSBT in Sparrow/Shrike, so warn before the user commits to it.
+function fundingOutputOnly(chain) {
+  const f = statusData && statusData.funding && statusData.funding[chain];
+  return !!(f && f.output_only);
+}
+// #295: the funding wallet's spendable balance for `chain`, or null (output-only / engine down).
+function fundingBalanceSat(chain) {
+  const f = statusData && statusData.funding && statusData.funding[chain];
+  return f && typeof f.balance_sat === "number" ? f.balance_sat : null;
+}
+// Update the funding preflight warning (#f-fund-warn placeholder) for the leg funded on `chain`.
+function updateFundWarn(chain) {
+  const el = $("#f-fund-warn");
+  if (!el) return;
+  if (fundingOutputOnly(chain)) {
+    el.className = "warn";
+    el.innerHTML =
+      `<strong>Heads up:</strong> your ${chainShort(chain)} leg is set to <strong>output-only</strong> ` +
+      `funding (advanced). You fund it by paying exact outputs from a wallet that can build a template, ` +
+      `not by signing in Sparrow/Shrike. For the normal sign-in-your-wallet flow, set an account ` +
+      `descriptor (descriptor-backed interactive) in Settings.`;
+  } else if (fundingBalanceSat(chain) === 0) {
+    // #295: descriptor-backed but the funding wallet is empty, exactly the configured-but-unsynced
+    // state that silently failed at signing time before.
+    el.className = "warn";
+    el.innerHTML =
+      `<strong>Heads up:</strong> your ${chainShort(chain)} funding wallet shows a <strong>0 ` +
+      `balance</strong>. It may need a rescan (set a funding birthday in Settings) or a deposit before ` +
+      `this leg can fund.`;
+  } else {
+    el.className = "hidden";
+    el.innerHTML = "";
+  }
+}
+
 function offerForm(o) {
   if (o) {
-    // Take: the terms are the maker's; you take the whole offer, nothing to set.
+    // Take: framed from the TAKER's side (#296), the mirror of the maker's offer, so the destination
+    // fields read as "receive what you buy" / "refund what you lock" rather than the maker's wording.
     return `<div class="row between"><h2>Take offer</h2>
         <button class="link" id="f-x" title="Close this dialog (changes nothing)">✕</button></div>
-      <p class="muted">Selling <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> for
-        <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong> ·
+      <p class="muted">You pay <strong>${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}</strong>
+        and receive <strong>${fmtSats(o.amount_sat)} ${chainShort(o.sell_chain)}</strong> ·
         rate ${fmtRate(o.counter_amount_sat / o.amount_sat)}.</p>
       <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
       <details style="margin:.4rem 0"><summary class="muted">Send this trade's coins to a specific address (optional)</summary>
-        <label title="Where the coin you receive from this swap is sent. Leave blank to use your configured payout, or a fresh address from your node wallet.">
-          Claim destination (${chainTag(o.sell_chain)}) <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
-        <label title="Where your own coin refunds if this swap stalls. Leave blank to use your configured payout.">
-          Refund destination (${chainTag(o.taker_chain)}) <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where you receive the ${chainShort(o.sell_chain)} you are buying. Leave blank to use your configured payout, or a fresh address from your node wallet.">
+          Receive your ${chainTag(o.sell_chain)} at <input id="f-claim-dest" placeholder="blank = your configured payout"></label>
+        <label title="Where your own ${chainShort(o.taker_chain)} refunds if this swap stalls. Leave blank to use your configured payout.">
+          Refund your ${chainTag(o.taker_chain)} to <input id="f-refund-dest" placeholder="blank = your configured payout"></label>
       </details>
+      <div class="hidden" id="f-fund-warn"></div>
       <div class="row between">
         <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
         <button class="primary" id="f-go">Take</button>
@@ -463,6 +502,7 @@ function offerForm(o) {
     <label title="How many days the offer stays valid. After this it is dropped from the market and can no longer be taken. Leave blank for no explicit expiry (it still ages out if you stop re-announcing).">
       Valid for (days, optional) <input id="f-days" type="number" min="1" step="1" placeholder="no expiry"></label>
     <div id="f-d6" class="warn hidden"></div>
+    <div class="hidden" id="f-fund-warn"></div>
     <div class="warn"><strong>Non-custodial.</strong> Your keys never leave your node; a swap ends claimed or refunded.</div>
     <div class="row between">
       <button class="ghost" id="f-cancel" title="Close this dialog (does not withdraw an offer or cancel a swap)">Close</button>
@@ -519,6 +559,8 @@ function createSheet() {
     const cc = $("#f-claim-coin"), rc = $("#f-refund-coin");
     if (cc) cc.textContent = chainShort(taker);
     if (rc) rc.textContent = chainShort(sell);
+    // #292: the maker funds (locks) the chain it sells; warn if that leg is output-only.
+    updateFundWarn(sell);
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
       // No market-derived price. The form prices only from the market, so it cannot publish until the
@@ -583,8 +625,17 @@ function createSheet() {
     if (amount === null) return ($("#f-msg").textContent = "Enter a valid amount.");
     // Always the market-derived path: send only the whole-percent margin; the daemon prices it off the
     // live reference, so the published rate is the market rate at publish time, always in band.
+    const sellChain = $("#f-chain").value;
+    if (
+      fundingOutputOnly(sellChain) &&
+      !confirm(
+        `Your ${chainShort(sellChain)} leg is output-only funding (advanced): you fund it by paying exact ` +
+          `outputs from your own wallet, not by signing in Sparrow/Shrike. Publish this offer anyway?`,
+      )
+    )
+      return;
     const body = {
-      sell_chain: $("#f-chain").value,
+      sell_chain: sellChain,
       amount_sat: amount,
       min_amount_sat: amount,
       margin_pct: parseInt($("#f-margin").value, 10) || 0,
@@ -609,7 +660,17 @@ function takeSheet(o) {
   const h = health();
   if (!h.trade) { alert("Taking an offer is unavailable right now: " + h.reason + "."); return; }
   openSheet(offerForm(o));
+  // #292: the taker funds its own lock on the taker chain; warn if that leg is output-only.
+  updateFundWarn(o.taker_chain);
   $("#f-go").onclick = async () => {
+    if (
+      fundingOutputOnly(o.taker_chain) &&
+      !confirm(
+        `Your ${chainShort(o.taker_chain)} leg is output-only funding (advanced): you fund it by paying ` +
+          `exact outputs from your own wallet, not by signing in Sparrow/Shrike. Take this offer anyway?`,
+      )
+    )
+      return;
     try {
       // #257: optional per-trade destinations (blank falls back to the configured payout).
       const tb = { amount_sat: o.amount_sat };

@@ -126,6 +126,9 @@ pub(crate) enum EngineCmd {
     CommitmentStatus(Sender<Value>),
     /// 0029: per-relay connection status (url + connected), for the connected-relays display.
     RelayStatus(Sender<Value>),
+    /// #295: per-chain funding-wallet balances (spendable sats, or null for output-only / RPC error),
+    /// for the funding-readiness display.
+    FundingBalances(Sender<Value>),
 }
 
 impl EngineCmd {
@@ -417,6 +420,9 @@ pub(crate) fn handle_engine_cmd(
         EngineCmd::CommitmentStatus(reply) => {
             let (next_index, provisioned) = engine.commitment_status();
             let _ = reply.send(json!({ "next_index": next_index, "provisioned": provisioned }));
+        }
+        EngineCmd::FundingBalances(reply) => {
+            let _ = reply.send(engine.funding_balances());
         }
         EngineCmd::RelayStatus(reply) => {
             let list: Vec<Value> = engine

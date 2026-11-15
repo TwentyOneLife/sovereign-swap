@@ -84,6 +84,24 @@ pub struct FundingConfig {
     pub descriptor_receive: String,
     #[serde(default)]
     pub descriptor_change: String,
+    /// Funding birthday (#294): a unix timestamp (0 = genesis) the daemon imports the account
+    /// descriptors from, so a freshly (re)configured descriptor-backed wallet rescans and sees coins
+    /// received before the import. `None` keeps the no-rescan behaviour (the operator funds the wallet
+    /// after configuring). Only meaningful for descriptor-backed interactive and cold funding.
+    #[serde(default)]
+    pub funding_birthday: Option<i64>,
+}
+
+impl FundingConfig {
+    /// Output-only funding (design 0032): interactive with no account descriptor. The daemon holds no
+    /// funding wallet and builds an inputless PSBT the user funds entirely from their own wallet. That
+    /// PSBT cannot be opened/signed by Sparrow or Shrike, so the GUI warns before a leg commits to it
+    /// (#292) and surfaces a pay-to instruction instead of "open this in your wallet" (#291).
+    pub fn is_output_only(&self) -> bool {
+        self.mode == FundingMode::Interactive
+            && self.descriptor_receive.trim().is_empty()
+            && self.descriptor_change.trim().is_empty()
+    }
 }
 
 impl std::fmt::Debug for FundingConfig {
@@ -505,9 +523,7 @@ impl Settings {
                 &self.xbtc_payout_address,
             ),
         ] {
-            let output_only = cfg.mode == FundingMode::Interactive
-                && cfg.descriptor_receive.trim().is_empty()
-                && cfg.descriptor_change.trim().is_empty();
+            let output_only = cfg.is_output_only();
             if output_only && payout.trim().is_empty() {
                 e.push(format!(
                     "{fname} is output-only (interactive, no descriptors) but {pname} is unset: a claim/refund on this chain has no destination without a funding wallet (design 0032)"
@@ -1588,11 +1604,41 @@ mod tests {
             signer_ca: String::new(),
             descriptor_receive: "wpkh(tpub.../0/*)".to_owned(),
             descriptor_change: "wpkh(tpub.../1/*)".to_owned(),
+            funding_birthday: None,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("hunter2"), "password must not be logged");
         assert!(!shown.contains("tpub"), "descriptors must not be logged");
         // The non-secret fields stay visible for diagnosis.
         assert!(shown.contains("node.example:8080") && shown.contains("operator"));
+    }
+
+    #[test]
+    fn is_output_only_is_interactive_without_a_descriptor() {
+        // Hot and Cold are never output-only.
+        assert!(!FundingConfig {
+            mode: FundingMode::Hot,
+            ..Default::default()
+        }
+        .is_output_only());
+        assert!(!FundingConfig {
+            mode: FundingMode::Cold,
+            ..Default::default()
+        }
+        .is_output_only());
+        // Interactive with no descriptor is output-only (the inputless-PSBT path, design 0032).
+        assert!(FundingConfig {
+            mode: FundingMode::Interactive,
+            ..Default::default()
+        }
+        .is_output_only());
+        // Interactive WITH descriptors is descriptor-backed, not output-only.
+        assert!(!FundingConfig {
+            mode: FundingMode::Interactive,
+            descriptor_receive: "wpkh(tpub.../0/*)".to_owned(),
+            descriptor_change: "wpkh(tpub.../1/*)".to_owned(),
+            ..Default::default()
+        }
+        .is_output_only());
     }
 }
