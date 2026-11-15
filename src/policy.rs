@@ -34,6 +34,13 @@ pub struct Policy {
     /// Confirmations our own lock inputs need before we spend them.
     pub funding_minconf_btc: u32,
     pub funding_minconf_xbtc: u32,
+    /// Extra confirmations an operator adds on top of the table depth, per chain (#271). Always
+    /// additive, so the effective security depth is never below the table floor: the operator can be
+    /// more conservative than this engine, never less. Keyed by chain (not by role), so it protects
+    /// whichever side is waiting on that chain's lock: a larger `xbtc` value makes both a taker wait
+    /// longer on a maker's xBTC lock and a maker wait longer on a taker's xBTC lock.
+    pub btc_depth_add: u32,
+    pub xbtc_depth_add: u32,
 }
 
 impl Policy {
@@ -52,18 +59,20 @@ impl Policy {
             ],
             funding_minconf_btc: 1,
             funding_minconf_xbtc: 6,
+            btc_depth_add: 0,
+            xbtc_depth_add: 0,
         }
     }
 
     pub fn depth(&self, chain: Chain, btc_side: Amount) -> Option<u32> {
-        let table = match chain {
-            Chain::Btc => &self.btc,
-            Chain::Xbtc => &self.xbtc,
+        let (table, add) = match chain {
+            Chain::Btc => (&self.btc, self.btc_depth_add),
+            Chain::Xbtc => (&self.xbtc, self.xbtc_depth_add),
         };
         table
             .iter()
             .find(|(limit, _)| btc_side <= *limit)
-            .map(|(_, depth)| *depth)
+            .map(|(_, depth)| *depth + add)
     }
 
     pub fn funding_minconf(&self, chain: Chain) -> u32 {
@@ -230,6 +239,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(d.taker_lock, 10);
+    }
+
+    #[test]
+    fn operator_added_depth_raises_the_floor_sizes_longer_and_gates_a_take() {
+        // #271: a per-chain add on top of the table floor.
+        let amt = Amount::from_sat(1_000_000); // xBTC floor 6, BTC floor 1
+        let base = Policy::standard();
+        let deeper = Policy {
+            xbtc_depth_add: 4,
+            ..Policy::standard()
+        };
+        // Effective depth is floor + add, and only on the chain that was raised.
+        assert_eq!(base.depth(Chain::Xbtc, amt), Some(6));
+        assert_eq!(deeper.depth(Chain::Xbtc, amt), Some(10));
+        assert_eq!(
+            deeper.depth(Chain::Btc, amt),
+            Some(1),
+            "the untouched chain keeps its floor"
+        );
+
+        // A maker on the deeper policy sizes its own offer's timelocks longer, so that offer still
+        // passes the deeper depths() check (otherwise publish would fail on its own offer).
+        let mc = Chain::Xbtc;
+        let (mlb_base, _) = base.min_lock_blocks(mc, amt, amt, 1, 1, 3, 6).unwrap();
+        let (mlb_deep, tlb_deep) = deeper.min_lock_blocks(mc, amt, amt, 1, 1, 3, 6).unwrap();
+        assert!(
+            mlb_deep > mlb_base,
+            "a deeper requirement needs a longer maker lock"
+        );
+        let sized = Offer {
+            maker_amount: amt,
+            taker_amount: amt,
+            maker_lock_blocks: mlb_deep,
+            taker_lock_blocks: tlb_deep,
+            margin_blocks: 3,
+            ..offer(0, 0)
+        };
+        assert!(
+            deeper.depths(&sized, amt, amt).is_ok(),
+            "the maker's own deeper offer sizes to pass its deeper check"
+        );
+
+        // A taker on the deeper policy taking an offer that was sized only for the FLOOR is refused
+        // cleanly at depths() (which gates the bid), rather than taking it and stalling (#272).
+        let floor_sized = Offer {
+            maker_lock_blocks: mlb_base,
+            ..sized.clone()
+        };
+        assert_eq!(
+            deeper.depths(&floor_sized, amt, amt),
+            Err(PolicyError::TimelocksTooShort),
+            "a taker demanding more depth than the offer's maker lock allows must refuse"
+        );
     }
 
     #[test]

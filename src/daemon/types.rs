@@ -157,6 +157,17 @@ pub struct Settings {
     /// `serde(default)`.
     #[serde(default = "default_signing_headroom")]
     pub signing_headroom_blocks: u16,
+    /// Extra confirmations added on top of this engine's security-depth table, per chain (#271).
+    /// Always additive: the effective depth is the table floor plus this, so an operator can only be
+    /// more conservative, never less. Keyed by chain, so it protects whichever side waits on that
+    /// chain's lock. Raising it lengthens the timelocks of offers this node makes (so its own offers
+    /// still satisfy the deeper check) and makes it refuse to take an offer whose timelocks leave no
+    /// room for the deeper wait, rather than take it and stall. Absent in older config, so
+    /// `serde(default)` (0 = the table floor, today's behaviour).
+    #[serde(default)]
+    pub btc_depth_add: u32,
+    #[serde(default)]
+    pub xbtc_depth_add: u32,
     /// Smallest swap leg this deployment will offer, bid or accept, in sats. Defaults to `DUST_SAT`
     /// (10_000), so existing configs are unchanged. Lower it only on a deployment that wants to offer
     /// a small real-rate leg (xBTC is far cheaper than BTC, so a realistic swap's BTC side is tiny).
@@ -372,6 +383,8 @@ impl Default for Settings {
             xbtc_conf: 2,
             margin_blocks: 2,
             signing_headroom_blocks: default_signing_headroom(),
+            btc_depth_add: 0,
+            xbtc_depth_add: 0,
             min_swap_sat: default_min_swap_sat(),
             split_fork_height: default_split_fork_height(),
             min_trade_sat: default_min_trade_sat(),
@@ -497,6 +510,12 @@ impl Settings {
             e.push(
                 "signing_headroom_blocks: 2..=144 (2 is the old minimum; 144 is ~1 day)".to_owned(),
             );
+        }
+        if self.btc_depth_add > 100 {
+            e.push("btc_depth_add: 0..=100 (extra confirmations added to the floor)".to_owned());
+        }
+        if self.xbtc_depth_add > 100 {
+            e.push("xbtc_depth_add: 0..=100 (extra confirmations added to the floor)".to_owned());
         }
         if self.min_swap_sat < MIN_SWAP_FLOOR_SAT {
             e.push(format!(

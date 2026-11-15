@@ -38,6 +38,8 @@ fn config() -> Config {
             xbtc: vec![(Amount::ONE_BTC, 2)],
             funding_minconf_btc: 1,
             funding_minconf_xbtc: 1,
+            btc_depth_add: 0,
+            xbtc_depth_add: 0,
         },
         btc_payout: None,
         xbtc_payout: None,
