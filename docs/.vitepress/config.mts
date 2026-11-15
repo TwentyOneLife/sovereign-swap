@@ -39,7 +39,9 @@ export default defineConfig({
       { text: 'How it works', link: '/guide/how-it-works' },
       { text: 'Architecture', link: '/guide/architecture' },
       { text: 'Security', link: '/guide/security-model' },
+      { text: 'Roadmap', link: '/guide/roadmap' },
       { text: 'Design decisions', link: '/design/' },
+      { text: 'Hosted service (soon)', link: 'https://twentyone.life/swap' },
     ],
     sidebar: {
       '/guide/': [
@@ -71,6 +73,14 @@ export default defineConfig({
           items: [
             { text: 'Security model', link: '/guide/security-model' },
             { text: 'Run your own', link: '/guide/run-your-own' },
+            { text: 'Configuration', link: '/guide/configuration' },
+          ],
+        },
+        {
+          text: 'Project',
+          items: [
+            { text: 'Roadmap', link: '/guide/roadmap' },
+            { text: 'Hosted service (coming soon)', link: 'https://twentyone.life/swap' },
           ],
         },
         howToGuides,
