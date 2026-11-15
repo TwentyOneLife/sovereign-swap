@@ -393,6 +393,9 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
     let mut policy = Policy::standard();
     policy.funding_minconf_btc = s.btc_conf;
     policy.funding_minconf_xbtc = s.xbtc_conf;
+    // #271: operator-added security depth, per chain, on top of the table floor (never below it).
+    policy.btc_depth_add = s.btc_depth_add;
+    policy.xbtc_depth_add = s.xbtc_depth_add;
     let payout = |a: &str| (!a.trim().is_empty()).then(|| a.trim().to_owned());
     EngineConfig {
         // Floor on the claim/refund fee (F6); the real fee is the live estimate x vsize, never below

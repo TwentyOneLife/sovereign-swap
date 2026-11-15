@@ -29,6 +29,8 @@ fn config() -> Config {
             xbtc: vec![(Amount::from_sat(100_000_000), 3)],
             funding_minconf_btc: 1,
             funding_minconf_xbtc: 1,
+            btc_depth_add: 0,
+            xbtc_depth_add: 0,
         },
         btc_payout: None,
         xbtc_payout: None,
