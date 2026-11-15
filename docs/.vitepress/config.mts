@@ -109,7 +109,8 @@ export default defineConfig({
     search: { provider: 'local' },
     footer: {
       message: 'Sovereign, non-custodial atomic swaps. No custody, no KYC.',
-      copyright: 'TwentyOne.Life',
+      copyright:
+        '<a href="https://twentyone.life" target="_blank" rel="noopener noreferrer">TwentyOne.Life</a>',
     },
   },
 })

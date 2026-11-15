@@ -45,6 +45,16 @@ configured, the node builds a **fully-funded** PSBT you only sign (this is the r
 descriptor ("output-only"), the node builds an **inputless** PSBT and your own wallet adds the inputs,
 change and signature (a good fit for a software wallet that can fund a template).
 
+**Cold vs Interactive, the real difference.** Your spending keys are off the hot node in both, so the
+distinction is not "do you sign", it is **who selects the coins and whether the signer is reachable**.
+In **Cold**, the node holds a watch-only view, so it **selects your coins and builds a fully-funded
+transaction**, then hands it to a signer it can **reach over the network** (a dedicated signing service
+or device) that applies the signature automatically; the keys are isolated but the signer is online. In
+**Interactive**, the node builds only the outputs and knows nothing about your coins; **you** choose the
+inputs and sign **fully out of band** (copy and paste, or a QR to an air-gapped device) and hand the
+signed transaction back. So an **air-gapped signer is Interactive** by definition, the node cannot reach
+it; Cold is for a signer the node can talk to.
+
 ### What the node holds: watch-only wallets
 
 In every mode except Hot, the node holds **no private keys** - it works through **watch-only** wallets. A
