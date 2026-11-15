@@ -833,15 +833,34 @@ async function fillSwapDetail(id, box) {
     // E2 (design 0017): when funding is parked for the user, show the PSBT handoff.
     (s.pending_lock_psbt
       ? `<div class="card" style="border-left:3px solid var(--orange)">` +
-        `<p><strong>Sign your funding (${chainShort(ownChain)})</strong></p>` +
-        `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
-        `in your own wallet (Sparrow for ${chainShort("btc")}, Shrike for ${chainShort("xbtc")}), and paste the signed PSBT back. Your keys ` +
-        `never leave your wallet. <a href="https://twentyonelife.github.io/sovereign-swap/guide/run-your-own" target="_blank" rel="noopener noreferrer">Signing guide</a>.</p>` +
-        `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
-        `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
-        `lock only the engine can refund.</p>` +
-        `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable" id="unsigned-psbt">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
-        `<div class="row" style="justify-content:flex-end"><button class="ghost" type="button" id="copy-psbt">Copy</button></div>` +
+        `<p><strong>Fund your lock (${chainShort(ownChain)})</strong></p>` +
+        (s.awaiting_external_funding
+          ? // #291 output-only (design 0032): the daemon's PSBT is inputless, so Sparrow/Shrike cannot
+            // open it. Tell the user to pay the exact outputs from their own wallet instead.
+            `<p class="muted">This swap is waiting for you to fund your lock from your own wallet. Your ` +
+            `wallet cannot open the daemon's template (it has no inputs). Instead, create a normal send ` +
+            `that pays <strong>exactly</strong> these outputs, then sign and paste the signed PSBT back:</p>` +
+            `<div class="card" style="margin:.3rem 0">` +
+            (s.funding_outputs || [])
+              .map(
+                (o) =>
+                  `<div class="row between" style="gap:.5rem"><span><strong>${fmtSats(o.sats)} ${chainShort(ownChain)}</strong> to</span>` +
+                  `<code class="copyable" style="word-break:break-all">${escapeHtml(o.address)}</code></div>`,
+              )
+              .join("") +
+            `</div>` +
+            `<p class="muted"><strong>Use coin control</strong> to spend a coin that is safe on the ` +
+            `${chainShort(ownChain)} chain (a split coin), so your input cannot be replayed on the other ` +
+            `chain. <strong>Sign without broadcasting</strong>, then paste the signed PSBT here so the ` +
+            `engine broadcasts it. <a href="https://twentyonelife.github.io/sovereign-swap/guide/run-your-own" target="_blank" rel="noopener noreferrer">Funding guide</a>.</p>`
+          : `<p class="muted">This swap is waiting for you to fund your lock. Copy the unsigned PSBT, sign it ` +
+            `in your own wallet (Sparrow for ${chainShort("btc")}, Shrike for ${chainShort("xbtc")}), and paste the signed PSBT back. Your keys ` +
+            `never leave your wallet. <a href="https://twentyonelife.github.io/sovereign-swap/guide/run-your-own" target="_blank" rel="noopener noreferrer">Signing guide</a>.</p>` +
+            `<p class="muted"><strong>Do not broadcast it from your wallet.</strong> Paste it here so the ` +
+            `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
+            `lock only the engine can refund.</p>` +
+            `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable" id="unsigned-psbt">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
+            `<div class="row" style="justify-content:flex-end"><button class="ghost" type="button" id="copy-psbt">Copy</button></div>`) +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
         `<div class="row" style="justify-content:space-between;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`

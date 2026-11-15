@@ -278,10 +278,22 @@ pub(crate) fn handle_engine_cmd(
             let spend_template = engine.pending_spend_template(id);
             // #270: the voluntary fee this swap owes on our lock, for the swap-detail fee breakdown.
             let voluntary_fee_sat = engine.voluntary_fee_sat(id);
+            // #291: whether this parked funding is output-only (inputless PSBT the user funds from their
+            // own wallet), and, if so, the exact outputs to pay, so the GUI can show a "pay exactly
+            // this" instruction instead of the impossible "open this PSBT in Sparrow/Shrike".
+            let awaiting_external_funding = engine.awaiting_external_funding(id);
+            let funding_outputs = engine.external_funding_outputs(id);
             let detail = base.map(|(mut j, side, mlb, tlb, key_index, contracts, mld, tld)| {
                 j["voluntary_fee_sat"] = json!(voluntary_fee_sat);
                 if let Some(psbt) = &pending {
                     j["pending_lock_psbt"] = json!(psbt);
+                    j["awaiting_external_funding"] = json!(awaiting_external_funding);
+                    if let Some(outs) = &funding_outputs {
+                        j["funding_outputs"] = json!(outs
+                            .iter()
+                            .map(|(address, sats)| json!({ "address": address, "sats": sats }))
+                            .collect::<Vec<_>>());
+                    }
                 }
                 if let Some((claim, sighash)) = pending_spend {
                     let mut ps = json!({

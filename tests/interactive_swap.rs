@@ -20,8 +20,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::str::FromStr;
+
+use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-use bitcoin::{Amount, Network, ScriptBuf, Transaction, Txid};
+use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
 use common::{binaries, Node};
@@ -129,6 +132,22 @@ fn open_taker(
         Box::new(InteractiveSigner),
     )
     .unwrap();
+    let xbtc = ChainNode::open(knots.rpc.clone(), "taker").unwrap();
+    Engine::open(dir, btc, xbtc, tp, config()).unwrap()
+}
+
+/// A taker whose BTC leg funds OUTPUT-ONLY (design 0032): a watch-only wallet with NO descriptors plus
+/// the `InteractiveSigner`, so funding builds an inputless PSBT the user funds entirely from their own
+/// wallet. xBTC is a plain node. Used to exercise the output-only funding surface (#291).
+fn open_taker_output_only(dir: &Path, relay: &Relay, core: &Node, knots: &Node) -> Engine<Tp> {
+    let tp = RelayTransport::new(
+        Identity::from_seed(&[22; 32]),
+        &[202; 32],
+        InProcessConn::new(relay.clone()),
+    );
+    let btc =
+        ChainNode::open_watch_only(core.rpc.clone(), "takerfund", Box::new(InteractiveSigner))
+            .unwrap();
     let xbtc = ChainNode::open(knots.rpc.clone(), "taker").unwrap();
     Engine::open(dir, btc, xbtc, tp, config()).unwrap()
 }
@@ -968,6 +987,17 @@ fn a_fee_paying_interactive_taker_swap_settles_and_reports_the_fee() {
             taker.swaps().next().map(|s| s.phase)
         );
     };
+
+    // #291: descriptor-backed interactive funding is NOT output-only, so the detail must not flag it
+    // nor expose pay-to outputs (its PSBT is already funded; the user just signs it).
+    assert!(
+        !taker.awaiting_external_funding(swap_id),
+        "descriptor-backed interactive funding is not flagged output-only"
+    );
+    assert!(
+        taker.external_funding_outputs(swap_id).is_none(),
+        "descriptor-backed funding exposes no pay-to outputs"
+    );
 
     // The user signs the PSBT (which already carries the fee output) and submits it.
     let signed = user.call("walletprocesspsbt", json!([parked])).unwrap();
@@ -2055,4 +2085,145 @@ fn a_maker_refuses_to_publish_an_sp1_fee_it_cannot_fund_interactively() {
     );
 
     let _ = std::fs::remove_dir_all(&mdir);
+}
+
+/// #291: a swap parked for OUTPUT-ONLY funding exposes `awaiting_external_funding` and the exact
+/// `external_funding_outputs` (lock + fee) the user must pay, matching the parked inputless PSBT, so
+/// the GUI can show a "pay exactly this" instruction instead of the impossible "open this in Sparrow".
+#[test]
+fn an_output_only_parked_funding_exposes_its_outputs() {
+    let Some((btc, xbtc)) = binaries() else {
+        return;
+    };
+    let core = Node::start(&btc, None);
+    let knots = Node::start(&xbtc, Some(20));
+    core.mine(101);
+    knots.mine(101);
+    let relay = Relay::new();
+
+    // A fee on the taker's BTC leg, so the parked funding carries both a lock and a fee output.
+    let btc_fee = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let xbtc_fee = knots
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fee_offer = Offer {
+        fee: Some(FeeTerms {
+            maker_bps: 20,
+            taker_bps: 30,
+            btc_address: Some(btc_fee.clone()),
+            xbtc_address: Some(xbtc_fee),
+        }),
+        ..offer()
+    };
+
+    let mdir = std::env::temp_dir().join(format!("sovswap-oo-m-{}", std::process::id()));
+    let tdir = std::env::temp_dir().join(format!("sovswap-oo-t-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
+    let mut maker = open_maker(&mdir, &relay, &core, &knots);
+    let mut taker = open_taker_output_only(&tdir, &relay, &core, &knots);
+
+    // The maker funds its xBTC lock from its node wallet; the output-only taker needs no funding wallet.
+    let maddr = knots
+        .rpc
+        .wallet("maker")
+        .call("getnewaddress", json!([]))
+        .unwrap();
+    knots
+        .wallet()
+        .call("sendtoaddress", json!([maddr, 2.0]))
+        .unwrap();
+    core.mine(1);
+    knots.mine(1);
+
+    maker.publish(fee_offer.clone()).unwrap();
+    tick(&mut taker);
+    // Output-only funding has no keys in the BTC funding wallet, so the taker cannot draw its own BTC
+    // refund address from it (a real output-only deployment sets a payout/destination; the daemon
+    // validation enforces that). Give an explicit per-trade BTC refund destination.
+    let btc_refund = core
+        .wallet()
+        .call("getnewaddress", json!([]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    taker
+        .bid_with_dest(
+            &fee_offer,
+            fee_offer.maker_amount,
+            [9; 16],
+            None,
+            Some(btc_refund),
+        )
+        .unwrap();
+    let mut rounds = 0;
+    let (swap_id, parked) = loop {
+        tick(&mut maker);
+        tick(&mut taker);
+        core.mine(1);
+        knots.mine(1);
+        if let Some(id) = taker.swaps().next().map(|s| s.id) {
+            if let Some(psbt) = taker.pending_lock_psbt(id) {
+                break (id, psbt);
+            }
+        }
+        rounds += 1;
+        assert!(
+            rounds < 60,
+            "taker never parked an output-only funding lock: {:?}",
+            taker.swaps().next().map(|s| s.phase)
+        );
+    };
+
+    // The flag distinguishes output-only, and the exposed outputs match the parked inputless PSBT
+    // exactly, so the GUI's "pay exactly this" instruction cannot drift from what is actually funded.
+    assert!(
+        taker.awaiting_external_funding(swap_id),
+        "an output-only parking sets awaiting_external_funding"
+    );
+    let outs = taker
+        .external_funding_outputs(swap_id)
+        .expect("an output-only parking exposes its funding outputs");
+    let psbt = Psbt::from_str(&parked).unwrap();
+    let from_psbt: Vec<(String, u64)> = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|o| {
+            (
+                Address::from_script(&o.script_pubkey, Network::Regtest)
+                    .unwrap()
+                    .to_string(),
+                o.value.to_sat(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outs, from_psbt,
+        "external_funding_outputs mirror the parked inputless PSBT's outputs"
+    );
+    assert_eq!(outs.len(), 2, "a lock output and a fee output");
+    assert_eq!(
+        outs[0].1,
+        fee_offer.taker_amount.to_sat(),
+        "the lock output pays the taker's lock amount"
+    );
+    assert_eq!(
+        outs[1].0, btc_fee,
+        "the fee output pays the configured BTC fee address"
+    );
+
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&tdir);
 }
