@@ -126,7 +126,7 @@ because every swap ends either claimed or refunded, whatever the message plane d
      ▼ swap proceeds: each side locks on its chain, waits confirmations, claims, reads the secret ▼
 ```
 
-## Settlement plane: the swap itself (sequence, maker sells xBTC)
+## Settlement plane: the swap itself, maker sells BTC (Blake2b)
 
 ```
  maker engine                         xBTC chain              BTC chain                 taker engine

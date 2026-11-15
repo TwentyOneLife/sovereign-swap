@@ -1,4 +1,4 @@
-# Separating your BTC and xBTC coins yourself
+# Separating your BTC (SHA256) and BTC (Blake2b) coins yourself
 
 > Looking for the simple, guided way (no command line, no node of your own)? See
 > [Protect your BTC (Blake2b) coins](/guides/protect-your-coins). This page is the by-hand method for
@@ -40,7 +40,7 @@ your own device, non-custodial, for a 0.5% fee. See
 In the commands, `xbtc-cli` is `bitcoin-cli` pointed at the Knots BLAKE2b node, `btc-cli` the one
 pointed at the BTC (SHA256) node, and `W` the wallet name.
 
-## 1. Check that you are on xBTC
+## 1. Check that you are on BTC (Blake2b)
 
 ```sh
 xbtc-cli getblockchaininfo            # "blocks" equals "headers"
@@ -74,7 +74,7 @@ This spends every coin of the wallet. The result's `hex` is the signed transacti
 coin by coin instead (better for privacy, since one transaction links all its inputs), add
 `"inputs": [{"txid": "...", "vout": n}]` to the options.
 
-## 5. Prove that it is valid on xBTC only
+## 5. Prove that it is valid on BTC (Blake2b) only
 
 ```sh
 btc-cli  testmempoolaccept '["<hex>"]'    # must show "allowed": false, with a script or signature error
@@ -83,7 +83,7 @@ xbtc-cli testmempoolaccept '["<hex>"]'    # must show "allowed": true
 **If the BTC (SHA256) node says `"allowed": true`, stop and do not broadcast**: the transaction is not
 replay-protected and would move your BTC (SHA256) as well.
 
-## 6. Broadcast it on xBTC, nowhere else
+## 6. Broadcast it on BTC (Blake2b), nowhere else
 
 ```sh
 xbtc-cli sendrawtransaction <hex>
