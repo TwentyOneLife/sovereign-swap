@@ -402,7 +402,8 @@ pub(crate) fn engine_config(s: &Settings) -> EngineConfig {
         // this. Min-relay-safe (~2.8 sat/vB for a ~142 vB claim) so a spend still confirms when the
         // mempool is empty, while a quiet mempool no longer forces the old flat 2000-sat overpay.
         min_spend_fee: Amount::from_sat(400),
-        fee_rate_sat_vb: 2,
+        btc_funding_fee_rate: s.btc_funding_fee_rate,
+        xbtc_funding_fee_rate: s.xbtc_funding_fee_rate,
         policy,
         btc_payout: payout(&s.btc_payout_address),
         xbtc_payout: payout(&s.xbtc_payout_address),

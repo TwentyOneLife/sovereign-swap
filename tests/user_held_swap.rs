@@ -42,7 +42,8 @@ type Tp = RelayTransport<InProcessConn>;
 fn config(user_held: bool) -> Config {
     Config {
         min_spend_fee: Amount::from_sat(2_000),
-        fee_rate_sat_vb: 2,
+        btc_funding_fee_rate: 2,
+        xbtc_funding_fee_rate: 2,
         policy: Policy {
             btc: vec![(Amount::ONE_BTC, 1)],
             xbtc: vec![(Amount::ONE_BTC, 2)],
