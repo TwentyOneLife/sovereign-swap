@@ -670,8 +670,13 @@ impl ChainNode {
             }
             None => None,
         };
-        let options =
-            json!({ "fee_rate": fee_rate_sat_vb, "replaceable": true, "minconf": minconf });
+        // #269: a non-zero rate is a fixed sat/vB; `0` means omit `fee_rate` so the node estimates
+        // (Core falls back to its own fee estimation / `conf_target`), which is safer on a busy chain
+        // than a too-low fixed rate that could strand the lock.
+        let mut options = json!({ "replaceable": true, "minconf": minconf });
+        if fee_rate_sat_vb > 0 {
+            options["fee_rate"] = json!(fee_rate_sat_vb);
+        }
         let funded = self.wallet.call(
             "walletcreatefundedpsbt",
             json!([[], json!(outputs), 0, options]),
