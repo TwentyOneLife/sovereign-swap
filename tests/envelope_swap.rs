@@ -20,7 +20,8 @@ use sovereign_swap::transport::{memory_bytes_pair, EnvelopeTransport, MemoryByte
 fn config() -> Config {
     Config {
         min_spend_fee: Amount::from_sat(2_000),
-        fee_rate_sat_vb: 2,
+        btc_funding_fee_rate: 2,
+        xbtc_funding_fee_rate: 2,
         policy: Policy {
             btc: vec![(Amount::ONE_BTC, 1)],
             xbtc: vec![(Amount::ONE_BTC, 2)],

@@ -162,9 +162,13 @@ pub struct Config {
     /// of this and the live fee-rate estimate applied to the transaction's real vsize (F6); the floor
     /// is min-relay-safe so a spend still confirms when the mempool is empty.
     pub min_spend_fee: Amount,
-    /// Fee rate (sat/vB) for the funding (lock) transaction, passed to walletcreatefundedpsbt. The
-    /// claim/refund spends do NOT use this; they fee from the live estimate (see `min_spend_fee`).
-    pub fee_rate_sat_vb: u64,
+    /// Fee rate (sat/vB) for the funding (lock) transaction, per chain, passed to
+    /// walletcreatefundedpsbt (#269). `0` means let the node estimate (omit `fee_rate` so Core uses
+    /// its own fee estimation); a non-zero value is a fixed sat/vB. The claim/refund spends do NOT
+    /// use this; they fee from the live estimate (see `min_spend_fee`). A too-low fixed rate can
+    /// strand a lock past its signing window, so auto (`0`) is the safer default on a busy chain.
+    pub btc_funding_fee_rate: u64,
+    pub xbtc_funding_fee_rate: u64,
     pub policy: Policy,
     /// Optional operator-owned payout address per chain, where this node's claimed proceeds and its
     /// own refunds on that chain are sent instead of a fresh address from the node's hot wallet
@@ -181,6 +185,16 @@ pub struct Config {
     /// the self-hosted (2a) client, where the per-swap keys are legitimately the user's own, are
     /// untouched. Gates only the SIGNATURE; the preimage is still engine-side until a later slice.
     pub user_held_spends: bool,
+}
+
+impl Config {
+    /// The funding (lock) fee rate in sat/vB for `chain`; `0` means let the node estimate (#269).
+    pub fn funding_fee_rate(&self, chain: Chain) -> u64 {
+        match chain {
+            Chain::Btc => self.btc_funding_fee_rate,
+            Chain::Xbtc => self.xbtc_funding_fee_rate,
+        }
+    }
 }
 
 /// A per-swap PUBLIC commitment bundle the user's browser pre-provisions for an upcoming `take_index`
@@ -2121,7 +2135,7 @@ impl<T: Transport> Engine<T> {
                     match self.nodes[&own_chain].fund(
                         own_contract,
                         lock_amount,
-                        self.config.fee_rate_sat_vb,
+                        self.config.funding_fee_rate(own_chain),
                         self.config.policy.funding_minconf(own_chain),
                         other,
                         fee.as_ref().map(|(a, dest)| (*a, dest)),

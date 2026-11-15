@@ -168,6 +168,15 @@ pub struct Settings {
     pub btc_depth_add: u32,
     #[serde(default)]
     pub xbtc_depth_add: u32,
+    /// Funding (lock) miner fee rate in sat/vB, per chain (#269). `0` lets the node estimate the fee
+    /// (omit a fixed rate, so Core uses its own fee estimation); a non-zero value is a fixed rate,
+    /// floored at 1 (min-relay). Defaults to 2 to preserve the previous fixed behaviour; a too-low
+    /// fixed rate can strand a lock past its signing window, so prefer `0` (estimate) on a busy chain.
+    /// Absent in older config, hence `serde(default)`.
+    #[serde(default = "default_funding_fee_rate")]
+    pub btc_funding_fee_rate: u64,
+    #[serde(default = "default_funding_fee_rate")]
+    pub xbtc_funding_fee_rate: u64,
     /// Smallest swap leg this deployment will offer, bid or accept, in sats. Defaults to `DUST_SAT`
     /// (10_000), so existing configs are unchanged. Lower it only on a deployment that wants to offer
     /// a small real-rate leg (xBTC is far cheaper than BTC, so a realistic swap's BTC side is tiny).
@@ -345,6 +354,12 @@ fn default_min_swap_sat() -> u64 {
 fn default_signing_headroom() -> u16 {
     6
 }
+/// Default funding fee rate (sat/vB): 2, the previous fixed value, so an existing install is
+/// unchanged. `0` would mean "let the node estimate", which is safer on a busy BTC mempool but can
+/// fail on a chain whose fee estimation is unavailable (a quiet xBTC), so the default stays fixed.
+fn default_funding_fee_rate() -> u64 {
+    2
+}
 fn default_split_fork_height() -> u32 {
     crate::split::MAINNET_FORK_HEIGHT
 }
@@ -385,6 +400,8 @@ impl Default for Settings {
             signing_headroom_blocks: default_signing_headroom(),
             btc_depth_add: 0,
             xbtc_depth_add: 0,
+            btc_funding_fee_rate: default_funding_fee_rate(),
+            xbtc_funding_fee_rate: default_funding_fee_rate(),
             min_swap_sat: default_min_swap_sat(),
             split_fork_height: default_split_fork_height(),
             min_trade_sat: default_min_trade_sat(),
@@ -516,6 +533,12 @@ impl Settings {
         }
         if self.xbtc_depth_add > 100 {
             e.push("xbtc_depth_add: 0..=100 (extra confirmations added to the floor)".to_owned());
+        }
+        if self.btc_funding_fee_rate > 1000 {
+            e.push("btc_funding_fee_rate: 0..=1000 sat/vB (0 = estimate)".to_owned());
+        }
+        if self.xbtc_funding_fee_rate > 1000 {
+            e.push("xbtc_funding_fee_rate: 0..=1000 sat/vB (0 = estimate)".to_owned());
         }
         if self.min_swap_sat < MIN_SWAP_FLOOR_SAT {
             e.push(format!(
@@ -1059,6 +1082,37 @@ mod tests {
             o_roomy.maker_lock_blocks > o_tight.maker_lock_blocks,
             "more headroom means a longer maker lock, hence a wider signing window"
         );
+    }
+
+    #[test]
+    fn funding_fee_rate_defaults_bounds_and_wires_per_chain() {
+        use super::super::engine::engine_config;
+        // #269: a config written before the field loads at the previous fixed 2 (serde default), so an
+        // existing install's funding fee is unchanged on upgrade.
+        let old: Settings = serde_json::from_str(
+            r#"{"btc_node":"x","xbtc_node":"y","relays":[],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2}"#,
+        )
+        .unwrap();
+        assert_eq!(old.btc_funding_fee_rate, 2);
+        assert_eq!(old.xbtc_funding_fee_rate, 2);
+        // Capped at 1000; 0 is valid (means estimate).
+        let too_high = Settings {
+            btc_funding_fee_rate: 1001,
+            ..Settings::default()
+        };
+        assert!(too_high
+            .validate()
+            .iter()
+            .any(|m| m.contains("btc_funding_fee_rate")));
+        // Per-chain values reach the engine config, keyed by chain; 0 = estimate stays 0.
+        let s = Settings {
+            btc_funding_fee_rate: 0,
+            xbtc_funding_fee_rate: 7,
+            ..Settings::default()
+        };
+        let cfg = engine_config(&s);
+        assert_eq!(cfg.funding_fee_rate(SwapChain::Btc), 0);
+        assert_eq!(cfg.funding_fee_rate(SwapChain::Xbtc), 7);
     }
 
     #[test]
