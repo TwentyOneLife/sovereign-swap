@@ -1384,6 +1384,10 @@ impl<T: Transport> Engine<T> {
         claim_dest: Option<String>,
         refund_dest: Option<String>,
     ) -> Result<(), EngineError> {
+        // #257 hardening: reject a bad per-trade destination now, not at start(). As maker, we claim
+        // on the chain we receive (the other chain) and refund on the chain we lock (maker_chain).
+        self.validate_dest(offer.maker_chain.other(), &claim_dest)?;
+        self.validate_dest(offer.maker_chain, &refund_dest)?;
         self.config
             .policy
             .depths(&offer, offer.maker_amount, offer.taker_amount)
@@ -1443,6 +1447,11 @@ impl<T: Transport> Engine<T> {
         claim_dest: Option<String>,
         refund_dest: Option<String>,
     ) -> Result<(), EngineError> {
+        // #257 hardening: reject a bad per-trade destination now, not at start() (which runs when the
+        // maker's Accept arrives, after the maker has committed). As taker, we claim on the maker's
+        // chain (we receive it) and refund on the chain we lock (the other chain).
+        self.validate_dest(offer.maker_chain, &claim_dest)?;
+        self.validate_dest(offer.maker_chain.other(), &refund_dest)?;
         if self.state.own_offers.iter().any(|o| o.id == offer.id) {
             return Err(EngineError::Bid(BidError::OwnOffer));
         }
@@ -1811,6 +1820,25 @@ impl<T: Transport> Engine<T> {
                 .map_err(EngineError::Node),
             _ => self.destination(chain),
         }
+    }
+
+    /// #257 (0.7.0 hardening): validate a per-trade destination against the chain it will pay, at
+    /// publish/take time rather than deferring to `start()`. The 0.7.0 adversarial pass showed the
+    /// early `dest_shape_error` prefix guard missed uppercase/regtest/obfuscated silent-payment forms,
+    /// which then failed only at `start()` - after the counterparty had committed - and could grief the
+    /// maker into a timelock refund or leak contract watches. Parsing the address here (a local
+    /// `script_for`: `Address::from_str` + `require_network`, no RPC) makes ANY invalid destination a
+    /// clean refusal at submit time. A blank/unset destination is allowed (it falls back to the payout).
+    fn validate_dest(&self, chain: Chain, over: &Option<String>) -> Result<(), EngineError> {
+        if let Some(a) = over {
+            let a = a.trim();
+            if !a.is_empty() {
+                self.nodes[&chain]
+                    .script_for(a)
+                    .map_err(EngineError::Node)?;
+            }
+        }
+        Ok(())
     }
 
     /// The maker's per-trade destination override for one of our own offers (#257), taken from the

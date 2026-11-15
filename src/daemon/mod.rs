@@ -2074,8 +2074,13 @@ fn scan_address(
 fn dest_shape_error(d: &Option<String>) -> Option<String> {
     match d {
         Some(a) if !a.trim().is_empty() => {
-            let a = a.trim();
-            if a.starts_with("sp1") || a.starts_with("tsp1") {
+            // Case-fold, since bech32m is case-insensitive (SP1.../ TSP1... are valid and apply on
+            // mainnet), and cover the regtest HRP (sprt1), which the 0.7.0 adversarial pass showed the
+            // old lowercase-prefix-only check missed. This is the fast, friendly early message; the
+            // engine's `validate_dest` (a real address parse) is the authoritative catch-all for any
+            // other obfuscated or malformed form.
+            let a = a.trim().to_lowercase();
+            if a.starts_with("sp1") || a.starts_with("tsp1") || a.starts_with("sprt1") {
                 Some("a claim/refund destination cannot be a silent-payment address".to_owned())
             } else {
                 None
@@ -2189,12 +2194,36 @@ fn serve_guard(bind: &str, has_basic_auth: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_is_loopback, engine_call_on, resolve_tor_socks, serve_guard, Dispatch, EngineCmd,
-        ENGINE_CALL_TIMEOUT,
+        bind_is_loopback, dest_shape_error, engine_call_on, resolve_tor_socks, serve_guard,
+        Dispatch, EngineCmd, ENGINE_CALL_TIMEOUT,
     };
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    #[test]
+    fn dest_shape_error_catches_silent_payment_forms_case_and_hrp_insensitively() {
+        // #257 hardening (0.7.0 adversarial finding): the early guard must reject silent-payment
+        // destinations regardless of case or HRP, not just a bare lowercase `sp1`/`tsp1` prefix.
+        for sp in [
+            "sp1qqexample",
+            "SP1QQEXAMPLE",
+            "tsp1qqexample",
+            "TSP1QQEXAMPLE",
+            "sprt1qqexample",
+            "  sp1qqexample  ",
+        ] {
+            assert!(
+                dest_shape_error(&Some(sp.to_owned())).is_some(),
+                "a silent-payment destination must be rejected early: {sp:?}"
+            );
+        }
+        // A normal bech32 address and an unset/blank destination are accepted (the authoritative
+        // address parse happens in the engine's validate_dest).
+        assert!(dest_shape_error(&Some("bc1qexampleaddress".to_owned())).is_none());
+        assert!(dest_shape_error(&None).is_none());
+        assert!(dest_shape_error(&Some("   ".to_owned())).is_none());
+    }
 
     #[test]
     fn engine_call_does_not_hold_the_lock_across_the_reply_wait() {
