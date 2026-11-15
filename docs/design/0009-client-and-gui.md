@@ -250,7 +250,7 @@ Tooltips are content, versioned with the GUI, and never block the flow (hover he
 - **M4b - the GUI.** The screens above against the M4a API, in the twentyone.life style, with the
   tooltips and the three-layer validation. Served by the daemon on `127.0.0.1`.
 - **M4c - package and ship.** The daemon (and its GUI) as a StartOS service for the node, the same
-  path the relay took, so a node runs its own swap client with its own BTC and xBTC nodes beside it.
+  path the relay took, so a node runs its own swap client with its own BTC (SHA256) and BTC (Blake2b) nodes beside it.
 
 ## Test plan
 

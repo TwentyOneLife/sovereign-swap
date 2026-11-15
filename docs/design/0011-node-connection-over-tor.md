@@ -8,7 +8,7 @@ constraint, the options, and the work each option implies, so the owner can choo
 ## The problem
 
 The client is a daemon that drives both legs of a swap. Each leg talks to a full node by JSON-RPC: a
-Bitcoin Core node for BTC and a Bitcoin Knots BLAKE2b node for xBTC. On StartOS the RPC is not a plain
+Bitcoin Core node for BTC (SHA256) and a Bitcoin Knots BLAKE2b node for BTC (Blake2b). On StartOS the RPC is not a plain
 `http://host:8332` endpoint. The platform fronts bitcoind's RPC with a **TLS reverse proxy** and
 presents it as **HTTPS on a dedicated port**, with a StartOS Root CA certificate. The node's
 **Interfaces** page offers that one RPC endpoint over several addresses at once, each a toggle: a Local
@@ -110,7 +110,7 @@ item, so C is not a pure packaging choice.
 1. **Per-application RPC credentials on the Knots BLAKE2b node.** The portable path assumes each node
    package can hand an external application its own RPC credentials (not a local cookie file, which
    does not cross machines and rotates on restart). This must be confirmed on the **BLAKE2b/Knots**
-   package specifically, since every xBTC user runs it. If that package lacks it, the portable path
+   package specifically, since every BTC (Blake2b) user runs it. If that package lacks it, the portable path
    depends on the package adding it, and that becomes an upstream task, not a client task.
 2. **Co-resident layout.** Decide whether we recommend putting the client on the same server as one of
    the two nodes (so one leg is local via B) or on a third server (both legs over Tor). The first is

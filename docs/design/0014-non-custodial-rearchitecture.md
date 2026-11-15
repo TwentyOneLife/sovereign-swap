@@ -7,7 +7,7 @@ go-forward decision for the project (see the decision section at the end). No co
 
 ## Goal and non-goals
 
-Goal: a user swaps with **a BTC wallet, an xBTC wallet, and a thin client**, using hosted chain data
+Goal: a user swaps with **a BTC (SHA256) wallet, a BTC (Blake2b) wallet, and a thin client**, using hosted chain data
 (our Fulcrum/Shulcrum) and the relay, while **holding their own keys and signing their own swaps**. No
 operator custody, so no KYC.
 
@@ -60,8 +60,8 @@ Every design choice below is checked against this line.
 Introduce `ChainBackend`: the data and broadcast surface the engine needs, with no wallet in it.
 Methods, drawn from what the engine uses today: tip height; confirmations for a txid; fetch a
 transaction; is-an-output-spent / find-spend; broadcast a raw transaction; register a watch-only
-script and report its transactions. `ChainNode` becomes one impl (bitcoind); an `ElectrumBackend`
-(Fulcrum for BTC, Shulcrum for xBTC) becomes another. The engine depends on the trait, not on bitcoind.
+script and report its transactions. `ChainNode` becomes one impl (bitcoind); an `ElectrumBackend`,
+Fulcrum for BTC (SHA256) and Shulcrum for BTC (Blake2b), becomes another. The engine depends on the trait, not on bitcoind.
 
 This is what removes the user's full-node requirement: the thin client points `ChainBackend` at our
 Electrum endpoints.
@@ -74,7 +74,7 @@ They move client-side, to the user's own wallet:
 - The engine computes the **lock specification** (output script, amount, locktime) from the swap, as
   it does now, but no longer funds it itself.
 - The user's wallet **selects coins, builds the funded PSBT, and signs** it. This is the natural job
-  of Sparrow (BTC) / Shrike (xBTC) and of the `FundingSigner`/`with_signer` seam generalised: a
+  of Sparrow for BTC (SHA256) / Shrike for BTC (Blake2b) and of the `FundingSigner`/`with_signer` seam generalised: a
   `WalletBackendSigner` that hands the lock spec to the user's wallet and gets back a signed, funded
   transaction.
 - The backend only **broadcasts** it and then **watches** the resulting outputs.

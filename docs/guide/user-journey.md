@@ -61,6 +61,6 @@ yours to fall back on. The counterparty, the relay, and a stranger can do nothin
 
 ## Before your first real trade
 
-- Confirm you are sending each leg to the **right chain** (BTC vs xBTC share an address format).
+- Confirm you are sending each leg to the **right chain**: BTC (SHA256) and BTC (Blake2b) share an address format.
 - Start small. The project runs a soft launch; treat it as early software.
 - If you are running your own node and client, follow [run your own](/guide/run-your-own) first.

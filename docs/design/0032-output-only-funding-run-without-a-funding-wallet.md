@@ -25,8 +25,8 @@ that forces wallet state onto a node that should have none.
 ## Proposal: an output-only funding template
 
 Add a funding path where the engine emits a PSBT that contains **only the swap's required outputs** (the
-HTLC lock output, plus the fee output when enabled) and **no inputs**. The user's own wallet (Sparrow
-for BTC, Shrike for xBTC) adds the inputs and change, signs, and the lock is broadcast (by the daemon on
+HTLC lock output, plus the fee output when enabled) and **no inputs**. The user's own wallet, Sparrow
+for BTC (SHA256) and Shrike for BTC (Blake2b), adds the inputs and change, signs, and the lock is broadcast (by the daemon on
 submit, or by the user per 0019). The daemon never holds, imports, or selects from the user's wallet.
 
 Consequences:
@@ -91,9 +91,9 @@ is the current default.
 `Engine::destination` (`src/engine.rs:1545`) picks the claim/refund address as: the configured
 `btc_payout`/`xbtc_payout` address **if set**, otherwise `self.nodes[chain].new_destination()` - a fresh
 address drawn **from the node's funding wallet**. With output-only funding there **is no funding
-wallet**, so the fallback has no source: the received coins (the taker's claimed xBTC, a maker's claimed
-BTC) and a refund would have nowhere valid to land, or would land on the node - exactly the "funds on the
-node" outcome this design exists to prevent (and the xBTC-interactive correction of 2026-11-14 depended
+wallet**, so the fallback has no source: the received coins (the taker's claimed Blake2b coin, a maker's claimed
+SHA256 coin) and a refund would have nowhere valid to land, or would land on the node - exactly the "funds on the
+node" outcome this design exists to prevent (and the Blake2b-interactive correction of 2026-11-14 depended
 on the claim landing cold).
 
 Therefore, in output-only mode the **per-chain payout addresses are mandatory**: the daemon refuses to

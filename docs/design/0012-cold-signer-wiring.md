@@ -69,8 +69,8 @@ let node = match funding_mode(chain, &settings) {
 };
 ```
 
-`funding_mode` is per chain, because BTC and xBTC can run different signers (a user may cold-store
-BTC on a hardware device and keep xBTC hot, or the reverse). Default stays `Hot` so nothing changes
+`funding_mode` is per chain, because BTC (SHA256) and BTC (Blake2b) can run different signers (a user may cold-store
+the SHA256 coin on a hardware device and keep the Blake2b coin hot, or the reverse). Default stays `Hot` so nothing changes
 for existing installs and for regtest.
 
 ## What a cold signer is here

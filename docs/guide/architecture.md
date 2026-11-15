@@ -14,10 +14,10 @@ and the only trusted parts are the ones you run yourself.
   subject of [design 0002](/design/) and the [safe lifecycle](/guide/lifecycle).
 - **Daemon / Web GUI**: the engine runs inside a daemon that exposes a small, token-gated HTTP API; the
   web GUI is a thin client over it. You drive swaps from your own browser.
-- **BTC node and xBTC node**: your own full nodes for each chain. Because they are yours, you trust the
+- **BTC (SHA256) node and BTC (Blake2b) node**: your own full nodes for each chain. Because they are yours, you trust the
   chain data; the software never asks a third party what happened on chain.
 - **Read backend**: chain reads and broadcasts normally go through the node's RPC, but can optionally go
-  through an **Electrum** server (Fulcrum for BTC, Shulcrum for xBTC) for a thinner client
+  through an **Electrum** server, Fulcrum for BTC (SHA256) and Shulcrum for BTC (Blake2b), for a thinner client
   ([design 0016](/design/)). Funding and signing always stay on the node.
 - **Cold signer** (optional): funding transactions can be signed off the hot node by an external signer,
   so the spending keys never live on the internet-facing machine ([design 0012](/design/)).
@@ -37,8 +37,8 @@ The engine supports three ways to fund the on-chain lock, chosen per chain:
 | **Interactive** | with you | you sign the funding PSBT out of band and submit it |
 
 Hot is the simplest (good for testing); cold keeps spending keys off the hot machine; interactive hands
-you the unsigned funding transaction to sign in your own wallet and hand back - **Sparrow for the BTC
-leg, Shrike for the xBTC (Bitcoin Blake2b) leg** (Sparrow does not sign on xBTC)
+you the unsigned funding transaction to sign in your own wallet and hand back - **Sparrow for the BTC (SHA256)
+leg, Shrike for the BTC (Blake2b) leg** (Sparrow does not sign on the Blake2b chain)
 ([design 0017](/design/), [0019](/design/)). Interactive has two shapes: with your **account descriptor**
 configured, the node builds a **fully-funded** PSBT you only sign (this is the right fit for an
 **air-gapped / QR signer** such as a SeedSigner, since it needs no coin selection in the signer); with no

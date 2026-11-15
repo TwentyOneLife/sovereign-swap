@@ -3,8 +3,8 @@
 ## Context
 `ChainBackend` (node.rs, design 0014) is the chain-data + broadcast surface the engine needs, with no
 wallet in it. `ChainNode` (bitcoind RPC) is the first implementation. **E1** adds a second: an
-`ElectrumBackend` that reads chain data and broadcasts over an Electrum server (Fulcrum for BTC,
-Shulcrum for xBTC) instead of a full node's RPC. This removes the user's full-node requirement for
+`ElectrumBackend` that reads chain data and broadcasts over an Electrum server, Fulcrum for BTC (SHA256)
+and Shulcrum for BTC (Blake2b), instead of a full node's RPC. This removes the user's full-node requirement for
 chain data (the first unblocker for the thin client / hosted service, #46). Funding and signing stay
 out of scope here, exactly as the trait does; they move to the user's own wallet in a later stage (E2).
 

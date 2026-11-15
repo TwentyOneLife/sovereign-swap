@@ -1,7 +1,7 @@
 # sovereign-swap
 
-Peer-to-peer atomic swaps between BTC and xBTC (Bitcoin Blake2b, the BLAKE2b proof-of-work hard fork
-of Bitcoin). Each party keeps its own keys and runs its own nodes; nobody, including any relay
+Peer-to-peer atomic swaps between BTC (SHA256) and BTC (Blake2b), the BLAKE2b proof-of-work hard fork
+of Bitcoin. Each party keeps its own keys and runs its own nodes; nobody, including any relay
 operator, ever holds the other side's coins.
 
 **Status: early development, not for use with real funds.** What exists today: the on-chain
@@ -10,8 +10,8 @@ funding through the user's own node wallets) that completes swaps between two en
 Core and Bitcoin Knots BLAKE2b regtest. Messages still travel in memory; the Nostr transport with
 post-quantum encryption is the next step.
 
-xBTC and BTC share the address format. Coins sent to an address on the wrong chain are a different
-asset. The ticker "xBTC" is also used by unrelated tokens.
+BTC (Blake2b) and BTC (SHA256) share the address format. Coins sent to an address on the wrong chain are a different
+asset. BTC (Blake2b) is sometimes written with the ticker "xBTC", which is also used by unrelated tokens.
 
 ## Design
 
@@ -19,10 +19,10 @@ asset. The ticker "xBTC" is also used by unrelated tokens.
   plane over Nostr, settlement plane on the two chains).
 
 - [`docs/design/0001-htlc-and-replay-guard.md`](docs/design/0001-htlc-and-replay-guard.md): the
-  contract, why it checks the secret's size, and why BTC transactions must not be replayable on xBTC.
+  contract, why it checks the secret's size, and why BTC (SHA256) transactions must not be replayable on BTC (Blake2b).
 - [`docs/design/0002-swap-engine.md`](docs/design/0002-swap-engine.md): the state machine, the
   swap wallet and persistence.
-- [`docs/guides/separating-coins.md`](docs/guides/separating-coins.md): separating BTC and xBTC
+- [`docs/guides/separating-coins.md`](docs/guides/separating-coins.md): separating BTC (SHA256) and BTC (Blake2b)
   coins by hand, step by step.
 - [`docs/edge-cases.md`](docs/edge-cases.md): every failure scenario taken over from BasicSwap, with
   the test that covers it.

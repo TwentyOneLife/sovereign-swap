@@ -14,7 +14,7 @@ toolchain. The suite:
 - **Correctness gated by official vectors**, not hand-rolled expectations:
   - BIP352 silent payments: `silentpayments_vectors.rs` (the BIP's send/receive vectors).
   - BIP374 DLEQ: `dleq_vectors.rs` (the BIP's CSV vectors, including the INVALID cases).
-- **End-to-end swap, two parties, in process** (`swap.rs`): maker-sells-BTC and maker-sells-xBTC
+- **End-to-end swap, two parties, in process** (`swap.rs`): maker sells BTC (SHA256) and maker sells BTC (Blake2b)
   complete; a swap survives a restart after every step; a swap completes after the claim is reorged
   out or the first claim is dropped; the fee path completes end to end.
 - **Adversarial tests** (design 0003): a maker refunds when the taker never locks; a taker does not

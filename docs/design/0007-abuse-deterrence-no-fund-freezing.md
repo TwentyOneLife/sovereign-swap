@@ -16,7 +16,7 @@ It is not an implementation gap; it is a boundary the design will not cross.
 - **We hold nothing to freeze.** Coins live in the user's own wallet and, during a swap, in HTLCs
   that only the two counterparties can spend (claim with the preimage, or refund after the timeout).
   There is no operator key in that path. The engine's own wallet is the user's, planned cold (M2b).
-- **Bitcoin and Bitcoin Blake2b have no freeze primitive.** No one can prevent another party's UTXO
+- **BTC (SHA256) and BTC (Blake2b) have no freeze primitive.** No one can prevent another party's UTXO
   from being spent; only the holder of the keys, or the chain's consensus, can. We are neither.
 - **A relay-level "attacker" has no funds in view.** Relay abuse (flooding, malformed events, DoS)
   comes from throwaway routing keys and connections, not from an on-chain identity tied to coins.

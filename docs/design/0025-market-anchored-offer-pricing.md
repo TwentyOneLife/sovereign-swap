@@ -7,7 +7,7 @@ work (#89) and the voluntary fee (0010/0013/0018). Tracked in a new issue.
 ## Context: the price is an economic decision, and today nothing anchors it
 
 A swap offer prices one chain's coin against the other: when the maker sells BTC, the offer's price is
-`counter_amount_sat / amount_sat` = **xBTC per BTC**. BTC (SHA256) and BTC-Blake2b (xBTC) are different
+`counter_amount_sat / amount_sat` = **xBTC per BTC**. BTC (SHA256) and BTC (Blake2b) are different
 assets with very different value, so this price is far from 1.0 (recent real offers sat near ~270 xBTC
 per BTC; the inverse, BTC per xBTC, is ~0.0037).
 
@@ -101,7 +101,7 @@ The Create-offer form shows, live as the maker types the amount or drags the mar
 - a plain-language profit line ("you receive ~X% more/less than market as the maker"),
 - a stale/unavailable banner when D6 applies.
 
-The two-asset reminder stays: this is BTC-Blake2b, a different asset from Bitcoin.
+The two-asset reminder stays: this is BTC (Blake2b), a different asset from BTC (SHA256).
 
 ## What this is NOT
 

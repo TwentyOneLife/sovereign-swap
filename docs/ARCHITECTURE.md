@@ -41,7 +41,7 @@ who runs each one.
 
 2. **The client (`sovereign-swap-client`)**, run by **each user on their own node**. This is the
    daemon plus the web GUI. It binds to loopback on that user's own machine, talks to that user's own
-   BTC and xBTC (Bitcoin Blake2b) nodes, holds that user's own keys (cold by default), and runs the
+   BTC (SHA256) and BTC (Blake2b) nodes, holds that user's own keys (cold by default), and runs the
    swap engine. There is no shared, multi-user website that strangers log into: the maker runs their
    client, the taker runs their client, and each person sees only their own.
 
@@ -126,7 +126,7 @@ because every swap ends either claimed or refunded, whatever the message plane d
      ▼ swap proceeds: each side locks on its chain, waits confirmations, claims, reads the secret ▼
 ```
 
-## Settlement plane: the swap itself (sequence, maker sells xBTC)
+## Settlement plane: the swap itself, maker sells BTC (Blake2b)
 
 ```
  maker engine                         xBTC chain              BTC chain                 taker engine
@@ -154,5 +154,5 @@ to claim one leg is what lets the other leg be claimed.
 | message confidentiality + authenticity | format-3 envelope: X25519+ML-KEM-1024, Schnorr+ML-DSA-87, AES-256-GCM, HKDF-SHA-512 (`envelope`, libcrux) |
 | addressing, discovery, delivery | Nostr events kind 4859 + relay routing (`nostr`, `relay`, `routing`) |
 | transport | WebSocket over Tor to relays (M3b-3) |
-| settlement | Bitcoin + Bitcoin Blake2b HTLCs via node JSON-RPC / Electrum (`node`) |
+| settlement | BTC (SHA256) + BTC (Blake2b) HTLCs via node JSON-RPC / Electrum (`node`) |
 ```

@@ -17,7 +17,7 @@ an external silent-payments indexer.
 
 0010 made the fee a BIP352 silent payment output: private and unlinkable, but collecting it needs a
 wallet that can scan for silent payments, which needs an Electrum server that indexes them. Our own
-servers (Fulcrum for BTC, Shulcrum for xBTC) do not implement that index, and upstream Fulcrum has
+servers, Fulcrum for BTC (SHA256) and Shulcrum for BTC (Blake2b), do not implement that index, and upstream Fulcrum has
 none to borrow. So today the fee can be built but not easily collected.
 
 The operator's goal is that an install left on the default fee address pays the project, and the
@@ -38,7 +38,7 @@ The fee destination for a chain is one of:
   Fulcrum/Shulcrum), but it tags every swap lock that pays it.
 
 The kind is inferred from the address: an `sp`/`tsp`/`sprt` HRP is a silent payment address, anything
-else that parses as a valid address is normal. BTC and xBTC are configured independently.
+else that parses as a valid address is normal. BTC (SHA256) and BTC (Blake2b) are configured independently.
 
 ## Output construction and counterparty verification
 
@@ -58,7 +58,7 @@ Both kinds keep the amount rules (floor, minimum trade, per-side basis points in
 ## Wire format (`FeeTerms`)
 
 The basis points stay global (two values, as today); only the address becomes per chain, each
-explicitly named so BTC and xBTC fee destinations can never be confused:
+explicitly named so BTC (SHA256) and BTC (Blake2b) fee destinations can never be confused:
 
 ```
 struct FeeTerms {
@@ -77,13 +77,13 @@ loudly; it never silently drops the fee.
 
 ## Anti-mix-up (hard constraint, covers collection too)
 
-In our code both chains resolve to `Network::Bitcoin`, so a BTC and an xBTC address, silent payment or
+In our code both chains resolve to `Network::Bitcoin`, so a BTC (SHA256) and a BTC (Blake2b) address, silent payment or
 normal, are byte-identical and the network check cannot tell them apart. Separation is structural:
 
 - `FeeTerms` uses `btc_address` / `xbtc_address`, never one shared field. The engine selects by the
   chain it locks, by construction.
 - The collection config is per chain the same way: `btc_` / `xbtc_` scan key, spend key, and payout
-  address. A BTC payout address and an xBTC payout address are just as byte-identical, so they are
+  address. A BTC (SHA256) payout address and a BTC (Blake2b) payout address are just as byte-identical, so they are
   named apart too.
 - Config and web UI present two clearly labelled inputs ("BTC fee address" / "xBTC fee address") with
   help: BTC from your Sparrow wallet, xBTC from your Shrike wallet, do not swap them. A save-time
@@ -104,7 +104,7 @@ the node RPC it already holds:
   the operator's scan key, derives the candidate output key, and records a match against the operator's
   SP address. Roughly two EC operations per eligible transaction; on BTC mainnet that is on the order
   of tens of seconds of CPU per day and a few hundred MB of block JSON over the LAN https path, and far
-  less on xBTC. This catches fees from every install paying the default address, not only the
+  less on BTC (Blake2b). This catches fees from every install paying the default address, not only the
   operator's own swaps.
 - **Collect.** Spending a matched output needs the SP spend key. The daemon holds a dedicated
   fee-wallet key (scan + spend), separate from any swap or savings seed, so a daemon compromise loses
@@ -149,8 +149,8 @@ A normal-address fee needs none of these.
 - `fee.rs` amount tests unchanged.
 - Normal-address output: the fee output equals the scriptPubKey of the configured normal address; a
   counterparty verifies a correct one and rejects a mismatch.
-- Per-chain selection: the BTC address is used when locking BTC and the xBTC address when locking
-  xBTC, and the two are never crossed (the anti-mix-up guarantee).
+- Per-chain selection: the BTC (SHA256) address is used when locking BTC (SHA256) and the BTC (Blake2b) address when locking
+  BTC (Blake2b), and the two are never crossed (the anti-mix-up guarantee).
 - Silent payment output + DLEQ: existing 0010 tests stand, under the new per-chain selection.
 - **Scanner (the case that matters): a regtest test where the daemon collects a fee from a swap it was
   NOT a party to.** Build an SP fee output to the operator address in an unrelated transaction, scan

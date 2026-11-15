@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Sovereign Swap
-  text: Trustless BTC and xBTC atomic swaps
+  text: Trustless BTC (SHA256) and BTC (Blake2b) atomic swaps
   tagline: Non-custodial. No KYC. Post-quantum sealed. Tor-first.
   image:
     src: /logo.svg
@@ -39,13 +39,13 @@ features:
 
 ## What this is
 
-**Sovereign Swap** trades [Bitcoin (BTC)](https://bitcoin.org/en/) for
-[Bitcoin Blake2b (xBTC)](https://bitcoinknots.org/) and back, directly between two
+**Sovereign Swap** trades [BTC (SHA256)](https://bitcoin.org/en/) for
+[BTC (Blake2b)](https://bitcoinknots.org/) and back, directly between two
 people, with no exchange, no custodian, and no account. The two sides never have to trust each other:
 the trade is enforced by cryptography on both chains, so the worst case for an honest party is that they
 get their own coin back.
 
-> **xBTC is not BTC.** Bitcoin Blake2b is a separate chain that shares Bitcoin's address format. A coin
+> **BTC (Blake2b) is not BTC (SHA256).** It is a separate chain that shares Bitcoin's address format. A coin
 > on one chain is a different asset from a coin on the other. Sending to an address on the wrong chain
 > loses the coin, and nothing on either chain can detect the mistake. This documentation is explicit
 > about which chain every step is on.

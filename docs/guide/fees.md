@@ -18,7 +18,7 @@ There is no platform cut, no spread, and no custody of your funds at any point.
 - The fee is **a share of the traded amount in basis points** (1 bp = 0.01%). Defaults are 20 bps for
   the maker and 30 bps for the taker; an operator can lower or waive either.
 - Each side pays its share **on the chain it locks**, to the fee address the offer names for that chain.
-  BTC and xBTC fee addresses are kept strictly separate (the chains share an address format, so one must
+  BTC (SHA256) and BTC (Blake2b) fee addresses are kept strictly separate (the chains share an address format, so one must
   never stand in for the other).
 - The counterparty **verifies the fee output on chain** before committing or revealing the secret. A
   missing, wrong-address, or underpaid fee makes the honest side refuse and refund. This is enforced,

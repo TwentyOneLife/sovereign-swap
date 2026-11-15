@@ -21,7 +21,7 @@ export default defineConfig({
   lang: 'en-US',
   title: 'Sovereign Swap',
   description:
-    'Peer-to-peer, non-custodial atomic swaps between Bitcoin and Bitcoin Blake2b (xBTC). ' +
+    'Peer-to-peer, non-custodial atomic swaps between BTC (SHA256) and BTC (Blake2b). ' +
     'No custody, no KYC, post-quantum sealed, Tor-first.',
   base: '/sovereign-swap/',
   cleanUrls: true,
