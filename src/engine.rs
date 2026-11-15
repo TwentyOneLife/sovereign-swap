@@ -857,6 +857,22 @@ impl<T: Transport> Engine<T> {
         Ok(())
     }
 
+    /// Locally dismisses a discovered PEER offer (#258): drops it from `seen_offers`/`seen_at` and
+    /// records its id in `withdrawn` so a relay replay cannot resurrect it. No wire message is sent:
+    /// we are not the maker and cannot withdraw someone else's offer for the network, only hide it on
+    /// this node. This clears a ghost offer whose maker went silent (a `valid_until: null` offer is
+    /// immune to the maker-expiry prune) without waiting out `SEEN_OFFER_TTL_SECS`. Idempotent: a
+    /// dismiss of an id we no longer hold still records the withdrawal so a later replay stays out.
+    pub fn dismiss(&mut self, offer_id: [u8; 16]) -> Result<(), EngineError> {
+        self.state.seen_offers.retain(|o| o.id != offer_id);
+        self.state.seen_at.retain(|(id, _)| *id != offer_id);
+        if !self.state.withdrawn.contains(&offer_id) {
+            self.state.withdrawn.push(offer_id);
+        }
+        self.save_state()?;
+        Ok(())
+    }
+
     /// Operator teardown of a swap that has not locked yet: mark it `Abandoned` so the engine stops
     /// trying to fund it. Refused once our lock is funded: a locked swap can only reach a timelock
     /// refund, never a forced abandon that would strand the coin. Idempotent on an already-terminal
