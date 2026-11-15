@@ -44,3 +44,7 @@ counterparty is just another node like yours.
 - [How it works](/guide/how-it-works) explains the atomic-swap contract that makes it trustless.
 - [Architecture](/guide/architecture) describes each component.
 - [Security model](/guide/security-model) covers the threat model and what can and cannot go wrong.
+- [Roadmap](/guide/roadmap) lists what is coming next.
+
+A hosted, non-custodial service is coming soon at [twentyone.life/swap](https://twentyone.life/swap), so
+you can swap without running your own node.
