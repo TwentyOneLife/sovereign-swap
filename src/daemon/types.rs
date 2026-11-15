@@ -148,6 +148,15 @@ pub struct Settings {
     pub btc_conf: u32,
     pub xbtc_conf: u32,
     pub margin_blocks: u16,
+    /// Extra maker-chain blocks added to an offer's sized timelocks beyond the policy minimum, so an
+    /// interactive (human) signer has a wider window to sign and submit the funding PSBT before the
+    /// swap would time out (#273). Larger means more time to sign, at the cost of the coins being
+    /// locked longer on a refund. The maker writes the offer's timelocks, so only the maker's value
+    /// widens the window the counterparty signs in. Floored at 2 (the old fixed value) so an offer is
+    /// never sized too tight for the engine's own `depths` check. Absent in older config, hence
+    /// `serde(default)`.
+    #[serde(default = "default_signing_headroom")]
+    pub signing_headroom_blocks: u16,
     /// Smallest swap leg this deployment will offer, bid or accept, in sats. Defaults to `DUST_SAT`
     /// (10_000), so existing configs are unchanged. Lower it only on a deployment that wants to offer
     /// a small real-rate leg (xBTC is far cheaper than BTC, so a realistic swap's BTC side is tiny).
@@ -319,6 +328,12 @@ pub(crate) const MAX_FEE_BPS: u16 = 100;
 fn default_min_swap_sat() -> u64 {
     DUST_SAT
 }
+/// Default interactive-signing headroom: 6 maker-chain blocks (~1 hour on BTC, ~1.3 h on xBTC),
+/// generous enough for a human to sign a funding PSBT in their own wallet. The old hardcoded value
+/// was 2; #273 widens the default and makes it configurable.
+fn default_signing_headroom() -> u16 {
+    6
+}
 fn default_split_fork_height() -> u32 {
     crate::split::MAINNET_FORK_HEIGHT
 }
@@ -356,6 +371,7 @@ impl Default for Settings {
             btc_conf: 1,
             xbtc_conf: 2,
             margin_blocks: 2,
+            signing_headroom_blocks: default_signing_headroom(),
             min_swap_sat: default_min_swap_sat(),
             split_fork_height: default_split_fork_height(),
             min_trade_sat: default_min_trade_sat(),
@@ -476,6 +492,11 @@ impl Settings {
         }
         if self.margin_blocks < 1 || self.margin_blocks > 1000 {
             e.push("margin_blocks: 1..=1000".to_owned());
+        }
+        if self.signing_headroom_blocks < 2 || self.signing_headroom_blocks > 144 {
+            e.push(
+                "signing_headroom_blocks: 2..=144 (2 is the old minimum; 144 is ~1 day)".to_owned(),
+            );
         }
         if self.min_swap_sat < MIN_SWAP_FLOOR_SAT {
             e.push(format!(
@@ -745,7 +766,15 @@ impl NewOffer {
         // amount is above the policy table; the engine then returns the precise error.
         let (maker_lock_blocks, taker_lock_blocks) = engine_config(s)
             .policy
-            .min_lock_blocks(maker_chain, maker_amount, taker_amount, 1, 1, margin)
+            .min_lock_blocks(
+                maker_chain,
+                maker_amount,
+                taker_amount,
+                1,
+                1,
+                margin,
+                s.signing_headroom_blocks as u32,
+            )
             .unwrap_or((MAKER_LOCK_BLOCKS, TAKER_LOCK_BLOCKS));
         // The fee terms travel in the offer (design 0010), filled from the operator's settings when
         // the fee is on; a fee-less offer carries None. The address was shape-checked by
@@ -968,6 +997,49 @@ mod tests {
             ..Settings::default()
         };
         assert!(engine_config(&on).user_held_spends);
+    }
+
+    #[test]
+    fn signing_headroom_defaults_bounds_and_widens_the_sized_offer() {
+        // #273: a config written before the field loads with the default 6 (serde default), so an
+        // existing install gets the wider window on upgrade without a migration.
+        let old: Settings = serde_json::from_str(
+            r#"{"btc_node":"x","xbtc_node":"y","relays":[],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2}"#,
+        )
+        .unwrap();
+        assert_eq!(old.signing_headroom_blocks, 6);
+        // Floored at 2 (the old fixed value) and capped at 144.
+        let too_low = Settings {
+            signing_headroom_blocks: 1,
+            ..Settings::default()
+        };
+        assert!(too_low
+            .validate()
+            .iter()
+            .any(|m| m.contains("signing_headroom_blocks")));
+        let too_high = Settings {
+            signing_headroom_blocks: 145,
+            ..Settings::default()
+        };
+        assert!(too_high
+            .validate()
+            .iter()
+            .any(|m| m.contains("signing_headroom_blocks")));
+        // A larger headroom sizes an offer's timelocks longer, which is what widens the window.
+        let tight = Settings {
+            signing_headroom_blocks: 2,
+            ..Settings::default()
+        };
+        let roomy = Settings {
+            signing_headroom_blocks: 6,
+            ..Settings::default()
+        };
+        let o_tight = a_new_offer().into_swap_offer(&tight);
+        let o_roomy = a_new_offer().into_swap_offer(&roomy);
+        assert!(
+            o_roomy.maker_lock_blocks > o_tight.maker_lock_blocks,
+            "more headroom means a longer maker lock, hence a wider signing window"
+        );
     }
 
     #[test]

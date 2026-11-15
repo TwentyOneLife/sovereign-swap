@@ -793,6 +793,63 @@ mod tests {
     }
 
     #[test]
+    fn signing_window_width_grows_with_headroom() {
+        // #273: the interactive-signing window is the set of maker-lock depths at which the taker is
+        // told to Fund. It is bounded above by the maker's `maker_lock_blocks`, which `min_lock_blocks`
+        // sizes with `headroom` extra blocks. Sizing the SAME offer with more headroom must widen that
+        // window by the same number of blocks: this is the thing a human signer feels as "more time".
+        let p = crate::policy::Policy::standard();
+        let amt = Amount::from_sat(1_000_000);
+        let fund_depths = |headroom: u32| -> u32 {
+            let maker_chain = Chain::Xbtc;
+            let (mlb, tlb) = p
+                .min_lock_blocks(maker_chain, amt, amt, 1, 1, 3, headroom)
+                .expect("within the policy table");
+            let o = Offer {
+                id: [7; 16],
+                maker_chain,
+                maker_amount: amt,
+                taker_amount: amt,
+                min_maker_amount: Amount::ZERO,
+                maker_lock_blocks: mlb,
+                taker_lock_blocks: tlb,
+                maker_lock_depth: 1,
+                taker_lock_depth: 1,
+                margin_blocks: 3,
+                fee: None,
+                valid_until: None,
+            };
+            let depths = p
+                .depths(&o, o.maker_amount, o.taker_amount)
+                .expect("a sized offer satisfies its own depths check");
+            // Maker's lock confirmed at height 100; sweep heights so its depth climbs from 1 past the
+            // window's close, counting the depths that produce a Fund. A fresh swap each step, so an
+            // abandon at the far edge never affects an earlier step.
+            let mut count = 0u32;
+            for ha in 100..=100 + u32::from(mlb) + 5 {
+                let mut s = swap(Role::Taker);
+                s.offer = o.clone();
+                s.depths = depths;
+                s.lock_deadline = u32::MAX; // isolate the window gate from the deadline abandon
+                let acts = s.decide(&view(ha, ha, Some(lock(1, Some(100))), None), SECRET);
+                if acts == vec![Action::Fund] {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let w2 = fund_depths(2);
+        let w6 = fund_depths(6);
+        assert_eq!(w2, 2, "the old fixed headroom of 2 gives a 2-block window");
+        assert_eq!(w6, 6, "a headroom of 6 gives a 6-block window");
+        assert_eq!(
+            w6 - w2,
+            4,
+            "4 extra headroom blocks = 4 extra funding depths"
+        );
+    }
+
+    #[test]
     fn blocks_as_normalizes_by_wall_clock_and_never_loosens() {
         // Same chain is identity.
         assert_eq!(blocks_as(20, Chain::Btc, Chain::Btc), 20);

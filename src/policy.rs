@@ -121,9 +121,13 @@ impl Policy {
     }
 
     /// The smallest `(maker_lock_blocks, taker_lock_blocks)` that satisfy `depths` for an offer of
-    /// these parameters, plus a small headroom. A client sizes an offer's timelocks to the amount
-    /// with this, rather than a fixed default that is too short once the amount needs deeper
-    /// confirmations. `None` if the amount is above the policy's table (there is no valid lock then).
+    /// these parameters, plus `headroom` extra maker-chain blocks (#273). A client sizes an offer's
+    /// timelocks to the amount with this, rather than a fixed default that is too short once the
+    /// amount needs deeper confirmations; `headroom` widens the interactive-signing window on top.
+    /// `None` if the amount is above the policy's table (there is no valid lock then).
+    // Each argument is a distinct sizing input mirroring `depths`; a params struct for one caller
+    // would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn min_lock_blocks(
         &self,
         maker_chain: Chain,
@@ -132,6 +136,7 @@ impl Policy {
         maker_lock_depth: u32,
         taker_lock_depth: u32,
         margin: u32,
+        headroom: u32,
     ) -> Option<(u16, u16)> {
         let btc_side = match maker_chain {
             Chain::Btc => maker_part,
@@ -142,8 +147,9 @@ impl Policy {
         let maker_lock = maker_lock_depth.max(maker_final);
         let taker_lock = taker_lock_depth.max(taker_final);
         // Mirror `depths`: each lock must exceed its room, so take room + headroom. The maker's room
-        // includes the taker's lock blocks, so size the taker first.
-        let headroom = 2;
+        // includes the taker's lock blocks, so size the taker first. `headroom` is extra maker-chain
+        // blocks beyond the minimum (#273): a wider interactive-signing window, operator-configurable
+        // via `signing_headroom_blocks`; the old fixed value was 2.
         let taker_lock_blocks = taker_lock + margin + taker_final + headroom;
         // Mirror `depths` exactly: convert the two taker-chain terms to maker-chain blocks per term
         // (never the sum) so the sizing a client computes here satisfies the normalized `depths`
@@ -267,6 +273,7 @@ mod tests {
                     1,
                     1,
                     o.margin_blocks,
+                    2,
                 )
                 .expect("within the table");
             let sized = Offer {
@@ -296,7 +303,7 @@ mod tests {
         };
         // The sizing helper satisfies `depths` in this direction too (per-term conversion matches).
         let (m, t) = p
-            .min_lock_blocks(Chain::Btc, amt, amt, 1, 1, 6)
+            .min_lock_blocks(Chain::Btc, amt, amt, 1, 1, 6, 2)
             .expect("within the table");
         // Normalized: maker 1 + ceil(6*780/600)=8 + ceil(20*780/600)=26 + margin 6 + final 1 + head 2
         // = 44; the un-normalized formula would have been 36. Taker leg (all xBTC) is unchanged at 20.
