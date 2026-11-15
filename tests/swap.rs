@@ -753,6 +753,44 @@ fn a_per_trade_destination_still_settles_the_swap_to_done() {
     assert_eq!(taker.phase(), Some(Phase::Done));
 }
 
+/// #257 hardening (0.7.0 adversarial finding): a bad per-trade destination is refused at take/publish
+/// time (validate_dest), not deferred to start() where a late failure could grief the counterparty
+/// into a timelock refund or leak contract watches.
+#[test]
+fn a_bad_per_trade_destination_is_refused_at_submit_time() {
+    let Some(w) = World::start() else { return };
+    let (a, b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let mut taker = Party::new("taker", b, &w.btc, &w.xbtc);
+    let offer = offer(Chain::Xbtc);
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    assert!(
+        taker
+            .engine()
+            .bid_with_dest(
+                &offer,
+                offer.maker_amount,
+                [9; 16],
+                Some("not-a-valid-address".to_owned()),
+                None,
+            )
+            .is_err(),
+        "a malformed per-trade destination must be refused at take time, not at start()"
+    );
+    let offer2 = Offer {
+        id: [2; 16],
+        ..offer.clone()
+    };
+    assert!(
+        maker
+            .engine()
+            .publish_with_dest(offer2, Some("not-a-valid-address".to_owned()), None)
+            .is_err(),
+        "a malformed per-trade destination must be refused at publish time"
+    );
+}
+
 /// Withdrawing an id that is not one of our own offers is an error, not a silent success: a never-ours
 /// id and an already-withdrawn id both report, so the HTTP layer can return 422 instead of a
 /// misleading `{"withdrawn":...}` 200 (#78).
