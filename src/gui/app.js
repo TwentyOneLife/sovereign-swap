@@ -320,6 +320,29 @@ async function withdrawOffer(id, btn) {
   }
 }
 
+// #258: locally dismiss a peer's stale/ghost offer. Local only (no wire message); it cannot come
+// back on a relay replay, but it will reappear if the maker genuinely re-announces after this. Only
+// clears it from THIS node's market view, so confirm and say so.
+async function dismissOffer(id, btn) {
+  if (
+    !confirm(
+      "Dismiss this offer from your market?\n\n" +
+        "• It is hidden on this node only; peers are not affected and no funds move.\n" +
+        "• It will not come back from a stale relay replay.\n" +
+        "• Use this to clear a ghost offer whose maker went silent.",
+    )
+  )
+    return;
+  if (btn) { btn.disabled = true; btn.textContent = "Dismissing…"; }
+  try {
+    await api("POST", "/offers/" + id + "/dismiss");
+    loadMarket();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Dismiss"; }
+    alert("Dismiss failed: " + ((e.data && e.data.error) || "unknown error"));
+  }
+}
+
 async function loadMarket() {
   loadMyOffers();
   const offers = await api("GET", "/offers").catch(() => []);
@@ -336,8 +359,13 @@ async function loadMarket() {
       { label: "For", num: true, get: (o) => o.counter_amount_sat, cell: (o) => `${fmtSats(o.counter_amount_sat)} ${chainShort(o.taker_chain)}` },
       { label: "Rate", num: true, get: (o) => o.counter_amount_sat / o.amount_sat, cell: (o) => fmtRate(o.counter_amount_sat / o.amount_sat) },
     ],
-    actions: () => `<button class="link take-btn">Take</button> `,
-    wireActions: (tr, o) => { const b = tr.querySelector(".take-btn"); if (b) b.addEventListener("click", (e) => { e.stopPropagation(); takeSheet(o); }); },
+    actions: () => `<button class="link take-btn">Take</button> <button class="link dismiss-btn" title="Hide this offer from your market on this node only (for a stale ghost offer)">Dismiss</button> `,
+    wireActions: (tr, o) => {
+      const b = tr.querySelector(".take-btn");
+      if (b) b.addEventListener("click", (e) => { e.stopPropagation(); takeSheet(o); });
+      const d = tr.querySelector(".dismiss-btn");
+      if (d) d.addEventListener("click", (e) => { e.stopPropagation(); dismissOffer(o.id, d); });
+    },
     detailInto: (o, box) => {
       const t = fmtTime(o.seen_at);
       box.innerHTML =

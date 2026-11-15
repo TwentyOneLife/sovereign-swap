@@ -656,6 +656,37 @@ fn a_withdrawn_offer_disappears_and_does_not_reappear_on_replay() {
     );
 }
 
+/// A taker can locally dismiss a peer's ghost offer (#258): it leaves discovery and a relay replay of
+/// the original event does not bring it back, all without a `Withdraw` on the wire (we are not the
+/// maker). This clears a stale `valid_until: null` offer without waiting out the seen-offer TTL.
+#[test]
+fn a_dismissed_peer_offer_stays_gone_without_a_wire_withdraw() {
+    let Some(w) = World::start() else { return };
+    let (a, b) = memory_pair();
+    let mut maker = Party::new("maker", a, &w.btc, &w.xbtc);
+    let mut taker = Party::new("taker", b, &w.btc, &w.xbtc);
+    let offer = offer(Chain::Xbtc);
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));
+    // The taker dismisses the peer offer locally; it disappears from discovery at once.
+    taker.engine().dismiss(offer.id).unwrap();
+    assert!(
+        taker.engine().seen_offers().is_empty(),
+        "a dismissed peer offer must disappear locally"
+    );
+    // The maker never withdrew it (it is still the maker's live offer) and re-announces; the taker's
+    // local dismissal must hold against the replay.
+    maker.engine().publish(offer.clone()).unwrap();
+    taker.tick();
+    assert!(
+        taker.engine().seen_offers().is_empty(),
+        "a dismissed offer must not reappear on replay"
+    );
+    // Idempotent: dismissing an id we no longer hold is still Ok (it keeps the replay guard in place).
+    taker.engine().dismiss(offer.id).unwrap();
+}
+
 /// Withdrawing an id that is not one of our own offers is an error, not a silent success: a never-ours
 /// id and an already-withdrawn id both report, so the HTTP layer can return 422 instead of a
 /// misleading `{"withdrawn":...}` 200 (#78).

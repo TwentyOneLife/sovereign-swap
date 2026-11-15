@@ -82,6 +82,11 @@ pub(crate) enum EngineCmd {
         offer_id: [u8; 16],
         reply: Sender<Result<(), String>>,
     },
+    /// Locally dismiss a discovered peer offer (#258): hide a ghost without a wire withdraw.
+    Dismiss {
+        offer_id: [u8; 16],
+        reply: Sender<Result<(), String>>,
+    },
     /// Abandon a swap that has not locked yet (operator teardown).
     Abort {
         swap_id: [u8; 16],
@@ -339,6 +344,9 @@ pub(crate) fn handle_engine_cmd(
         }
         EngineCmd::Withdraw { offer_id, reply } => {
             let _ = reply.send(engine.withdraw(offer_id).map_err(|e| format!("{e:?}")));
+        }
+        EngineCmd::Dismiss { offer_id, reply } => {
+            let _ = reply.send(engine.dismiss(offer_id).map_err(|e| format!("{e:?}")));
         }
         EngineCmd::Abort { swap_id, reply } => {
             let _ = reply.send(engine.abort(swap_id).map_err(|e| format!("{e:?}")));

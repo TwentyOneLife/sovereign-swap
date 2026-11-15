@@ -742,6 +742,13 @@ impl Daemon {
                 self.post_withdraw(path_id(p, "/offers/", "/withdraw"))
             }
             ("POST", p)
+                if p.starts_with("/offers/")
+                    && p.ends_with("/dismiss")
+                    && valid_id(path_id(p, "/offers/", "/dismiss")) =>
+            {
+                self.post_dismiss(path_id(p, "/offers/", "/dismiss"))
+            }
+            ("POST", p)
                 if p.starts_with("/swaps/")
                     && p.ends_with("/abort")
                     && valid_id(path_id(p, "/swaps/", "/abort")) =>
@@ -1594,6 +1601,23 @@ impl Daemon {
             Ok(Ok(())) => (
                 200,
                 json!({ "withdrawn": offer_id.to_hex_string(Case::Lower) }),
+            ),
+            Ok(Err(e)) => (422, json!({ "error": e })),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    fn post_dismiss(&self, offer_id_hex: &str) -> (u16, Value) {
+        let Ok(offer_id) = <[u8; 16]>::from_hex(offer_id_hex) else {
+            return (400, json!({"error": "bad offer id"}));
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::Dismiss { offer_id, reply }) {
+            Ok(Ok(())) => (
+                200,
+                json!({ "dismissed": offer_id.to_hex_string(Case::Lower) }),
             ),
             Ok(Err(e)) => (422, json!({ "error": e })),
             Err(e) => (503, json!({ "error": e })),
