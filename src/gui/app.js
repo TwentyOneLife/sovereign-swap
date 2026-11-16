@@ -502,15 +502,16 @@ function renderReplayWarn(el) {
   // leg: coin selection may avoid the replayable coins, so "has replayable coins" alone would
   // over-warn, and too little total balance is the #295 0-balance concern, not a replay problem.
   if (amount && d.replayable_sat > 0 && d.safe_sat < amount) {
-    // Whether a split is available depends ONLY on the Blake2b funding mode (the split co-sign runs on
-    // the Blake2b node and refuses unless it is hot, #310), not on the chain being funded.
-    const xbtcMode = (statusData && statusData.funding && statusData.funding.xbtc && statusData.funding.xbtc.mode) || "hot";
+    // Whether a split is available depends on the Blake2b funding wallet, not the chain being funded: the
+    // split needs a wallet to lend a marker. Hot (keyed) and cold / descriptor-backed (watch-only) both
+    // work (#314/#310); only output-only funding has no wallet, so it cannot split.
+    const xbtcOutputOnly = !!(statusData && statusData.funding && statusData.funding.xbtc && statusData.funding.xbtc.output_only);
     el.className = "warn";
     const held =
       `Your ${chainShort(chain)} funding wallet holds ${fmtSats(d.replayable_sat)} ${chainShort(chain)} ` +
       `in pre-fork coin(s) that are replayable across chains, and only ${fmtSats(d.safe_sat)} that is ` +
       `safe to lock, less than this leg needs.`;
-    if (xbtcMode === "hot") {
+    if (!xbtcOutputOnly) {
       el.innerHTML =
         `<strong>Split first.</strong> ${held} Separate them in the ` +
         `<a href="#" id="f-go-split">Split</a> tab first, or the swap will be refused when you sign ` +
@@ -524,9 +525,9 @@ function renderReplayWarn(el) {
         });
     } else {
       el.innerHTML =
-        `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting is not ` +
-        `available while Blake2b funding is ${xbtcMode} (issue #310); fund this leg from coins that ` +
-        `are already separated.`;
+        `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting needs a ` +
+        `Blake2b funding wallet, which output-only funding does not have, so fund this leg from coins ` +
+        `that are already separated.`;
     }
     return;
   }
@@ -1331,11 +1332,25 @@ function loadSplit() {
   $("#sp-build").addEventListener("click", async () => {
     if (!splitJob.coin) { step1.textContent = "Find or pick a coin to protect first."; return; }
     const dest = $("#sp-dest").value.trim();
-    if (!dest) { step1.textContent = "Enter your BTC (Blake2b) destination address first."; return; }
     step1.textContent = "Building the unsigned transaction…";
     try {
-      const r = await api("POST", "/split/build", { sha_coins: [splitJob.coin], dest });
+      // A destination is needed only for a coin you hold; for a coin in the swap's own hot funding
+      // wallet the daemon picks one and signs the input itself, so send dest only when you entered one.
+      const body = { sha_coins: [splitJob.coin] };
+      if (dest) body.dest = dest;
+      const r = await api("POST", "/split/build", body);
       splitJob.job_id = r.job_id;
+      if (r.daemon_signed) {
+        // #314: the coin is in the swap's hot funding wallet; there is no PSBT for you to sign. The
+        // daemon co-signs the coin and the marker and broadcasts, so submit the built PSBT straight through.
+        step1.textContent = "✓ Built (hot funding-wallet coin). Fee " + fmtSats(r.fee_sat) + " XBT. Co-signing and broadcasting…";
+        const s = await api("POST", "/split/submit", { job_id: r.job_id, psbt: r.psbt });
+        splitJob.txid = s.txid;
+        $("#sp-verify-card").classList.remove("hidden");
+        step1.textContent = "✓ Broadcast on BTC (Blake2b). txid " + s.txid;
+        $("#sp-verify-card").scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
       $("#sp-psbt").value = r.psbt;
       $("#sp-sign-card").classList.remove("hidden");
       step1.textContent = "✓ Built. Fee " + fmtSats(r.fee_sat) + " XBT. Sign it in step 3.";

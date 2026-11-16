@@ -94,7 +94,8 @@
       signs the move. Your BTC (SHA256) coin itself is never moved: it stays exactly where it is and
       simply becomes safe to spend.</p>
       <p class="muted">We lend a BTC (Blake2b) "marker" coin and take it back, so the move cannot exist on
-      the BTC (SHA256) chain. You sign on your own device (non-custodial); we only co-sign the marker.
+      the BTC (SHA256) chain. You sign on your own device (non-custodial); the marker is co-signed by the
+      service when it funds hot, or by you when funding is your own cold wallet.
       Fee 0.5% of the coin, taken in BTC (Blake2b).
       <a href="https://twentyonelife.github.io/sovereign-swap/guides/protect-your-coins" target="_blank" rel="noopener noreferrer">Learn how it works</a>.</p>
     </div>
@@ -136,12 +137,12 @@
         Unsigned transaction, open this in Sparrow
         <textarea id="sp-psbt" class="copyable" readonly rows="3" title="Click to select, then copy it into Sparrow."></textarea>
       </label>
-      <label title="Paste the fully-signed transaction Sparrow produced. We check it is exactly the one we built, co-sign our marker, and broadcast it.">
+      <label title="Paste the fully-signed transaction Sparrow produced. We check it is exactly the one we built, co-sign the marker when funding is hot (otherwise your signatures are already complete), and broadcast it.">
         Signed transaction, paste it back here
         <textarea id="sp-signed" rows="3" placeholder="paste the signed transaction from Sparrow"
           title="The fully-signed transaction from your signer."></textarea>
       </label>
-      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker, and broadcast it on BTC (Blake2b).">Co-sign and broadcast</button>
+      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker when funding is hot, and broadcast it on BTC (Blake2b).">Submit and broadcast</button>
       <p id="sp-step2" class="muted"></p>
     </div>
     <div class="card hidden" id="sp-verify-card">

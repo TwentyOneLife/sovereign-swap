@@ -127,6 +127,9 @@ fn a_full_swap_routes_over_the_relay() {
     taker.deposit(&core, 2.0);
     core.mine(1);
     knots.mine(1);
+    // #317: do not fund the swap until each wallet has processed its funding block (avoids a flaky -4).
+    common::wait_for_confirmed_utxo(&knots, "maker");
+    common::wait_for_confirmed_utxo(&core, "taker");
 
     maker.engine.publish(offer()).unwrap();
     taker.tick(); // discovers the offer over the relay

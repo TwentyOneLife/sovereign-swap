@@ -829,8 +829,9 @@ impl ChainNode {
         // Output-only funding (design 0032): build an inputless PSBT with just the HTLC output (and a
         // normal-address fee output), then hand it to the interactive signer, which parks it for the
         // user. The user's own wallet adds the inputs and change and signs. There is no coin selection
-        // and no input-replay check here: the daemon never sees the inputs, so the user is responsible
-        // for not funding from a coin still spendable on the other chain. A silent-payment fee derives
+        // and no input-replay check here: the daemon never sees the inputs at this point. The replay
+        // guard instead runs at submit time over the signed PSBT's inputs (`finalize_submitted_lock`,
+        // #313), which is the only point the daemon sees what the user funded from. A silent-payment fee derives
         // its output from the spending inputs' keys (BIP352), which only the user's wallet holds, so it
         // cannot be built output-only (design 0018); a normal fee address is a plain output and works.
         if self.output_only {
@@ -936,14 +937,15 @@ impl ChainNode {
 
     /// Resume a lock parked for the user's signature (E2, design 0017): the submitted PSBT must carry
     /// the same unsigned transaction as the one handed out (the user may sign, not rewrite it), then
-    /// it is finalized and the lock transaction extracted, with the lock output re-checked. Does not
-    /// broadcast; the caller does.
+    /// it is finalized and the lock transaction extracted, with the lock output re-checked and the
+    /// inputs run through the cross-chain replay guard (#313). Does not broadcast; the caller does.
     pub fn finalize_submitted_lock(
         &self,
         pending_psbt: &str,
         signed_psbt: &str,
         contract: &Contract,
         amount: Amount,
+        other_chain: &impl UtxoLookup<Error = RpcError>,
     ) -> Result<Transaction, NodeError> {
         let unsigned_txid = |p: &str| {
             Psbt::from_str(p)
@@ -967,6 +969,30 @@ impl ChainNode {
             ));
         }
         let tx: Transaction = parse(&finalized["hex"])?;
+        // #313: the cross-chain replay guard, run over the inputs the user actually signed, before the
+        // caller broadcasts. Descriptor-backed funding already passed this guard inside `fund()` and
+        // pins the txid above, so re-running it here is a cheap backstop. Output-only funding (design
+        // 0032) builds the inputs in the user's OWN wallet, which the daemon never saw at `fund()`
+        // time, so this submit-time check is the ONLY replay guard on that path. Fail closed: a
+        // spendable-on-the-other-chain input, or a lookup the other node cannot answer, refuses rather
+        // than broadcasts a lock that could be replayed (a loss path, #74).
+        match check_inputs(&tx, other_chain) {
+            Ok(()) => {}
+            Err(ReplayError::SpendableOnOtherChain(outpoint)) => {
+                return Err(NodeError::Unexpected(format!(
+                    "funding input {outpoint} is still spendable on the other chain, so this lock \
+                     could be replayed there (a loss path). Do NOT broadcast this signed transaction \
+                     from your own wallet. Split the coin first (Split tab) and fund the lock from a \
+                     post-split output."
+                )));
+            }
+            Err(ReplayError::Lookup(e)) => {
+                return Err(NodeError::Unexpected(format!(
+                    "cannot verify the funding inputs are replay-safe against the other chain ({e:?}); \
+                     not broadcasting. Check the other node is reachable and resubmit."
+                )));
+            }
+        }
         contract
             .find_lock_output(&tx, amount)
             .map_err(|e| NodeError::Unexpected(format!("funded lock: {e:?}")))?;

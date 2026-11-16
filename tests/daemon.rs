@@ -421,42 +421,55 @@ fn a_second_daemon_on_the_same_data_dir_is_refused_then_allowed_after_release() 
 }
 
 #[test]
-fn split_build_refuses_when_blake2b_funding_is_not_hot() {
-    // #301/#310: the split co-sign needs a KEYED Blake2b funding wallet. In cold / descriptor-backed
-    // funding it is watch-only, so /split/build refuses up front (before any node I/O) rather than
-    // ever sign the user's balance from a stale keyed left-over on the engine host. No bitcoind needed:
-    // the refusal is reached from settings alone. Points at #310 for the eventual cold-mode path.
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("sovswap-split-cold-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    // Bogus node addresses: the engine will not start (non-fatal), but /split/build never connects on
-    // this path. A fee address is set so the handler passes its fee-config gate and reaches the mode
-    // check; Blake2b funding is interactive (descriptor-backed/output-only), i.e. not hot.
-    let settings = r#"{"btc_node":"http://127.0.0.1:1","xbtc_node":"http://127.0.0.1:1",
-        "relays":["ws://127.0.0.1:1"],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
-        "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
-        "fee_xbtc_address":"bcrt1qexample","xbtc_funding":{"mode":"interactive"}}"#;
-    std::fs::write(dir.join("settings.json"), settings).unwrap();
-    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+fn split_build_refuses_output_only_but_not_descriptor_backed_blake2b_funding() {
+    // #310/#314: the split needs a Blake2b funding WALLET to lend a chain-exclusive marker. Output-only
+    // interactive funding has none, so /split/build refuses up front (409) before any node I/O. Cold /
+    // descriptor-backed funding IS a (watch-only) wallet, so it must NOT short-circuit: it proceeds to the
+    // node (and here fails to connect to the bogus address), proving the old hot-only refusal is gone. No
+    // bitcoind needed; the engine not starting is non-fatal.
+    let mk = |funding: &str| -> (u16, String) {
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("sovswap-split-mode-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = format!(
+            r#"{{"btc_node":"http://127.0.0.1:1","xbtc_node":"http://127.0.0.1:1",
+            "relays":["ws://127.0.0.1:1"],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+            "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
+            "fee_xbtc_address":"bcrt1qexample","xbtc_funding":{funding}}}"#
+        );
+        std::fs::write(dir.join("settings.json"), &settings).unwrap();
+        let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+        let r = request(
+            &addr,
+            "POST",
+            "/split/build",
+            Some(&token),
+            r#"{"dest":"bcrt1qdest","sha_coins":[{"txid":"aa","vout":0}]}"#,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    };
 
-    let (code, body) = request(
-        &addr,
-        "POST",
-        "/split/build",
-        Some(&token),
-        r#"{"dest":"bcrt1qdest","sha_coins":[{"txid":"aa","vout":0}]}"#,
-    );
+    // Output-only (interactive, no descriptors): refused up front, no wallet to lend a marker.
+    let (code, body) = mk(r#"{"mode":"interactive"}"#);
     assert_eq!(
         code, 409,
-        "cold/descriptor Blake2b funding cannot co-sign a split: {body}"
+        "output-only Blake2b funding has no wallet to lend a split marker: {body}"
     );
     assert!(
-        body.contains("#310"),
-        "the refusal points at the cold-mode split issue: {body}"
+        body.contains("output-only"),
+        "the refusal names the output-only cause: {body}"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // Cold / descriptor-backed: a watch-only wallet, so #310 lets the split proceed (the user signs the
+    // marker). It must no longer be refused up front; here it reaches the node and fails to connect.
+    let (code, _body) = mk(r#"{"mode":"cold"}"#);
+    assert_ne!(
+        code, 409,
+        "cold / descriptor-backed Blake2b funding must no longer be refused up front (#310)"
+    );
 }
 
 #[test]
