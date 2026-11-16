@@ -852,8 +852,14 @@ function explorerTx(chain, lock) {
     return `<span style="color:var(--dim)">not locked yet</span>`;
   const need = lock.required_depth;
   const confs = lock.confirmations;
+  // #303: once the required depth is met the leg is done, so clamp the numerator at `need` rather than
+  // keep counting (`2/1`, `3/1`), which reads like "2 of 1" / partial instead of "met, 1 required".
   const count =
-    confs == null ? "unconfirmed" : need ? `${confs}/${need} conf` : `${confs} conf`;
+    confs == null
+      ? "unconfirmed"
+      : need
+        ? `${Math.min(confs, need)}/${need} conf`
+        : `${confs} conf`;
   const settled = lock.spent || (confs != null && (!need || confs >= need));
   const color = settled ? "var(--ok)" : confs == null ? "var(--dim)" : "var(--orange)";
   const state = `${count} · ${lock.spent ? "spent" : "locked"}`;
@@ -1013,8 +1019,11 @@ async function fillSwapDetail(id, box) {
   const ownLock = s.role === "maker" ? c.maker_lock : c.taker_lock;
   const cpLock = s.role === "maker" ? c.taker_lock : c.maker_lock;
   live.innerHTML =
-    `<p class="muted" data-sd>${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
-    (s.secret_revealed ? " · secret revealed" : "") + `</p>` +
+    // #306: the authoritative phase, rendered from the detail's own fresh `/swaps/{id}` fetch so it
+    // tracks the daemon every poll (the row badge above can lag while a detail is open). Both roles.
+    `<p data-sd style="margin:.2rem 0"><span class="pill ${isTerminal(s) ? "phase-" + s.phase : "phase-active"}" title="Swap phase, from the daemon each poll">${escapeHtml(s.phase)}</span>` +
+    `<span class="muted"> · ${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
+    (s.secret_revealed ? " · secret revealed" : "") + `</span></p>` +
     `<div class="legs">` +
     `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
     `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
@@ -1078,7 +1087,8 @@ async function fillSwapDetail(id, box) {
             `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable" id="unsigned-psbt">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
             `<div class="row" style="justify-content:flex-end;gap:.4rem"><button class="ghost" type="button" id="qr-psbt" title="Show the unsigned PSBT as an animated QR to scan with an air-gapped signer (SeedSigner, Coldcard Q)">Show QR</button><button class="ghost" type="button" id="copy-psbt">Copy</button></div>` +
             `<div id="qr-box" class="hidden" style="text-align:center;margin:.4rem 0"><canvas id="qr-canvas" width="340" height="340" style="max-width:100%;image-rendering:pixelated;background:#fff;border-radius:4px"></canvas><p class="muted" id="qr-label" style="margin:.2rem 0"></p></div>`) +
-        `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
+        `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea>` +
+        `<span class="muted" style="font-size:.85em">Paste the signed PSBT in Base64 (it starts with <code>cHNidP8B</code>), not a raw transaction.</span></label>` +
         `<div class="row" style="justify-content:space-between;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`
       : "");
@@ -1128,6 +1138,13 @@ async function fillSwapDetail(id, box) {
         const msg = live.querySelector("#psbt-msg");
         if (!psbt) {
           msg.textContent = "Paste the signed PSBT first.";
+          return;
+        }
+        // #302: a valid value is a Base64 PSBT (the `psbt\xff` magic encodes to `cHNidP8B`). Catch a raw
+        // tx hex, a partial copy, or a wallet export here, before it fails mid-swap on a parked lock.
+        if (!psbt.startsWith("cHNidP8B")) {
+          msg.textContent =
+            "That is not a Base64 PSBT (it should start with cHNidP8B). Paste the signed PSBT, not a raw transaction or a partial copy.";
           return;
         }
         msg.textContent = "Submitting…";
@@ -1355,7 +1372,17 @@ function loadSplit() {
       $("#sp-sign-card").classList.remove("hidden");
       step1.textContent = "✓ Built. Fee " + fmtSats(r.fee_sat) + " XBT. Sign it in step 3.";
       $("#sp-sign-card").scrollIntoView({ behavior: "smooth", block: "start" });
-    } catch (e) { step1.textContent = "✗ " + splitErr(e); }
+    } catch (e) {
+      // #321: a coin YOU hold needs a destination; a coin in the swap's own funding wallet does not (the
+      // daemon fills it). Turn the bare "dest required" into that explanation instead of a raw error.
+      const emsg = (e && e.data && e.data.error) || "";
+      if (/dest required/i.test(emsg)) {
+        step1.textContent =
+          "Enter a BTC (Blake2b) destination address above: this coin is yours to control, so the split needs to know where to send the protected value. (A coin held by the swap's own funding wallet does not need one.)";
+      } else {
+        step1.textContent = "✗ " + splitErr(e);
+      }
+    }
   });
   $("#sp-submit").addEventListener("click", async () => {
     const psbt = $("#sp-signed").value.trim();
