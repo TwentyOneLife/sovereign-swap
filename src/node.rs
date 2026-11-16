@@ -814,6 +814,52 @@ impl ChainNode {
         Address::from_script(&contract.script_pubkey(), self.network).expect("P2WSH has an address")
     }
 
+    /// SPV proof bundle for one confirmed output (#247): the raw transaction, a Merkle (txout) proof
+    /// binding that txid into its block, and the block's 80-byte header, so a client that does not
+    /// trust this daemon (a light client, or a front treating the engine as untrusted) can verify a
+    /// lock exists on-chain with the agreed amount and script before committing anything irreversible.
+    /// The block hash is resolved from the height and passed to `getrawtransaction`/`gettxoutproof`, so
+    /// neither needs a transaction index. A pruned node that no longer holds the block returns an RPC
+    /// error, which the caller surfaces rather than fabricating a proof.
+    pub fn spv_proof(&self, outpoint: OutPoint, height: u32) -> Result<Value, NodeError> {
+        let txid = outpoint.txid.to_string();
+        let str_field = |v: Value, what: &str| -> Result<String, NodeError> {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| NodeError::Unexpected(format!("{what} returned no string")))
+        };
+        let block_hash = str_field(
+            self.rpc.call("getblockhash", json!([height]))?,
+            "getblockhash",
+        )?;
+        // verbose=false -> raw hex; passing the block hash means txindex is not required.
+        let raw_tx = str_field(
+            self.rpc
+                .call("getrawtransaction", json!([&txid, false, &block_hash]))?,
+            "getrawtransaction",
+        )?;
+        let txout_proof = str_field(
+            self.rpc
+                .call("gettxoutproof", json!([[&txid], &block_hash]))?,
+            "gettxoutproof",
+        )?;
+        // verbose=false -> the 80-byte header as hex.
+        let block_header = str_field(
+            self.rpc
+                .call("getblockheader", json!([&block_hash, false]))?,
+            "getblockheader",
+        )?;
+        Ok(json!({
+            "txid": txid,
+            "vout": outpoint.vout,
+            "height": height,
+            "block_hash": block_hash,
+            "raw_tx": raw_tx,
+            "txout_proof": txout_proof,
+            "block_header": block_header,
+        }))
+    }
+
     /// Sample this chain's runtime health (#308) from its own block timestamps plus wall-clock now: the
     /// tip's time and median-time-past, and the MTP `window` blocks back, fed to `assess_chain_health`.
     /// Used to refuse locking a taker leg into a stalled or far-slower-than-target chain, whose lock

@@ -75,6 +75,10 @@ pub(crate) enum EngineCmd {
     Swaps(Sender<Vec<SwapView>>),
     /// Full detail of one swap: the static view plus the live chain view. `None` if no such swap.
     Detail([u8; 16], Sender<Option<Value>>),
+    /// SPV proof data for a swap's confirmed locks (#247): raw tx + Merkle proof + block header per
+    /// lock, so an untrusting client can verify the locks on-chain. `None` = no such swap; the inner
+    /// `Err` = an RPC/pruned-node failure building a proof.
+    SpvProof([u8; 16], Sender<Option<Result<Value, String>>>),
     /// The operator reporting ledger (#67): per-swap history plus aggregate totals.
     History(Sender<Value>),
     Take {
@@ -261,6 +265,12 @@ pub(crate) fn handle_engine_cmd(
         EngineCmd::Swaps(reply) => {
             let views = engine.swaps().map(SwapView::of).collect();
             let _ = reply.send(views);
+        }
+        EngineCmd::SpvProof(id, reply) => {
+            let out = engine
+                .spv_proof(id)
+                .map(|r| r.map_err(|e| format!("{e:?}")));
+            let _ = reply.send(out);
         }
         EngineCmd::Detail(id, reply) => {
             // Static view first (ends the swaps() borrow), then the live chain view.
