@@ -343,6 +343,49 @@ fn split_signs_a_coin_held_in_the_daemon_hot_funding_wallet() {
         "the coin is unspent before the split"
     );
 
+    // #314 drain guard: a daemon-signed job must NOT honor a caller-supplied external destination,
+    // otherwise /split/build + /split/submit would move a hot-wallet coin anywhere. The address must come
+    // from a FRESH wallet: importing the coin's descriptors above made every 'w' address ismine on the
+    // funding wallet, so an external address has to be one the funding wallet does not know.
+    xbtc.call("createwallet", json!(["external314"]));
+    let external = xbtc
+        .rpc
+        .wallet("external314")
+        .call("getnewaddress", json!(["", "bech32"]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/build",
+        &token,
+        &format!(r#"{{"sha_coins":[{{"txid":"{sha}","vout":0}}],"dest":"{external}"}}"#),
+    );
+    assert_eq!(code, 200, "build with an external dest failed: {body}");
+    let built_ext: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        built_ext["daemon_signed"],
+        json!(true),
+        "a hot funding-wallet coin is still daemon-signed when an external dest is supplied: {body}"
+    );
+    let decoded = xbtc.call("decodepsbt", json!([built_ext["psbt"].as_str().unwrap()]));
+    let vouts = decoded["tx"]["vout"].as_array().unwrap();
+    assert!(
+        vouts
+            .iter()
+            .all(|o| o["scriptPubKey"]["address"].as_str() != Some(external.as_str())),
+        "the daemon must ignore a caller-supplied external dest for a daemon-signed split: {decoded}"
+    );
+    let out0 = vouts[0]["scriptPubKey"]["address"].as_str().unwrap();
+    assert!(
+        swap.call("getaddressinfo", json!([out0])).unwrap()["ismine"]
+            .as_bool()
+            .unwrap_or(false),
+        "the separated value must return to the funding wallet (output 0 ismine), got {out0}"
+    );
+
     // Build with NO dest: for a daemon-owned coin the daemon must pick a funding-wallet address itself.
     let (code, body) = request(
         &addr,
