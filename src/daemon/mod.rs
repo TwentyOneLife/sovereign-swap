@@ -314,7 +314,9 @@ impl Daemon {
             // Guard against a node assigned to the wrong chain before using it for any funds.
             crate::node::check_chain_pow(&client, chain).map_err(|e| format!("{e:?}"))?;
             match funding.mode {
-                FundingMode::Hot => ChainNode::open(client, &wallet).map_err(|e| format!("{e:?}")),
+                FundingMode::Hot => {
+                    ChainNode::open_hot(client, &wallet).map_err(|e| format!("{e:?}"))
+                }
                 FundingMode::Cold => {
                     let signer_client = connect_client(
                         &funding.signer_endpoint,
@@ -1271,7 +1273,7 @@ impl Daemon {
         if coins.is_empty() {
             return (422, json!({"error": "sha_coins required"}));
         }
-        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, fork_height, wallet_name) = {
+        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, fork_height, wallet_name, xbtc_mode) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1289,14 +1291,37 @@ impl Daemon {
                     "swap-{}",
                     self.identity_seed[..4].to_hex_string(Case::Lower)
                 ),
+                s.xbtc_funding.mode,
             )
         };
         let Some(fee_cfg) = fee_cfg else {
             return (503, json!({"error": "no XBT fee address configured"}));
         };
+        // #301/#310: the split marker is co-signed with the Blake2b funding wallet via
+        // walletprocesspsbt, which needs a KEYED wallet. Only hot funding keeps a keyed wallet; cold /
+        // descriptor-backed funding is watch-only. Refuse up front rather than fall back to a stale
+        // keyed left-over (which would sign the user's balance on the engine host under a cold config).
+        if xbtc_mode != FundingMode::Hot {
+            return (
+                409,
+                json!({"error": "split co-sign needs a keyed (hot) Blake2b funding wallet; split in cold/descriptor-backed mode is not yet supported (#310)"}),
+            );
+        }
         let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        // Resolve the funding wallet name the engine's way, so a hot chain that was once cold targets
+        // the keyed `<base>-hot`, not the watch-only base left behind by the flip (#301).
+        let wallet_name = match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, true)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                return (
+                    502,
+                    json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
+                )
+            }
         };
         let btc = match connect_client(&bn, &bu, &bp, &bca, &tor) {
             Ok(c) => c,
@@ -1466,7 +1491,7 @@ impl Daemon {
         if let Err(e) = crate::split::validate_user_signed(&expected, signed, marker_out) {
             return (400, json!({"error": format!("{e}")}));
         }
-        let (xn, xu, xp, xca, tor, wallet_name) = {
+        let (xn, xu, xp, xca, tor, wallet_name, xbtc_mode) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1478,11 +1503,32 @@ impl Daemon {
                     "swap-{}",
                     self.identity_seed[..4].to_hex_string(Case::Lower)
                 ),
+                s.xbtc_funding.mode,
             )
         };
+        // #301/#310: co-signing the marker needs a KEYED Blake2b funding wallet (walletprocesspsbt).
+        // Refuse up front in cold / descriptor-backed mode rather than sign from a stale keyed
+        // left-over on the engine host.
+        if xbtc_mode != FundingMode::Hot {
+            return (
+                409,
+                json!({"error": "split co-sign needs a keyed (hot) Blake2b funding wallet; split in cold/descriptor-backed mode is not yet supported (#310)"}),
+            );
+        }
         let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
+        };
+        // Resolve the funding name the engine's way (`<base>-hot` after a cold->hot flip, #301).
+        let wallet_name = match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, true)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                return (
+                    502,
+                    json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
+                )
+            }
         };
         let wallet = xbtc.wallet(&wallet_name);
         // Co-sign the marker on the ORIGINAL base64 (never a re-serialized PSBT).

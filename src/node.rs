@@ -340,6 +340,10 @@ pub struct ChainNode {
     /// adds inputs/change/signs. `new_destination` must never be called (config requires a payout
     /// address). False for hot, cold, and descriptor-backed interactive funding.
     output_only: bool,
+    /// The bitcoind wallet name this chain funds from, after Hot/Cold name resolution (#301). Hot
+    /// keeps a keyed wallet here, cold/descriptor-backed a watch-only one; for output-only funding
+    /// there is no funding wallet and this holds the contract watch-wallet name as a placeholder.
+    funding_wallet: String,
 }
 
 fn parse<T: bitcoin::consensus::Decodable>(hex: &Value) -> Result<T, NodeError> {
@@ -454,14 +458,78 @@ fn ensure_account_descriptor(
     }
 }
 
+/// The key-mode of an existing bitcoind wallet by name (#301). `Ok(None)` = no wallet of this name
+/// exists on the node; `Ok(Some(true))` = it exists and holds private keys (a hot funding wallet);
+/// `Ok(Some(false))` = it exists and is watch-only (a cold / descriptor-backed funding wallet). A
+/// wallet on disk but not loaded is loaded so its mode can be read; a wallet that exists but fails
+/// to load is an error, never silently reported as absent.
+fn funding_wallet_mode(rpc: &Client, name: &str) -> Result<Option<bool>, NodeError> {
+    let loaded = rpc.call("listwallets", json!([]))?;
+    let is_loaded = |l: &Value| l.as_array().is_some_and(|a| a.iter().any(|w| w == name));
+    if !is_loaded(&loaded) {
+        let dir = rpc.call("listwalletdir", json!([]))?;
+        let exists = dir["wallets"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| w["name"].as_str() == Some(name)));
+        if !exists {
+            return Ok(None);
+        }
+        // On disk but not loaded: load it to read the mode. A concurrent load (the engine already
+        // opened it) can race us to "already loaded"; tolerate that and read the mode anyway.
+        if rpc.call("loadwallet", json!([name])).is_err()
+            && !is_loaded(&rpc.call("listwallets", json!([]))?)
+        {
+            return Err(NodeError::Unexpected(format!(
+                "funding wallet {name} exists on disk but could not be loaded"
+            )));
+        }
+    }
+    let info = rpc.wallet(name).call("getwalletinfo", json!([]))?;
+    Ok(Some(info["private_keys_enabled"].as_bool() == Some(true)))
+}
+
+/// Resolves the funding-wallet name for the wanted key mode, sidestepping a left-over wallet of the
+/// other mode so a Hot<->Cold reconfiguration never collides on one bitcoind wallet name (#301). The
+/// daemon has no RPC to rename or delete a wallet, so rather than fail on a mismatched left-over it
+/// uses a dedicated name for the wanted mode:
+///
+/// - base absent: base (created fresh in the wanted mode)
+/// - base already in wanted mode: base (reused; a live watch-only install keeps its wallet)
+/// - base in the OTHER mode: `<base>-hot` (want keyed) or `<base>-cold` (want watch-only)
+///
+/// The rule is deterministic given what is on disk, so the engine-open paths and the split service
+/// resolve to the same wallet name with no shared state. `want_keyed` is true for hot funding (a
+/// signing wallet), false for cold / descriptor-backed (a watch-only wallet).
+pub fn resolve_funding_wallet_name(
+    rpc: &Client,
+    base: &str,
+    want_keyed: bool,
+) -> Result<String, NodeError> {
+    Ok(match funding_wallet_mode(rpc, base)? {
+        None => base.to_owned(),
+        Some(keyed) if keyed == want_keyed => base.to_owned(),
+        Some(_) => format!("{base}-{}", if want_keyed { "hot" } else { "cold" }),
+    })
+}
+
 impl ChainNode {
-    /// Opens (or creates) `<name>` for funds and `<name>-watch` for contracts on this node. Hot: the
-    /// funding wallet holds its keys and signs with `WalletSigner`. The cold path is `open_cold`.
-    pub fn open(rpc: Client, name: &str) -> Result<ChainNode, NodeError> {
+    /// Opens `<funding_name>` for funds and `<base>-watch` for contracts on this node, with a
+    /// `WalletSigner` over the funding wallet. The contract watch wallet is ALWAYS keyed off `base`
+    /// (not `funding_name`), so a Hot/Cold funding-wallet rename (#301) never orphans the in-flight
+    /// swaps' contract addresses. `require_keyed` makes a watch-only funding wallet a loud startup
+    /// error (the hot path, where a watch-only wallet could not sign); false leaves the wallet as it
+    /// is, since `open` + `with_signer` legitimately runs a watch-only funding wallet off an external
+    /// signer (design 0012).
+    fn open_with_funding(
+        rpc: Client,
+        base: &str,
+        funding_name: &str,
+        require_keyed: bool,
+    ) -> Result<ChainNode, NodeError> {
         let network = chain_network(&rpc)?;
-        let watch_name = format!("{name}-watch");
+        let watch_name = format!("{base}-watch");
         let loaded = rpc.call("listwallets", json!([]))?;
-        for (wallet, watch_only) in [(name, false), (watch_name.as_str(), true)] {
+        for (wallet, watch_only) in [(funding_name, false), (watch_name.as_str(), true)] {
             if loaded
                 .as_array()
                 .is_some_and(|l| l.iter().any(|w| w == wallet))
@@ -472,7 +540,18 @@ impl ChainNode {
                 rpc.call("createwallet", json!([wallet, watch_only, watch_only]))?;
             }
         }
-        let wallet = rpc.wallet(name);
+        let wallet = rpc.wallet(funding_name);
+        if require_keyed {
+            // The hot funding wallet must hold its keys, or `WalletSigner` cannot sign the lock; fail
+            // loudly at startup rather than later, at swap time.
+            let info = wallet.call("getwalletinfo", json!([]))?;
+            if info["private_keys_enabled"].as_bool() != Some(true) {
+                return Err(NodeError::Unexpected(format!(
+                    "hot funding wallet {funding_name} is watch-only; it must hold its keys to sign \
+                     the funding lock (use cold or descriptor-backed interactive funding instead)."
+                )));
+            }
+        }
         let signer = Box::new(WalletSigner {
             wallet: wallet.clone(),
         });
@@ -483,7 +562,32 @@ impl ChainNode {
             rpc,
             network,
             output_only: false,
+            funding_wallet: funding_name.to_owned(),
         })
+    }
+
+    /// Opens (or creates) `<name>` for funds and `<name>-watch` for contracts on this node, with a
+    /// `WalletSigner`. Mode-agnostic: with a keyed `<name>` it is the hot path; wrapped in
+    /// `with_signer` over a watch-only `<name>` it is the cold/external-signer path (design 0012). The
+    /// daemon's hot funding uses `open_hot`, which adds the #301 name resolution and the keyed guard.
+    pub fn open(rpc: Client, name: &str) -> Result<ChainNode, NodeError> {
+        Self::open_with_funding(rpc, name, name, false)
+    }
+
+    /// The daemon's hot funding path: funds from a KEYED wallet, signing with `WalletSigner`. If the
+    /// base name is a watch-only left-over (a chain flipped from cold/descriptor-backed back to hot),
+    /// do not silently wrap it in a signer that cannot sign (which would fail only later, at swap
+    /// time): fund from a dedicated keyed `<base>-hot` instead, and guard that it is keyed (#301). The
+    /// contract watch wallet stays `<base>-watch`, so in-flight swaps are never orphaned.
+    pub fn open_hot(rpc: Client, name: &str) -> Result<ChainNode, NodeError> {
+        let funding_name = resolve_funding_wallet_name(&rpc, name, true)?;
+        if funding_name != name {
+            eprintln!(
+                "funding: base wallet {name} is watch-only (a cold/descriptor-backed left-over); \
+                 funding hot from {funding_name} instead (#301)."
+            );
+        }
+        Self::open_with_funding(rpc, name, &funding_name, true)
     }
 
     /// Opens the chain for cold funding (design 0012). `<name>` is created watch-only
@@ -528,6 +632,11 @@ impl ChainNode {
         birthday: Option<i64>,
     ) -> Result<ChainNode, NodeError> {
         let network = chain_network(&rpc)?;
+        // Cold / descriptor-backed funds from a WATCH-ONLY wallet. If the base name is a keyed
+        // left-over (a chain flipped from hot), do not refuse to start: fund from a dedicated
+        // watch-only `<base>-cold` and leave the keyed left-over untouched for the operator to sweep
+        // (#301). The daemon has no RPC to rename or delete the left-over wallet.
+        let funding_name = resolve_funding_wallet_name(&rpc, name, false)?;
         let watch_name = format!("{name}-watch");
         let loaded = rpc.call("listwallets", json!([]))?;
         let is_loaded = |w: &str| loaded.as_array().is_some_and(|l| l.iter().any(|v| v == w));
@@ -535,28 +644,44 @@ impl ChainNode {
         // descriptors, the watch wallet tracks the swap contracts. Remember whether the funding
         // wallet was created now, so a restart does not re-import into an existing one.
         let mut funding_created = false;
-        for wallet in [name, watch_name.as_str()] {
+        for wallet in [funding_name.as_str(), watch_name.as_str()] {
             if is_loaded(wallet) || rpc.call("loadwallet", json!([wallet])).is_ok() {
                 continue;
             }
             // disable_private_keys=true, blank=true, passphrase="", avoid_reuse=false,
             // descriptors=true: a blank descriptor wallet that holds no key.
             rpc.call("createwallet", json!([wallet, true, true, "", false, true]))?;
-            if wallet == name {
+            if wallet == funding_name {
                 funding_created = true;
             }
         }
-        let wallet = rpc.wallet(name);
+        let wallet = rpc.wallet(&funding_name);
         // Safety (design 0012): the funding wallet must hold no private key, whether just created,
-        // loaded, or already present. Keys present means a hot wallet was reused under a cold config;
-        // refuse rather than ever sign the user's balance on the engine host.
+        // loaded, or already present. Keys present under the resolved name means an operator created
+        // this exact wallet keyed by hand; refuse rather than ever sign the user's balance on the
+        // engine host. (A keyed BASE left-over is sidestepped above, not signed from.)
         let info = wallet.call("getwalletinfo", json!([]))?;
         if info["private_keys_enabled"].as_bool() != Some(false) {
             return Err(NodeError::Unexpected(format!(
-                "cold funding wallet {name} has private keys enabled; it must be watch-only. \
+                "cold funding wallet {funding_name} has private keys enabled; it must be watch-only. \
                  Refusing to fund from a key on the engine host (recreate it from the account \
                  descriptors)."
             )));
+        }
+        if funding_name != name {
+            // We sidestepped a keyed base left-over. Tell the operator it is still there with its
+            // balance, so coins are never silently stranded (the daemon cannot sweep or remove it).
+            let left_btc = rpc
+                .wallet(name)
+                .call("getbalances", json!([]))
+                .ok()
+                .and_then(|b| b["mine"]["trusted"].as_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "funding: base wallet {name} holds private keys (a hot left-over); funding cold from \
+                 {funding_name} instead. The hot wallet {name} is untouched with {left_btc} still in \
+                 it; sweep it if you want those coins under this cold config (#301)."
+            );
         }
         // Import the receive (external) and change (internal) account descriptors so
         // walletcreatefundedpsbt can select coins and build a change-handling PSBT. Only on a fresh
@@ -585,6 +710,7 @@ impl ChainNode {
             rpc,
             network,
             output_only: false,
+            funding_wallet: funding_name,
         })
     }
 
@@ -614,7 +740,16 @@ impl ChainNode {
             rpc,
             network,
             output_only: true,
+            funding_wallet: watch_name,
         })
+    }
+
+    /// The bitcoind wallet name this chain funds from, after Hot/Cold name resolution (#301): keyed
+    /// for hot, watch-only for cold / descriptor-backed. For output-only funding there is no funding
+    /// wallet, so this returns the contract watch-wallet name as a placeholder; callers that need a
+    /// real funding wallet (e.g. the split co-sign) must first check `is_output_only`.
+    pub fn funding_wallet_name(&self) -> &str {
+        &self.funding_wallet
     }
 
     /// Whether this node funds output-only (design 0032): no funding wallet, the user supplies the

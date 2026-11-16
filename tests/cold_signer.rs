@@ -283,11 +283,16 @@ fn a_cold_lock_is_funded_end_to_end_through_a_remote_signer() {
 
 #[test]
 fn open_cold_refuses_a_funding_wallet_that_holds_keys() {
+    // The design-0012 last-resort refusal: the wallet cold actually funds from must be watch-only. A
+    // keyed BASE left-over is sidestepped to `<base>-cold` (that path is covered in
+    // funding_wallet_naming.rs); here even the resolved `<base>-cold` is keyed (an operator created it
+    // by hand with keys), so cold must refuse rather than ever sign the user's balance on the host.
     let Some((btc, _)) = binaries() else { return };
     let node = Node::start(&btc, None);
     node.mine(1);
-    // A hot wallet (keys enabled) wrongly reused under a cold config.
+    // Both the base and the resolved cold name hold keys.
     ChainNode::open(node.rpc.clone(), "waskeys").unwrap();
+    node.call("createwallet", json!(["waskeys-cold"]));
     let dummy = "wpkh(tpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupfe8yV8ekZ9iQLdM2GQpj1eZ4yZ6Z6Z6Z6/0/*)";
     let err = ChainNode::open_cold(
         node.rpc.clone(),
