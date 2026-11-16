@@ -854,6 +854,12 @@ pub struct SplitState {
     /// signs those out of band). The marker is always daemon-signed and is tracked by the pool, not here.
     #[serde(default)]
     daemon_inputs: HashMap<String, Vec<String>>,
+    /// job_ids whose MARKER is signed by the user, not the daemon (#310): cold / descriptor-backed
+    /// Blake2b funding is watch-only, so the user signs every input, including the lent marker, out of
+    /// band. Absent/not-present means the daemon signs the marker (hot, #314) - `#[serde(default)]` so a
+    /// job persisted before #310 keeps the hot behaviour.
+    #[serde(default)]
+    user_signed_markers: std::collections::HashSet<String>,
     /// Completed splits, newest appended last (#218). `#[serde(default)]` for backward-compatible load.
     #[serde(default)]
     history: Vec<SplitRecord>,
@@ -900,6 +906,17 @@ impl SplitState {
             .unwrap_or(&[])
     }
 
+    /// Record that `job_id`'s marker is signed by the USER, not the daemon (#310, cold/descriptor-backed
+    /// watch-only funding). A hot job never calls this, so the default (absent) means daemon-signed.
+    pub fn set_user_signed_marker(&mut self, job_id: &str) {
+        self.user_signed_markers.insert(job_id.to_owned());
+    }
+
+    /// Whether `job_id`'s marker is signed by the user (#310), i.e. the daemon must NOT co-sign it.
+    pub fn is_user_signed_marker(&self, job_id: &str) -> bool {
+        self.user_signed_markers.contains(job_id)
+    }
+
     /// On a successful broadcast, append a completed-split history entry (#218) from the job's parked
     /// metadata plus the broadcast `txid` and `time`, and drop the metadata. If the metadata is absent
     /// (a job built before this field existed), a minimal entry is still recorded so the split shows.
@@ -932,6 +949,7 @@ impl SplitState {
             self.jobs.remove(&job_id);
             self.meta.remove(&job_id);
             self.daemon_inputs.remove(&job_id);
+            self.user_signed_markers.remove(&job_id);
         }
     }
 
@@ -940,6 +958,7 @@ impl SplitState {
     pub fn finish_job(&mut self, job_id: &str, change_txid: String) -> Option<Marker> {
         self.jobs.remove(job_id);
         self.daemon_inputs.remove(job_id);
+        self.user_signed_markers.remove(job_id);
         self.pool.consume(job_id, change_txid)
     }
 }

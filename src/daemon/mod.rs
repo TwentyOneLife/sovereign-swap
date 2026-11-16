@@ -1413,7 +1413,22 @@ impl Daemon {
         if coins.is_empty() {
             return (422, json!({"error": "sha_coins required"}));
         }
-        let (xn, xu, xp, xca, bn, bu, bp, bca, tor, fee_cfg, fork_height, wallet_name, xbtc_mode) = {
+        let (
+            xn,
+            xu,
+            xp,
+            xca,
+            bn,
+            bu,
+            bp,
+            bca,
+            tor,
+            fee_cfg,
+            fork_height,
+            wallet_name,
+            xbtc_mode,
+            xbtc_output_only,
+        ) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1432,37 +1447,40 @@ impl Daemon {
                     self.identity_seed[..4].to_hex_string(Case::Lower)
                 ),
                 s.xbtc_funding.mode,
+                s.xbtc_funding.is_output_only(),
             )
         };
         let Some(fee_cfg) = fee_cfg else {
             return (503, json!({"error": "no XBT fee address configured"}));
         };
-        // #301/#310: the split marker is co-signed with the Blake2b funding wallet via
-        // walletprocesspsbt, which needs a KEYED wallet. Only hot funding keeps a keyed wallet; cold /
-        // descriptor-backed funding is watch-only. Refuse up front rather than fall back to a stale
-        // keyed left-over (which would sign the user's balance on the engine host under a cold config).
-        if xbtc_mode != FundingMode::Hot {
+        // #301/#310/#314: the split needs a Blake2b funding wallet to lend a chain-exclusive marker, and
+        // (when the wallet is KEYED) to co-sign it. Output-only interactive funding has no wallet at all,
+        // so refuse with a clear message. Hot funding is keyed: the daemon signs the marker, and any coin
+        // it holds (#314). Cold / descriptor-backed interactive funding is watch-only: the user signs
+        // EVERY input, including the marker, out of band (#310).
+        if xbtc_output_only {
             return (
                 409,
-                json!({"error": "split co-sign needs a keyed (hot) Blake2b funding wallet; split in cold/descriptor-backed mode is not yet supported (#310)"}),
+                json!({"error": "output-only Blake2b funding has no wallet to lend a split marker from; use hot or descriptor-backed funding"}),
             );
         }
+        let xbtc_keyed = xbtc_mode == FundingMode::Hot;
         let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
         };
-        // Resolve the funding wallet name the engine's way, so a hot chain that was once cold targets
-        // the keyed `<base>-hot`, not the watch-only base left behind by the flip (#301).
-        let wallet_name = match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, true)
-        {
-            Ok(n) => n,
-            Err(e) => {
-                return (
-                    502,
-                    json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
-                )
-            }
-        };
+        // Resolve the funding wallet name the engine's way: hot targets the keyed `<base>-hot`, cold the
+        // watch-only `<base>-cold`, never the base left behind by a flip (#301).
+        let wallet_name =
+            match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, xbtc_keyed) {
+                Ok(n) => n,
+                Err(e) => {
+                    return (
+                        502,
+                        json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
+                    )
+                }
+            };
         let btc = match connect_client(&bn, &bu, &bp, &bca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("SHA256 node: {e}")})),
@@ -1494,15 +1512,23 @@ impl Daemon {
         // those (the key is on the engine host), so the daemon signs them at co-sign; the rest the user
         // signs out of band. Decide ownership now, at build, and persist it with the job so the submit
         // gate treats exactly this set as daemon-signed.
-        let owned: std::collections::HashSet<(String, u32)> = list_unspent(&wallet)
-            .into_iter()
-            .map(|(t, v, _)| (t, v))
-            .collect();
-        let daemon_owned: Vec<(String, u32)> = coins
-            .iter()
-            .filter(|(t, v)| owned.contains(&(t.clone(), *v)))
-            .cloned()
-            .collect();
+        // Only a KEYED (hot) funding wallet can sign a coin itself. A watch-only (cold) wallet also lists
+        // the coin in listunspent, but cannot sign it, so under cold funding the daemon owns NOTHING to
+        // sign: the user signs every input, including the marker (#310). Deciding this here keeps the
+        // submit gate honest (it never expects the daemon to sign a watch-only input).
+        let daemon_owned: Vec<(String, u32)> = if xbtc_keyed {
+            let owned: std::collections::HashSet<(String, u32)> = list_unspent(&wallet)
+                .into_iter()
+                .map(|(t, v, _)| (t, v))
+                .collect();
+            coins
+                .iter()
+                .filter(|(t, v)| owned.contains(&(t.clone(), *v)))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Keep the flow binary for now (#314): a job is either all user-held or all daemon-held. A mixed
         // job would need both a user signature and our co-sign on different inputs; deferred.
         if !daemon_owned.is_empty() && daemon_owned.len() != coins.len() {
@@ -1591,17 +1617,43 @@ impl Daemon {
                 crate::split::prepare_input(&xbtc, fork_height, &marker.txid, marker.vout)
                     .map_err(|e| (502, json!({"error": format!("marker: {e}")})))?,
             );
-            let change_str = wallet
-                .call("getnewaddress", json!(["", "bech32"]))
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .ok_or((502, json!({"error": "could not get a change address"})))?;
+            // The marker is recovered to a change address of the funding wallet. The address type must
+            // match the wallet's own descriptor (a watch-only cold wallet may hold only one type, and the
+            // node default - legacy on Knots - would error "no legacy addresses available"). Deriving the
+            // type from the active change descriptor makes this work for wpkh, tr, pkh and sh wallets (#310).
+            let change_type = change_address_type(&wallet);
+            let change_str = match wallet.call("getrawchangeaddress", json!([change_type])) {
+                Ok(v) => v
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or((502, json!({"error": "change address was not a string"})))?,
+                Err(e) => {
+                    return Err((
+                        502,
+                        json!({"error": format!("could not get a change address: {e:?}")}),
+                    ))
+                }
+            };
             let change =
                 parse_addr(&change_str).ok_or((502, json!({"error": "bad change address"})))?;
             let net_fee = estimate_network_fee(&wallet, prepared.len());
             let psbt =
                 crate::split::build_split_psbt(&prepared, &dest, &fee_addr, &change, net_fee)
                     .map_err(|e| (422, json!({"error": format!("{e}")})))?;
+            // #310: the PSBT is built directly, so its inputs carry no BIP32 derivation. A watch-only
+            // (cold) funding wallet is signed by the USER's own wallet or an air-gapped device (Sparrow,
+            // SeedSigner), which finds keys by derivation path, so add the derivations the funding wallet
+            // knows WITHOUT signing (sign=false). The unsigned tx is unchanged, so the byte-for-byte
+            // submit gate still holds. Hot funding signs by script, so it needs none of this.
+            let psbt = if xbtc_keyed {
+                psbt
+            } else {
+                wallet
+                    .call("walletprocesspsbt", json!([psbt, false, "DEFAULT", true]))
+                    .ok()
+                    .and_then(|v| v["psbt"].as_str().map(str::to_owned))
+                    .ok_or((502, json!({"error": "could not add signing metadata for the cold funding wallet"})))?
+            };
             let unsigned_hex = psbt_unsigned_hex(&psbt)
                 .ok_or((500, json!({"error": "could not read built tx"})))?;
             let protected_sat: u64 = prepared
@@ -1643,6 +1695,11 @@ impl Daemon {
                     .map(|(t, v)| format!("{t}:{v}"))
                     .collect(),
             );
+            // #310: under watch-only (cold) funding the user signs the marker too, so the daemon must not
+            // co-sign at submit. Record it; a hot job never does, keeping the #314 behaviour by default.
+            if !xbtc_keyed {
+                st.set_user_signed_marker(&job_id);
+            }
             let _ = st.save(&self.data_dir.join("split.json"));
         }
         (
@@ -1671,7 +1728,7 @@ impl Daemon {
         let (Some(job_id), Some(signed)) = (req["job_id"].as_str(), req["psbt"].as_str()) else {
             return (422, json!({"error": "job_id and psbt required"}));
         };
-        let (expected, marker, owned_inputs) = {
+        let (expected, marker, owned_inputs, user_signs_marker) = {
             let st = self.split.lock().unwrap();
             let Some(expected) = st.job(job_id).map(str::to_owned) else {
                 return (410, json!({"error": "unknown or expired job"}));
@@ -1679,7 +1736,12 @@ impl Daemon {
             let Some(marker) = st.pool.reserved_marker(job_id) else {
                 return (410, json!({"error": "no marker reserved for this job"}));
             };
-            (expected, marker, st.daemon_inputs(job_id).to_vec())
+            (
+                expected,
+                marker,
+                st.daemon_inputs(job_id).to_vec(),
+                st.is_user_signed_marker(job_id),
+            )
         };
         let marker_out = match marker.txid.parse() {
             Ok(txid) => bitcoin::OutPoint {
@@ -1688,10 +1750,14 @@ impl Daemon {
             },
             Err(_) => return (500, json!({"error": "bad marker txid in state"})),
         };
-        // The inputs the daemon signs: always the lent marker, plus (since #314) any SHA-Coin we recorded
-        // at build as held in our own hot funding wallet. The submit gate requires exactly these to be
-        // unsigned (we add their signatures) and every other input to be user-ALL-signed.
-        let mut daemon_inputs = vec![marker_out];
+        // The inputs the DAEMON signs: under hot funding, the lent marker plus (since #314) any SHA-Coin
+        // held in our own hot wallet; under cold / descriptor-backed funding (#310) the wallet is
+        // watch-only, so the daemon signs NOTHING and the marker is one of the user-signed inputs. The
+        // gate requires exactly the daemon's inputs to be unsigned and every other input user-ALL-signed.
+        let mut daemon_inputs: Vec<bitcoin::OutPoint> = Vec::new();
+        if !user_signs_marker {
+            daemon_inputs.push(marker_out);
+        }
         for coin in &owned_inputs {
             let Some(op) = coin
                 .split_once(':')
@@ -1705,7 +1771,7 @@ impl Daemon {
         if let Err(e) = crate::split::validate_user_signed(&expected, signed, &daemon_inputs) {
             return (400, json!({"error": format!("{e}")}));
         }
-        let (xn, xu, xp, xca, tor, wallet_name, xbtc_mode) = {
+        let (xn, xu, xp, xca, tor, wallet_name) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1717,50 +1783,47 @@ impl Daemon {
                     "swap-{}",
                     self.identity_seed[..4].to_hex_string(Case::Lower)
                 ),
-                s.xbtc_funding.mode,
             )
         };
-        // #301/#310: co-signing the marker needs a KEYED Blake2b funding wallet (walletprocesspsbt).
-        // Refuse up front in cold / descriptor-backed mode rather than sign from a stale keyed
-        // left-over on the engine host.
-        if xbtc_mode != FundingMode::Hot {
-            return (
-                409,
-                json!({"error": "split co-sign needs a keyed (hot) Blake2b funding wallet; split in cold/descriptor-backed mode is not yet supported (#310)"}),
-            );
-        }
         let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),
         };
-        // Resolve the funding name the engine's way (`<base>-hot` after a cold->hot flip, #301).
-        let wallet_name = match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, true)
-        {
-            Ok(n) => n,
-            Err(e) => {
-                return (
-                    502,
-                    json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
-                )
+        // Produce the PSBT to finalize. Hot (#314): the daemon co-signs its inputs (the marker, and any
+        // coin it holds) with the keyed funding wallet, on the ORIGINAL base64 (never a re-serialized
+        // PSBT, so a 0x21 fork sighash byte is not rewritten). Cold (#310): the daemon signs nothing - the
+        // user already signed every input, including the marker - so the submitted PSBT is finalized as is.
+        let cosigned: String = if daemon_inputs.is_empty() {
+            signed.to_owned()
+        } else {
+            let wallet_name =
+                match crate::node::resolve_funding_wallet_name(&xbtc, &wallet_name, true) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return (
+                            502,
+                            json!({"error": format!("resolve Blake2b funding wallet: {e:?}")}),
+                        )
+                    }
+                };
+            let wallet = xbtc.wallet(&wallet_name);
+            let processed = match wallet.call("walletprocesspsbt", json!([signed])) {
+                Ok(v) => v,
+                Err(e) => return (502, json!({"error": format!("co-sign: {e:?}")})),
+            };
+            match processed["psbt"].as_str() {
+                Some(p) => p.to_owned(),
+                None => return (502, json!({"error": "co-sign returned no psbt"})),
             }
         };
-        let wallet = xbtc.wallet(&wallet_name);
-        // Co-sign the marker on the ORIGINAL base64 (never a re-serialized PSBT).
-        let processed = match wallet.call("walletprocesspsbt", json!([signed])) {
-            Ok(v) => v,
-            Err(e) => return (502, json!({"error": format!("co-sign: {e:?}")})),
-        };
-        let Some(psbt2) = processed["psbt"].as_str() else {
-            return (502, json!({"error": "co-sign returned no psbt"}));
-        };
-        // #314 backstop: after we co-sign, EVERY input (marker, any hot funding-wallet coin we just
-        // signed, and the user's) must carry an ALL-family signature before we broadcast. The
-        // byte-for-byte check does not cover per-input sighash fields, which the submitter controls, so a
-        // daemon-owned input accepted as unsigned above is held to the same no-ANYONECANPAY bar here.
-        if let Err(e) = crate::split::verify_cosigned_all_family(psbt2) {
+        // Backstop (#314): before broadcast, EVERY input (the daemon's and the user's) must carry an
+        // ALL-family signature. The byte-for-byte check does not cover per-input sighash fields, which the
+        // submitter controls, so a daemon-owned input accepted as unsigned above is held to the same
+        // no-ANYONECANPAY bar here, and so is every user-signed input under cold funding.
+        if let Err(e) = crate::split::verify_cosigned_all_family(&cosigned) {
             return (400, json!({"error": format!("{e}")}));
         }
-        let finalized = match wallet.call("finalizepsbt", json!([psbt2])) {
+        let finalized = match xbtc.call("finalizepsbt", json!([cosigned])) {
             Ok(v) => v,
             Err(e) => return (502, json!({"error": format!("finalize: {e:?}")})),
         };
@@ -2448,6 +2511,34 @@ fn list_unspent(wallet: &Client) -> Vec<(String, u32, u64)> {
             ))
         })
         .collect()
+}
+
+/// The `getrawchangeaddress`/`getnewaddress` address-type matching the wallet's own active change
+/// descriptor, so a change address is derivable whatever the descriptor is. A watch-only (cold) funding
+/// wallet may hold only one type, and the node default (legacy on Knots) would error on a wpkh/tr wallet;
+/// a keyed (hot) wallet holds all four, so any type works. Falls back to `bech32` (the common wpkh case).
+fn change_address_type(wallet: &Client) -> &'static str {
+    let listed = wallet
+        .call("listdescriptors", json!([]))
+        .unwrap_or(Value::Null);
+    let desc = listed["descriptors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|d| {
+            d["internal"].as_bool().unwrap_or(false) && d["active"].as_bool().unwrap_or(false)
+        })
+        .and_then(|d| d["desc"].as_str())
+        .unwrap_or("");
+    if desc.starts_with("tr(") {
+        "bech32m"
+    } else if desc.starts_with("sh(") {
+        "p2sh-segwit"
+    } else if desc.starts_with("pkh(") {
+        "legacy"
+    } else {
+        "bech32" // wpkh/wsh and the default
+    }
 }
 
 /// Classify a coin by its funding txid on the Blake2b node (for the marker auto-scan).

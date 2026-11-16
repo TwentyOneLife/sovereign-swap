@@ -431,3 +431,134 @@ fn split_signs_a_coin_held_in_the_daemon_hot_funding_wallet() {
         "SHA256 must reject the daemon-signed split (missing marker input)"
     );
 }
+
+/// Pick the wpkh receive + change public descriptors from a `listdescriptors` result.
+fn wpkh_descriptors(listed: &Value) -> (String, String) {
+    let mut receive = None;
+    let mut change = None;
+    for d in listed["descriptors"].as_array().unwrap() {
+        let desc = d["desc"].as_str().unwrap_or("");
+        if desc.starts_with("wpkh(") {
+            if d["internal"].as_bool().unwrap_or(false) {
+                change = Some(desc.to_owned());
+            } else {
+                receive = Some(desc.to_owned());
+            }
+        }
+    }
+    (
+        receive.expect("a wpkh receive descriptor"),
+        change.expect("a wpkh change descriptor"),
+    )
+}
+
+/// #310: a split in cold / descriptor-backed (watch-only) Blake2b funding. The daemon signs NOTHING; the
+/// user's own wallet signs every input, including the lent marker, and the daemon only builds, validates,
+/// finalizes and broadcasts. Proven through the real routes with an Interactive descriptor-backed funding
+/// wallet (watch-only, no external signer), which exercises the same `xbtc_keyed = false` path as Cold.
+#[test]
+fn split_in_descriptor_backed_cold_funding_is_user_signed() {
+    const FORK: u32 = 110;
+    let Some(pair) = ForkedPair::start(FORK) else {
+        return;
+    };
+    let btc = &pair.btc;
+    let xbtc = &pair.xbtc;
+
+    let relay = RelayServer::new(RelayConfig::default())
+        .spawn("127.0.0.1:0")
+        .unwrap();
+    let fee_addr = xbtc.new_bech32_address();
+
+    // 'w' on xbtc is the USER's wallet: it holds the private keys and the pre-fork coin. The daemon's
+    // Blake2b funding is configured WATCH-ONLY from 'w's public descriptors (birthday 0 so it rescans and
+    // sees the existing coins), so the funding wallet watches 'w's coins but cannot sign them.
+    let listed = xbtc
+        .rpc
+        .wallet("w")
+        .call("listdescriptors", json!([]))
+        .unwrap();
+    let (recv, chg) = wpkh_descriptors(&listed);
+
+    let dir = std::env::temp_dir().join(format!(
+        "sovswap-split-cold-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = format!(
+        r#"{{"btc_node":"http://127.0.0.1:{bp}","xbtc_node":"http://127.0.0.1:{xp}","relays":["{relay}"],
+            "signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+            "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
+            "fee_enabled":true,"fee_xbtc_address":"{fee_addr}","split_fork_height":{FORK},
+            "xbtc_funding":{{"mode":"interactive","descriptor_receive":"{recv}","descriptor_change":"{chg}","funding_birthday":0}}}}"#,
+        bp = btc.rpc_port,
+        xp = xbtc.rpc_port,
+    );
+    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+    let (_, status) = request(&addr, "GET", "/status", &token, "");
+    assert!(
+        status.contains("\"engine\":true"),
+        "engine with cold (descriptor-backed) Blake2b funding did not start: {status}"
+    );
+
+    let sha = pair.knots_sha_coin_txid();
+    // Cold funding needs a user-chosen destination (the daemon signs nothing and picks nothing).
+    let dest = xbtc.new_bech32_address();
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/build",
+        &token,
+        &format!(r#"{{"sha_coins":[{{"txid":"{sha}","vout":0}}],"dest":"{dest}"}}"#),
+    );
+    assert_eq!(code, 200, "cold build failed: {body}");
+    let built: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        built["daemon_signed"],
+        json!(false),
+        "cold / descriptor-backed funding is user-signed, not daemon-signed: {body}"
+    );
+    let job_id = built["job_id"].as_str().unwrap();
+    let psbt = built["psbt"].as_str().unwrap();
+
+    // The user ('w') signs EVERY input, including the lent marker (the funding wallet cannot).
+    let signed = xbtc
+        .rpc
+        .wallet("w")
+        .call("walletprocesspsbt", json!([psbt]))
+        .unwrap();
+    assert_eq!(
+        signed["complete"],
+        json!(true),
+        "the user's wallet fully signs the cold split, marker included: {signed}"
+    );
+    let signed_psbt = signed["psbt"].as_str().unwrap();
+
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/submit",
+        &token,
+        &format!(r#"{{"job_id":"{job_id}","psbt":"{signed_psbt}"}}"#),
+    );
+    assert_eq!(code, 200, "cold submit failed: {body}");
+    let out: Value = serde_json::from_str(&body).unwrap();
+    let txid = out["txid"].as_str().unwrap();
+
+    // The user-signed split spent the coin and is non-replayable: SHA256 rejects it (missing marker).
+    assert!(
+        xbtc.call("gettxout", json!([sha, 0])).is_null(),
+        "the pre-fork coin must be spent by the user-signed split"
+    );
+    let hex = xbtc.call("getrawtransaction", json!([txid]));
+    let hex = hex.as_str().expect("split tx is on the Blake2b node");
+    let reject = btc.call("testmempoolaccept", json!([[hex]]));
+    assert_eq!(
+        reject[0]["allowed"],
+        json!(false),
+        "SHA256 must reject the cold split (missing marker input)"
+    );
+}
