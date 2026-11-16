@@ -872,7 +872,13 @@ function explorerTx(chain, lock) {
   const settled = lock.spent || (confs != null && (!need || confs >= need));
   const color = settled ? "var(--ok)" : confs == null ? "var(--dim)" : "var(--orange)";
   const state = `${count} · ${lock.spent ? "spent" : "locked"}`;
-  return `${explorerLink(chain, lock.txid)}<br><span style="color:${color}">${escapeHtml(state)}</span>`;
+  // #309: the required depth the engine enforces is a value-based security FLOOR (deeper for larger
+  // swaps), which can exceed the configured btc_conf/xbtc_conf; label it so a user who set 2 and sees 6
+  // understands why. The setting raises this floor, never lowers it.
+  const depthTitle = need
+    ? `Requires ${need} confirmation(s): a value-based security floor for this amount (low-hashrate reorg safety). Your btc_conf/xbtc_conf can raise this, never lower it below the floor.`
+    : "";
+  return `${explorerLink(chain, lock.txid)}<br><span style="color:${color}" title="${escapeHtml(depthTitle)}">${escapeHtml(state)}</span>`;
 }
 
 // History / ledger (#67): the daemon derives per-swap entries + totals from its own records at
