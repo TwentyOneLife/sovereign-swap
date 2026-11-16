@@ -23,17 +23,18 @@ struct Minted {
 /// Mints a self-signed CA and a `127.0.0.1` leaf (IP SAN) signed by it, mirroring the StartOS shape
 /// (a self-signed Root CA and a leaf with an IP SAN) the client must trust on the LAN.
 fn mint() -> Minted {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = ca_params.self_signed(&ca_key).unwrap();
 
+    let issuer = Issuer::new(ca_params, ca_key);
     let leaf_key = KeyPair::generate().unwrap();
     // A string that parses as an IP becomes an IP SAN in rcgen, matching the live cert.
     let leaf_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-    let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
 
     Minted {
         ca_pem: ca.pem(),
