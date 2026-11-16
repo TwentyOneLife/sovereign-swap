@@ -16,7 +16,8 @@ use crate::policy::{Policy, PolicyError};
 use crate::silentpayments;
 use crate::store::write_atomic;
 use crate::swap::{
-    Action, BidError, Chain, ChainView, FeeProof, FeeState, Message, Offer, Phase, Role, Swap,
+    Action, BidError, Chain, ChainView, FeeProof, FeeState, LockView, Message, Offer, Phase, Role,
+    Swap,
 };
 use crate::transport::Transport;
 
@@ -2032,6 +2033,49 @@ impl<T: Transport> Engine<T> {
             .iter()
             .find(|r| r.swap.id == id)
             .map(|r| self.view(r))
+    }
+
+    /// SPV proof data for a swap's confirmed locks (#247): for each lock that has reached a block, the
+    /// raw tx + a Merkle proof + the block header, so a client can verify the lock on-chain without
+    /// trusting this daemon. `None` if no such swap; a lock not yet confirmed is `null` (nothing to
+    /// prove yet). An RPC/pruned-node failure propagates as the inner `Err`.
+    pub fn spv_proof(&self, id: [u8; 16]) -> Option<Result<serde_json::Value, EngineError>> {
+        self.records
+            .iter()
+            .find(|r| r.swap.id == id)
+            .map(|r| self.spv_for_record(r))
+    }
+
+    fn spv_for_record(&self, record: &Record) -> Result<serde_json::Value, EngineError> {
+        let view = self.view(record)?;
+        let maker_chain = record.swap.offer.maker_chain;
+        Ok(serde_json::json!({
+            "maker_lock": self.lock_spv(maker_chain, &view.maker_lock)?,
+            "taker_lock": self.lock_spv(maker_chain.other(), &view.taker_lock)?,
+        }))
+    }
+
+    fn lock_spv(
+        &self,
+        chain: Chain,
+        lock: &Option<LockView>,
+    ) -> Result<serde_json::Value, EngineError> {
+        match lock
+            .as_ref()
+            .and_then(|l| l.confirmed_height.map(|h| (l.outpoint, h)))
+        {
+            Some((outpoint, height)) => {
+                let mut proof = self.nodes[&chain].spv_proof(outpoint, height)?;
+                // Name the chain so the client applies the right PoW (BTC verifies the header under
+                // SHA256d, xBTC under BLAKE2b) when checking the proof (#247).
+                proof["chain"] = serde_json::json!(match chain {
+                    Chain::Btc => "btc",
+                    Chain::Xbtc => "xbtc",
+                });
+                Ok(proof)
+            }
+            None => Ok(serde_json::Value::Null),
+        }
     }
 
     fn view(&self, record: &Record) -> Result<ChainView, EngineError> {

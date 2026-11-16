@@ -809,6 +809,13 @@ impl Daemon {
             }
             ("POST", "/commitments") => self.post_commitments(&req.body),
             ("GET", "/commitments") => self.get_commitments(),
+            ("GET", p)
+                if p.starts_with("/swaps/")
+                    && p.ends_with("/spv")
+                    && valid_id(path_id(p, "/swaps/", "/spv")) =>
+            {
+                self.get_swap_spv(path_id(p, "/swaps/", "/spv"))
+            }
             // A bounded dynamic path. Kept strict so nothing is mistaken for a file to serve.
             ("GET", p) if p.starts_with("/swaps/") && valid_id(&p[7..]) => self.get_swap(&p[7..]),
             ("GET", p) if p.starts_with("/offers/") || p.starts_with("/swaps/") => {
@@ -1980,6 +1987,24 @@ impl Daemon {
         }
         match self.engine_call(move |reply| EngineCmd::Detail(id, reply)) {
             Ok(Some(detail)) => (200, detail),
+            Ok(None) => (404, json!({"error": "no such swap"})),
+            Err(e) => (503, json!({ "error": e })),
+        }
+    }
+
+    /// SPV proof data for a swap's confirmed locks (#247), for a client that does not trust this
+    /// daemon: raw tx + Merkle proof + block header per lock. 404 if no such swap, 502 if a proof
+    /// could not be built (e.g. the block was pruned).
+    fn get_swap_spv(&self, id_hex: &str) -> (u16, Value) {
+        let Ok(id) = <[u8; 16]>::from_hex(id_hex) else {
+            return (404, json!({"error": "no such swap"}));
+        };
+        if !self.engine_running() {
+            return Self::not_running();
+        }
+        match self.engine_call(move |reply| EngineCmd::SpvProof(id, reply)) {
+            Ok(Some(Ok(proof))) => (200, proof),
+            Ok(Some(Err(e))) => (502, json!({ "error": e })),
             Ok(None) => (404, json!({"error": "no such swap"})),
             Err(e) => (503, json!({ "error": e })),
         }
