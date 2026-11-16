@@ -66,13 +66,13 @@ wallet you are already safe and need no service.
 - The submit step requires the submitted transaction to be byte-for-byte the one we built, and the user's
   inputs to be signed with an ALL-family sighash — never ANYONECANPAY/NONE/SINGLE, which could be lifted
   into a transaction funded on the other chain.
-- Inputs the service signs itself — always the lent marker, and (since #314) any coin held in its own hot
-  funding wallet, decided at build time and persisted with the job — must be left **unsigned** at submit;
+- Inputs the service signs itself, the lent marker always and (since #314) any coin held in its own hot
+  funding wallet, decided at build time and persisted with the job, must be left **unsigned** at submit;
   the service adds the only signatures on them. After co-signing, **every** input (the service's included)
   is re-checked for an ALL-family signature before broadcast: the byte-for-byte check does not cover
   per-input sighash fields, which whoever submits the PSBT controls.
-- When any input is service-owned, the service also chooses the destination itself — a fresh address in its
-  own funding wallet — and ignores any caller-supplied one (#314). Otherwise `/split/build` plus
+- When any input is service-owned, the service also chooses the destination itself, a fresh address in its
+  own funding wallet, and ignores any caller-supplied one (#314). Otherwise `/split/build` plus
   `/split/submit` would be a path to move any hot-wallet coin to an arbitrary address (for anyone holding
   the GUI token, or a same-origin script); and the separated value must return to the funding wallet for
   the funding view's safe balance to cover the leg. A job is all user-held or all service-held, never a mix.
@@ -102,6 +102,17 @@ never counted safe), and the client warns, and offers a split first, only when t
 AND the safe balance cannot cover the leg. Output-only funding has no wallet to survey, so the guard is
 the only protection there. Deliberately NOT ancestry classification: a pre-fork coin already spent or
 split on the other chain is no longer replayable, and only the guard's own predicate agrees with the
-backstop. Co-signing the marker needs hot (keyed) Blake2b funding; cold/descriptor-backed funding cannot
-co-sign yet (#310). A flagged coin the user holds, they sign; a flagged coin in the service's own hot
-funding wallet, the service signs along with the marker (#314).
+backstop. How the marker is signed follows the Blake2b funding mode:
+
+- **Hot (keyed wallet):** the service co-signs the marker, and any coin held in its own hot wallet (#314).
+- **Cold / descriptor-backed interactive (watch-only wallet):** the service signs nothing; the user's own
+  wallet or air-gapped device signs **every** input, the marker included (#310). The built PSBT is passed
+  once through the watch-only wallet with `walletprocesspsbt(sign=false, bip32derivs=true)` so a
+  derivation-path signer (SeedSigner, a hardware wallet) can find its keys; the unsigned tx is unchanged,
+  so the byte-for-byte gate still holds. The marker's recovered change is a change address of the funding
+  wallet (`getrawchangeaddress`, so it works whatever the descriptor type).
+- **Output-only interactive (no wallet):** refused, there is no wallet to lend a marker from.
+
+In cold mode the lent marker is one of the operator's own coins, so the anti-reuse taint still applies:
+a funding wallet holding a single Blake2b-Coin can split once, then needs another Blake2b-Coin to serve as
+the next marker (same as hot).
