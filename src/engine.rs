@@ -890,6 +890,27 @@ impl<T: Transport> Engine<T> {
         serde_json::json!({ "btc": bal(Chain::Btc), "xbtc": bal(Chain::Xbtc) })
     }
 
+    /// Per-chain runtime health (#308): tip age, measured pace, and whether the chain is stalled or
+    /// running far slower than target. Surfaced in `/status` so the operator can see a degraded (or a
+    /// clock-skewed) chain; the taker-fund guard reads the same signal to refuse locking into one.
+    pub fn chain_health_json(&self) -> serde_json::Value {
+        let h = |chain: Chain| match self
+            .node(chain)
+            .chain_health(chain.target_block_secs(), crate::swap::PACE_WINDOW)
+        {
+            Ok(h) => serde_json::json!({
+                "tip_age_secs": h.tip_age_secs,
+                "pace_secs": h.pace_secs,
+                "target_secs": chain.target_block_secs(),
+                "stalled": h.stalled,
+                "slow": h.slow,
+                "ok": h.ok(),
+            }),
+            Err(_) => serde_json::Value::Null,
+        };
+        serde_json::json!({ "btc": h(Chain::Btc), "xbtc": h(Chain::Xbtc) })
+    }
+
     /// Our own live offers paired with when each was first posted (unix secs), for the My-offers view
     /// (#264). `None` for an offer posted before the `posted_at` field existed, shown as "unknown".
     pub fn own_offers_with_time(&self) -> Vec<(Offer, Option<u64>)> {
@@ -1099,6 +1120,13 @@ impl<T: Transport> Engine<T> {
                 self.records[i].swap.taker_part,
             ),
         };
+        // #308: do not broadcast a taker lock into a stalled or far-slower-than-target chain (the
+        // parked/interactive path, mirroring the direct-fund guard in `act`). Refuse retryably so the
+        // parked PSBT survives and the user resubmits once the chain recovers; decide_taker's margin gate
+        // abandons the swap otherwise. Fails closed on an unreadable chain. The maker is not gated.
+        if self.records[i].swap.role == Role::Taker && !self.taker_chain_ok(own_chain) {
+            return Err(EngineError::NotYetFundable);
+        }
         // The replay guard checks the signed inputs against the OTHER chain, the same lookup target
         // `fund()` uses at swap time (#313). Output-only funding has no daemon wallet, so this is its
         // only replay protection.
@@ -2338,6 +2366,20 @@ impl<T: Transport> Engine<T> {
         )
     }
 
+    /// #308: is `chain` healthy enough to lock a TAKER leg into, i.e. not stalled and not running far
+    /// slower than its target block time? A taker's lock duration is reserved in the maker's budget
+    /// assuming the target pace (`blocks_as`), so locking into a degraded chain lets the lock outlast
+    /// that budget in wall-clock and a fixed-height maker refund mature while the taker leg is still
+    /// claimable. Fails CLOSED: a chain whose health cannot be read is treated as not ok, so a taker
+    /// that cannot verify its own lock chain does not lock into it. Only the taker is gated (it is the
+    /// party at risk); this does not touch the maker's secret logic or any in-flight swap.
+    fn taker_chain_ok(&self, chain: Chain) -> bool {
+        matches!(
+            self.nodes[&chain].chain_health(chain.target_block_secs(), crate::swap::PACE_WINDOW),
+            Ok(h) if h.ok()
+        )
+    }
+
     fn act(&mut self, i: usize, action: Action) -> Result<(), EngineError> {
         let record = self.records[i].clone();
         let swap = &record.swap;
@@ -2361,6 +2403,13 @@ impl<T: Transport> Engine<T> {
             Action::Fund => match record.funding {
                 Some(tx) => (own_chain, tx, None),
                 None => {
+                    // #308: never lock a TAKER leg into a stalled or far-slower-than-target chain; its
+                    // lock would outlast the maker's reserved budget and permit a both-legs collect. Skip
+                    // this tick (the swap stays Locking; decide_taker's margin gate abandons it if the
+                    // chain never recovers). Fail closed on an unreadable chain. The maker is not gated.
+                    if swap.role == Role::Taker && !self.taker_chain_ok(own_chain) {
+                        return Ok(());
+                    }
                     // E2 (0017): parked awaiting the user's funding signature? Do nothing until they
                     // submit it via submit_signed_lock. Never rebuild a parked lock: a fresh
                     // walletcreatefundedpsbt could pick different inputs and strand the signature.

@@ -80,6 +80,73 @@ pub(crate) fn blocks_as(count: u32, from: Chain, to: Chain) -> u32 {
     u32::try_from(scaled).unwrap_or(u32::MAX).max(count)
 }
 
+/// Blocks the taker-chain pace is measured over (#308). ~24 keeps the Poisson noise near 20%, so a
+/// healthy-but-variable chain does not trip the slow-pace check.
+pub const PACE_WINDOW: u32 = 24;
+/// Refuse a take when the taker chain's measured pace exceeds its target by more than this percent.
+/// Conservative (+50%): well above the ~20% window noise, and catches the sustained slowdown that
+/// erodes the cross-chain timelock margin (the operator can tighten/loosen this later).
+pub const PACE_TOL_PCT: u64 = 50;
+/// Halt threshold: the tip is "stalled" when no block has arrived for this many target intervals.
+pub const HALT_FACTOR: i64 = 7;
+
+/// Runtime health of a chain, from its own block timestamps, for the taker-chain stall guard (#308).
+/// The timelock math (`blocks_as`) reserves the counterparty's budget assuming the target block time, so
+/// a taker locking into a chain running far slower than target lets its lock outlast that budget in
+/// wall-clock: the maker's fixed-height refund can mature while the taker leg is still claimable, a
+/// both-legs-collectable timelock break. This refuses to START a lock into an already-degraded chain; it
+/// does NOT mitigate a slowdown that begins AFTER the taker has locked (that needs no in-flight change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainHealth {
+    /// Wall-clock seconds since the tip block. Signed: a regtest burst can put the tip ahead of `now`.
+    pub tip_age_secs: i64,
+    /// Measured average inter-block interval over `PACE_WINDOW`, or `None` with too few blocks.
+    pub pace_secs: Option<u64>,
+    /// No block for longer than the halt threshold.
+    pub stalled: bool,
+    /// Recent pace slower than target * (1 + tol): a sustained slowdown.
+    pub slow: bool,
+}
+
+impl ChainHealth {
+    /// Safe to lock a taker leg into: neither halted nor sustained-slow.
+    pub fn ok(self) -> bool {
+        !self.stalled && !self.slow
+    }
+}
+
+/// Assess a chain's health from timestamps only (no host-clock dependence beyond `now`). `tip_time` and
+/// the two median-time-past samples are block timestamps; `window` is how many blocks apart the MTP
+/// samples are (`PACE_WINDOW`). All arithmetic is signed so a regtest burst (tip ahead of `now`, or MTP
+/// not yet advanced) never panics nor false-refuses. The halt check uses the tip time (how long since the
+/// last block); the pace check uses the MTP pair (a single skewed block barely moves a median), so a
+/// fresh halt, whose last `window` blocks are pre-halt and look normal, is still caught by the halt check.
+pub fn assess_chain_health(
+    now: i64,
+    tip_time: i64,
+    tip_mtp: i64,
+    mtp_window_back: i64,
+    window: u32,
+    target_secs: u32,
+) -> ChainHealth {
+    let target = i64::from(target_secs);
+    let tip_age_secs = now - tip_time;
+    let stalled = tip_age_secs > HALT_FACTOR * target;
+    let pace_secs = if window > 0 && tip_mtp > mtp_window_back {
+        Some(((tip_mtp - mtp_window_back) as u64) / u64::from(window))
+    } else {
+        None
+    };
+    let limit = (u64::from(target_secs) * (100 + PACE_TOL_PCT)) / 100;
+    let slow = pace_secs.map(|p| p > limit).unwrap_or(false);
+    ChainHealth {
+        tip_age_secs,
+        pace_secs,
+        stalled,
+        slow,
+    }
+}
+
 /// The default smallest swap leg: below this a swap output is not worth making, and it keeps both
 /// sides clear of dust. The runtime value is configurable (daemon setting `min_swap_sat`, threaded
 /// into the engine) and defaults to this; the pure state machine takes it as an input, never a global.
@@ -609,6 +676,38 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::Txid;
+
+    #[test]
+    fn chain_health_catches_halt_and_slow_pace_without_false_positives() {
+        let target = 780u32; // xBTC
+        let n = PACE_WINDOW;
+        let now = 1_000_000i64;
+        let span = |mult_pct: i64| (i64::from(target) * mult_pct / 100) * i64::from(n);
+
+        // Healthy: fresh tip, pace ~ target.
+        let h = assess_chain_health(now, now - 100, now - 100, now - 100 - span(100), n, target);
+        assert!(h.ok() && !h.stalled && !h.slow, "healthy: {h:?}");
+
+        // Halted: no block for 8x target (tip old), even though the pre-halt window looks normal.
+        let old = now - 8 * i64::from(target);
+        let h = assess_chain_health(now, old, old, old - span(100), n, target);
+        assert!(h.stalled && !h.ok(), "halt: {h:?}");
+
+        // Sustained slow pace at 2x target, but a recent tip (not halted): refused.
+        let h = assess_chain_health(now, now - 100, now - 100, now - 100 - span(200), n, target);
+        assert!(h.slow && !h.stalled && !h.ok(), "slow: {h:?}");
+
+        // 1.45x target is within the +50% tolerance: healthy (no false positive on variance).
+        let h = assess_chain_health(now, now - 100, now - 100, now - 100 - span(145), n, target);
+        assert!(!h.slow && h.ok(), "within tolerance: {h:?}");
+
+        // Regtest burst: tip ahead of `now`. Signed math, no panic, not stalled.
+        let h = assess_chain_health(now, now + 500, now + 500, now + 500 - span(100), n, target);
+        assert!(
+            h.tip_age_secs < 0 && !h.stalled && h.ok(),
+            "tip ahead: {h:?}"
+        );
+    }
 
     #[test]
     fn offer_expiry_is_honoured() {

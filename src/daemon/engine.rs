@@ -129,6 +129,8 @@ pub(crate) enum EngineCmd {
     /// #295: per-chain funding-wallet balances (spendable sats, or null for output-only / RPC error),
     /// for the funding-readiness display.
     FundingBalances(Sender<Value>),
+    /// Per-chain runtime health for `/status` (#308): tip age, pace, stalled/slow flags.
+    ChainHealth(Sender<Value>),
 }
 
 impl EngineCmd {
@@ -428,6 +430,9 @@ pub(crate) fn handle_engine_cmd(
         }
         EngineCmd::FundingBalances(reply) => {
             let _ = reply.send(engine.funding_balances());
+        }
+        EngineCmd::ChainHealth(reply) => {
+            let _ = reply.send(engine.chain_health_json());
         }
         EngineCmd::RelayStatus(reply) => {
             let list: Vec<Value> = engine

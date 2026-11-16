@@ -891,6 +891,14 @@ impl Daemon {
         } else {
             serde_json::Value::Null
         };
+        // #308: per-chain runtime health (tip age, pace, stalled/slow). The taker-fund guard refuses to
+        // lock into a degraded taker chain; exposing it here lets the operator see why, and a GUI warn.
+        let chain_health = if running {
+            self.engine_call::<Value>(EngineCmd::ChainHealth)
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
         // Fee scanner totals, per chain (design 0013, scan-only): how many fee outputs the operator
         // has collected and their total sats. Zero and present even when no scanner runs.
         let btc_scan = self.scan_btc.lock().unwrap().clone();
@@ -898,6 +906,7 @@ impl Daemon {
         json!({
             "btc_node": reachable(&settings.btc_node),
             "xbtc_node": reachable(&settings.xbtc_node),
+            "chain_health": chain_health,
             "relays": settings.relays.len(),
             "relay_list": relay_list,
             "engine": running,
