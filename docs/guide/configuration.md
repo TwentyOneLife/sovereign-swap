@@ -19,6 +19,12 @@ it builds an inputless PSBT that Sparrow and Shrike cannot open, so it needs a w
 (Bitcoin Core, Electrum) or a plain pay-to-outputs send; the daemon logs a warning and the web UI flags it
 before you commit a trade.
 
+**Air-gapped QR signers (SeedSigner and similar) must use descriptor-backed interactive, not
+output-only.** Such a signer only signs a *finished* transaction (it cannot add inputs), and the
+output-only PSBT is inputless, so it cannot fund it. Descriptor-backed builds a fully-funded PSBT with
+the BIP32 key derivations the signer needs, which the web UI's QR scan carries to the signer and back
+(scan the PSBT out, sign it on the air-gapped device, scan the signed PSBT back in).
+
 If you configure a descriptor for a chain whose coins already exist on chain, set a **funding birthday**
 (a unix timestamp, 0 = genesis) so the wallet rescans and sees them; without it the wallet only tracks
 coins received after you configure it, and shows a 0 balance until then. The web UI shows each chain's
