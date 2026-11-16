@@ -742,6 +742,7 @@ impl Daemon {
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
             ("POST", "/psbt/ur") => self.psbt_ur(&req.body),
+            ("POST", "/psbt/from-ur") => self.psbt_from_ur(&req.body),
             ("POST", "/funding/survey") => self.funding_survey(&req.body),
             ("POST", "/split/classify") => self.split_classify(&req.body),
             ("POST", "/split/scan") => self.split_scan(&req.body),
@@ -1212,6 +1213,42 @@ impl Daemon {
             .unwrap_or(crate::ur::DEFAULT_MAX_FRAGMENT_LEN);
         let parts = crate::ur::psbt_to_ur_parts(&psbt.serialize(), max);
         (200, json!({ "count": parts.len(), "parts": parts }))
+    }
+
+    /// Scan-back (#274 PR2): decode a set of `ur:crypto-psbt` QR fragments (pure or fountain-mixed) read
+    /// from an air-gapped signer's animated reply back into a base64 PSBT. Stateless , the GUI posts the
+    /// growing set of frames the camera has read; `complete:false` means keep scanning , so the fountain
+    /// decode runs fresh over the whole set each time. The result is validated as a PSBT before return.
+    fn psbt_from_ur(&self, body: &[u8]) -> (u16, Value) {
+        #[derive(Deserialize)]
+        struct Req {
+            parts: Vec<String>,
+        }
+        let Ok(req) = serde_json::from_slice::<Req>(body) else {
+            return (
+                400,
+                json!({"error": "expected a JSON object with a parts array"}),
+            );
+        };
+        if req.parts.is_empty() {
+            return (422, json!({"error": "parts required"}));
+        }
+        // Bound the input: a flood of frames must not grow unbounded.
+        if req.parts.len() > 4096 || req.parts.iter().map(String::len).sum::<usize>() > 2_000_000 {
+            return (413, json!({"error": "too many or too large UR parts"}));
+        }
+        let refs: Vec<&str> = req.parts.iter().map(String::as_str).collect();
+        match crate::ur::decode_ur_psbt(&refs) {
+            Ok(Some(bytes)) => match bitcoin::Psbt::deserialize(&bytes) {
+                Ok(psbt) => (200, json!({ "complete": true, "psbt": psbt.to_string() })),
+                Err(e) => (
+                    422,
+                    json!({"error": format!("the scanned data is not a valid PSBT: {e}")}),
+                ),
+            },
+            Ok(None) => (200, json!({ "complete": false })),
+            Err(e) => (422, json!({"error": format!("{e}")})),
+        }
     }
 
     /// Funding-view replay pre-check (#312): classify the funding wallet's own UTXOs by the runtime
