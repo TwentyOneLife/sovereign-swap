@@ -311,6 +311,13 @@ fn the_gui_is_served_with_the_token_injected() {
         qr.contains("qrcode-generator"),
         "qrcode.js provenance banner present"
     );
+    // #274 PR2: the vendored QR DECODER (jsQR) for scan-back, same-origin.
+    let (code, js) = request(&addr, "GET", "/jsQR.js", None, "");
+    assert_eq!(code, 200, "jsQR.js not served");
+    assert!(
+        js.contains("jsQR 1.4.0"),
+        "jsQR.js provenance banner present"
+    );
 }
 
 #[test]
