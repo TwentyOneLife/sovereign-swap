@@ -524,6 +524,31 @@ fn split_in_descriptor_backed_cold_funding_is_user_signed() {
     let job_id = built["job_id"].as_str().unwrap();
     let psbt = built["psbt"].as_str().unwrap();
 
+    // #310: the cold build must add BIP32 derivations so a derivation-path signer (SeedSigner, hardware)
+    // can find its keys; the direct PSBT build carries none. Core's walletprocesspsbt signs by script and
+    // would pass without them, so assert them here. Both the marker and the coin input must carry one.
+    let decoded = xbtc.call("decodepsbt", json!([psbt]));
+    let marker_txid = built["marker"]["txid"].as_str().unwrap();
+    let marker_vout = built["marker"]["vout"].as_u64().unwrap();
+    let inputs = decoded["tx"]["vin"].as_array().unwrap();
+    for (i, vin) in inputs.iter().enumerate() {
+        let derivs = decoded["inputs"][i]["bip32_derivs"].as_array();
+        assert!(
+            derivs.is_some_and(|d| !d.is_empty()),
+            "input {i} ({}:{}) must carry a BIP32 derivation for an air-gapped signer: {}",
+            vin["txid"].as_str().unwrap_or(""),
+            vin["vout"],
+            decoded["inputs"][i]
+        );
+    }
+    assert!(
+        inputs
+            .iter()
+            .any(|v| v["txid"].as_str() == Some(marker_txid)
+                && v["vout"].as_u64() == Some(marker_vout)),
+        "the lent marker is an input of the built split"
+    );
+
     // The user ('w') signs EVERY input, including the lent marker (the funding wallet cannot).
     let signed = xbtc
         .rpc

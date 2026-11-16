@@ -1617,11 +1617,15 @@ impl Daemon {
                 crate::split::prepare_input(&xbtc, fork_height, &marker.txid, marker.vout)
                     .map_err(|e| (502, json!({"error": format!("marker: {e}")})))?,
             );
-            // The marker is recovered to a change address of the funding wallet. The address type must
-            // match the wallet's own descriptor (a watch-only cold wallet may hold only one type, and the
-            // node default - legacy on Knots - would error "no legacy addresses available"). Deriving the
-            // type from the active change descriptor makes this work for wpkh, tr, pkh and sh wallets (#310).
-            let change_type = change_address_type(&wallet);
+            // The marker is recovered to a change address of the funding wallet. A keyed (hot) wallet
+            // holds all four descriptor types, so keep its historical bech32 change. A watch-only (cold)
+            // wallet may hold only one type, and the node default (legacy on Knots) would error "no legacy
+            // addresses available"; match the type to its own active change descriptor (wpkh/tr/pkh/sh, #310).
+            let change_type = if xbtc_keyed {
+                "bech32"
+            } else {
+                change_address_type(&wallet)
+            };
             let change_str = match wallet.call("getrawchangeaddress", json!([change_type])) {
                 Ok(v) => v
                     .as_str()
@@ -1771,7 +1775,7 @@ impl Daemon {
         if let Err(e) = crate::split::validate_user_signed(&expected, signed, &daemon_inputs) {
             return (400, json!({"error": format!("{e}")}));
         }
-        let (xn, xu, xp, xca, tor, wallet_name) = {
+        let (xn, xu, xp, xca, tor, wallet_name, xbtc_mode) = {
             let s = &self.state.lock().unwrap().settings;
             (
                 s.xbtc_node.clone(),
@@ -1783,8 +1787,19 @@ impl Daemon {
                     "swap-{}",
                     self.identity_seed[..4].to_hex_string(Case::Lower)
                 ),
+                s.xbtc_funding.mode,
             )
         };
+        // #301: never co-sign on the engine host under a cold config. A job built hot carries daemon
+        // inputs; if the operator flipped to cold and restarted (the parked job survives in split.json),
+        // co-signing now would resolve a keyed left-over wallet and sign the user's balance on the host.
+        // Refuse and have the user rebuild under the current mode.
+        if !daemon_inputs.is_empty() && xbtc_mode != FundingMode::Hot {
+            return (
+                409,
+                json!({"error": "Blake2b funding mode changed since this split was built; rebuild it under the current mode"}),
+            );
+        }
         let xbtc = match connect_client(&xn, &xu, &xp, &xca, &tor) {
             Ok(c) => c,
             Err(e) => return (502, json!({"error": format!("Blake2b node: {e}")})),

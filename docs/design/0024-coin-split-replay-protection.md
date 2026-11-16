@@ -66,13 +66,13 @@ wallet you are already safe and need no service.
 - The submit step requires the submitted transaction to be byte-for-byte the one we built, and the user's
   inputs to be signed with an ALL-family sighash — never ANYONECANPAY/NONE/SINGLE, which could be lifted
   into a transaction funded on the other chain.
-- Inputs the service signs itself — always the lent marker, and (since #314) any coin held in its own hot
-  funding wallet, decided at build time and persisted with the job — must be left **unsigned** at submit;
+- Inputs the service signs itself, the lent marker always and (since #314) any coin held in its own hot
+  funding wallet, decided at build time and persisted with the job, must be left **unsigned** at submit;
   the service adds the only signatures on them. After co-signing, **every** input (the service's included)
   is re-checked for an ALL-family signature before broadcast: the byte-for-byte check does not cover
   per-input sighash fields, which whoever submits the PSBT controls.
-- When any input is service-owned, the service also chooses the destination itself — a fresh address in its
-  own funding wallet — and ignores any caller-supplied one (#314). Otherwise `/split/build` plus
+- When any input is service-owned, the service also chooses the destination itself, a fresh address in its
+  own funding wallet, and ignores any caller-supplied one (#314). Otherwise `/split/build` plus
   `/split/submit` would be a path to move any hot-wallet coin to an arbitrary address (for anyone holding
   the GUI token, or a same-origin script); and the separated value must return to the funding wallet for
   the funding view's safe balance to cover the leg. A job is all user-held or all service-held, never a mix.
@@ -111,7 +111,7 @@ backstop. How the marker is signed follows the Blake2b funding mode:
   derivation-path signer (SeedSigner, a hardware wallet) can find its keys; the unsigned tx is unchanged,
   so the byte-for-byte gate still holds. The marker's recovered change is a change address of the funding
   wallet (`getrawchangeaddress`, so it works whatever the descriptor type).
-- **Output-only interactive (no wallet):** refused , there is no wallet to lend a marker from.
+- **Output-only interactive (no wallet):** refused, there is no wallet to lend a marker from.
 
 In cold mode the lent marker is one of the operator's own coins, so the anti-reuse taint still applies:
 a funding wallet holding a single Blake2b-Coin can split once, then needs another Blake2b-Coin to serve as

@@ -502,15 +502,16 @@ function renderReplayWarn(el) {
   // leg: coin selection may avoid the replayable coins, so "has replayable coins" alone would
   // over-warn, and too little total balance is the #295 0-balance concern, not a replay problem.
   if (amount && d.replayable_sat > 0 && d.safe_sat < amount) {
-    // Whether a split is available depends ONLY on the Blake2b funding mode (the split co-sign runs on
-    // the Blake2b node and refuses unless it is hot, #310), not on the chain being funded.
-    const xbtcMode = (statusData && statusData.funding && statusData.funding.xbtc && statusData.funding.xbtc.mode) || "hot";
+    // Whether a split is available depends on the Blake2b funding wallet, not the chain being funded: the
+    // split needs a wallet to lend a marker. Hot (keyed) and cold / descriptor-backed (watch-only) both
+    // work (#314/#310); only output-only funding has no wallet, so it cannot split.
+    const xbtcOutputOnly = !!(statusData && statusData.funding && statusData.funding.xbtc && statusData.funding.xbtc.output_only);
     el.className = "warn";
     const held =
       `Your ${chainShort(chain)} funding wallet holds ${fmtSats(d.replayable_sat)} ${chainShort(chain)} ` +
       `in pre-fork coin(s) that are replayable across chains, and only ${fmtSats(d.safe_sat)} that is ` +
       `safe to lock, less than this leg needs.`;
-    if (xbtcMode === "hot") {
+    if (!xbtcOutputOnly) {
       el.innerHTML =
         `<strong>Split first.</strong> ${held} Separate them in the ` +
         `<a href="#" id="f-go-split">Split</a> tab first, or the swap will be refused when you sign ` +
@@ -524,9 +525,9 @@ function renderReplayWarn(el) {
         });
     } else {
       el.innerHTML =
-        `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting is not ` +
-        `available while Blake2b funding is ${xbtcMode} (issue #310) — fund this leg from coins that ` +
-        `are already separated.`;
+        `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting needs a ` +
+        `Blake2b funding wallet, which output-only funding does not have, so fund this leg from coins ` +
+        `that are already separated.`;
     }
     return;
   }
