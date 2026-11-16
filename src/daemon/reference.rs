@@ -59,15 +59,24 @@ impl Reference {
     /// exchange clearnet-side and serves the rate in its NIP-11 document, so the client reads it over
     /// Tor and its IP never reaches the exchange. Falls back to a direct fetch of the exchange over
     /// Tor when no relay offers a fresh price. Never fetches clearnet from the client.
+    ///
+    /// `force` skips the cache-freshness short-circuit and always does a live fetch (still updating
+    /// the cache afterwards): the Create-offer form uses it so opening the form and the Refresh button
+    /// re-fetch live rather than echo a cached value, and a Refresh after a failure actually retries
+    /// instead of returning the still-cached error (#254). The header's background poll leaves it false
+    /// so it stays cheap.
     pub(crate) fn get(
         &self,
         relays: &[String],
         socks: &str,
+        force: bool,
     ) -> Result<(ReferenceRate, RateVia), String> {
-        if let Some((res, at)) = self.cache.lock().unwrap().as_ref() {
-            let ttl = if res.is_ok() { TTL_OK } else { TTL_ERR };
-            if at.elapsed() < ttl {
-                return res.clone();
+        if !force {
+            if let Some((res, at)) = self.cache.lock().unwrap().as_ref() {
+                let ttl = if res.is_ok() { TTL_OK } else { TTL_ERR };
+                if at.elapsed() < ttl {
+                    return res.clone();
+                }
             }
         }
         // 1) A relay's price proxy, over Tor. First relay with a fresh price wins.
@@ -252,5 +261,30 @@ mod tests {
         assert!(classify_curl_failure(Some(60), "127.0.0.1:9050", "").contains("TLS"));
         // stderr detail is appended when curl provides it.
         assert!(classify_curl_failure(Some(7), "127.0.0.1:9050", "boom").ends_with("[boom]"));
+    }
+
+    #[test]
+    fn force_bypasses_the_fresh_cache_so_refresh_actually_refetches() {
+        // #254: with a fresh cached value, a normal get() echoes it, but a forced get() ignores the
+        // cache and does a live fetch. Here the live fetch cannot succeed (no relay price proxy, an
+        // unreachable SOCKS proxy), so the forced call errors where the cached call returns the rate -
+        // proving the cache was bypassed rather than re-served.
+        let reference = Reference::default();
+        let cached = ReferenceRate {
+            rate: 0.004,
+            bid: 0.004,
+            ask: 0.004,
+        };
+        *reference.cache.lock().unwrap() = Some((Ok((cached, RateVia::Relay)), Instant::now()));
+        // Cached path: the seeded, still-fresh rate.
+        let hit = reference
+            .get(&[], "127.0.0.1:1", false)
+            .expect("a fresh cache is returned");
+        assert!((hit.0.rate - 0.004).abs() < 1e-12);
+        // Forced path: the fresh cache is ignored and the live fetch fails (refused proxy, no relay).
+        assert!(
+            reference.get(&[], "127.0.0.1:1", true).is_err(),
+            "force must bypass the cache and attempt a live fetch"
+        );
     }
 }
