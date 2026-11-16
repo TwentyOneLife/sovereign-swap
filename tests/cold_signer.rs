@@ -484,7 +484,7 @@ fn an_interactive_lock_resumes_after_the_user_signs_and_submits() {
 
     // Resume: validate it is the same transaction, finalize, broadcast, confirm.
     let tx = chain
-        .finalize_submitted_lock(&psbt, signed_psbt, &contract, amount)
+        .finalize_submitted_lock(&psbt, signed_psbt, &contract, amount, &NoOtherChain)
         .expect("the submitted lock finalizes");
     chain.broadcast(&tx).expect("the lock broadcasts");
     node.mine(1);
