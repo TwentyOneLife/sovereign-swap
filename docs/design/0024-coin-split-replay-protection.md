@@ -49,7 +49,10 @@ the network fee), the fee to the service, and the marker recovered to the servic
   each carrying `witness_utxo` and, for non-witness inputs, `non_witness_utxo`, so any signer can sign),
   and return it with a job id.
 - `POST /split/submit` — the user signs their input **first**; the service validates and co-signs the
-  marker **last**, then broadcasts. No signed marker is ever outstanding.
+  marker **last**, then broadcasts. No signed marker is ever outstanding. When the coin being split is
+  itself held in the service's own hot funding wallet (the user has no key for it), the service signs that
+  input too in the same co-sign (#314); the safety invariants below keep that case replay-safe and
+  drain-safe.
 - `POST /split/verify` — once the move is 12 confirmations deep on Blake2b, confirm its inputs do not all
   exist on the SHA256 chain, i.e. it can never be replayed.
 
@@ -63,6 +66,16 @@ wallet you are already safe and need no service.
 - The submit step requires the submitted transaction to be byte-for-byte the one we built, and the user's
   inputs to be signed with an ALL-family sighash — never ANYONECANPAY/NONE/SINGLE, which could be lifted
   into a transaction funded on the other chain.
+- Inputs the service signs itself — always the lent marker, and (since #314) any coin held in its own hot
+  funding wallet, decided at build time and persisted with the job — must be left **unsigned** at submit;
+  the service adds the only signatures on them. After co-signing, **every** input (the service's included)
+  is re-checked for an ALL-family signature before broadcast: the byte-for-byte check does not cover
+  per-input sighash fields, which whoever submits the PSBT controls.
+- When any input is service-owned, the service also chooses the destination itself — a fresh address in its
+  own funding wallet — and ignores any caller-supplied one (#314). Otherwise `/split/build` plus
+  `/split/submit` would be a path to move any hot-wallet coin to an arbitrary address (for anyone holding
+  the GUI token, or a same-origin script); and the separated value must return to the funding wallet for
+  the funding view's safe balance to cover the leg. A job is all user-held or all service-held, never a mix.
 - `verify` refuses to run unless the SHA256 node has a fully synced `txindex`: without it an absent input
   cannot be told apart from a merely unindexed one, which could wrongly report a replayable coin as safe.
 - A move is "final" only at ≥12 Blake2b confirmations; the low-hashrate chain reorgs, and a shallow
@@ -89,4 +102,6 @@ never counted safe), and the client warns, and offers a split first, only when t
 AND the safe balance cannot cover the leg. Output-only funding has no wallet to survey, so the guard is
 the only protection there. Deliberately NOT ancestry classification: a pre-fork coin already spent or
 split on the other chain is no longer replayable, and only the guard's own predicate agrees with the
-backstop. Splitting the flagged coins requires hot Blake2b funding (the co-sign needs a keyed wallet).
+backstop. Co-signing the marker needs hot (keyed) Blake2b funding; cold/descriptor-backed funding cannot
+co-sign yet (#310). A flagged coin the user holds, they sign; a flagged coin in the service's own hot
+funding wallet, the service signs along with the marker (#314).
