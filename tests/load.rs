@@ -122,6 +122,9 @@ fn fund_wallet(node: &Node, name: &str, count: usize, each: Amount) {
         .call("sendmany", json!(["", outputs]))
         .unwrap();
     node.mine(1);
+    // #317: do not start swaps until the wallet has processed the funding block, or a loaded runner can
+    // let the first fund() run against a wallet that has not yet seen its coins (a flaky -4).
+    common::wait_for_confirmed_utxo(node, name);
 }
 
 #[test]
