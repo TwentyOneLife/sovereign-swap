@@ -92,6 +92,9 @@ use wire::{
 const INDEX_HTML: &str = include_str!("../gui/index.html");
 const APP_CSS: &str = include_str!("../gui/app.css");
 const APP_JS: &str = include_str!("../gui/app.js");
+/// Vendored QR Code generator (qrcode-generator 1.4.4, MIT), for the funding-PSBT animated QR (#274).
+/// Served same-origin and compiled in, so it is pinned and reproducible; provenance in its header.
+const QRCODE_JS: &str = include_str!("../gui/qrcode.js");
 
 /// Response headers that harden the embedded GUI: `frame-ancestors`/`X-Frame-Options` block framing
 /// (clickjacking), the CSP pins every resource to this origin, and `base-uri`/`form-action` close the
@@ -610,7 +613,7 @@ impl Daemon {
             let is_page = req.method == "GET"
                 && matches!(
                     req.path.as_str(),
-                    "/" | "/index.html" | "/app.css" | "/app.js"
+                    "/" | "/index.html" | "/app.css" | "/app.js" | "/qrcode.js"
                 );
             if is_page && !self.basic_ok(&req, &user, &pass) {
                 return self.write_unauthorized_basic(&mut stream);
@@ -651,6 +654,13 @@ impl Daemon {
                         &mut stream,
                         "application/javascript; charset=utf-8",
                         APP_JS.as_bytes(),
+                    )
+                }
+                "/qrcode.js" => {
+                    return self.write_asset(
+                        &mut stream,
+                        "application/javascript; charset=utf-8",
+                        QRCODE_JS.as_bytes(),
                     )
                 }
                 _ => {}
@@ -731,6 +741,7 @@ impl Daemon {
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
+            ("POST", "/psbt/ur") => self.psbt_ur(&req.body),
             ("POST", "/funding/survey") => self.funding_survey(&req.body),
             ("POST", "/split/classify") => self.split_classify(&req.body),
             ("POST", "/split/scan") => self.split_scan(&req.body),
@@ -1162,6 +1173,38 @@ impl Daemon {
     /// while. Returns each coin as `{txid, vout, value_sat, kind, needs_split}`; the pre-fork ones (kind
     /// `sha_coin`, `needs_split` true) are the ones to protect. The actual split still builds from a
     /// specific coin (`/split/build`); this only resolves an address to its coins.
+    /// Encode a PSBT as `ur:crypto-psbt` QR part strings for animated-QR display (#274). Stateless:
+    /// the client passes the unsigned PSBT it already holds, so the QR can never diverge from the
+    /// paste field, there is no engine call, and the Split tab can reuse it. Validates the input
+    /// parses as a PSBT (never QR-encode garbage) and caps its size.
+    fn psbt_ur(&self, body: &[u8]) -> (u16, Value) {
+        #[derive(Deserialize)]
+        struct Req {
+            psbt: String,
+            #[serde(default)]
+            max_fragment_len: Option<usize>,
+        }
+        let Ok(req) = serde_json::from_slice::<Req>(body) else {
+            return (
+                400,
+                json!({"error": "expected a JSON object with a psbt field"}),
+            );
+        };
+        if req.psbt.len() > 200_000 {
+            return (413, json!({"error": "PSBT too large to encode as a QR"}));
+        }
+        let psbt = match req.psbt.trim().parse::<bitcoin::Psbt>() {
+            Ok(p) => p,
+            Err(e) => return (422, json!({"error": format!("not a valid PSBT: {e}")})),
+        };
+        let max = req
+            .max_fragment_len
+            .filter(|n| *n > 0)
+            .unwrap_or(crate::ur::DEFAULT_MAX_FRAGMENT_LEN);
+        let parts = crate::ur::psbt_to_ur_parts(&psbt.serialize(), max);
+        (200, json!({ "count": parts.len(), "parts": parts }))
+    }
+
     /// Funding-view replay pre-check (#312): classify the funding wallet's own UTXOs by the runtime
     /// guard's predicate (unspent on the OTHER chain = cross-chain replayable), so the GUI can offer
     /// split-first before a swap instead of hitting the guard and failing at signing time. One
