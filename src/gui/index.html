@@ -114,10 +114,10 @@
             title="Sparrow UTXOs tab: right-click a coin, copy its transaction id, then add its output number (e.g. :0).">
         </label>
       </details>
-      <label title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike. The separated coin lands here and is yours alone from then on.">
-        Your BTC (Blake2b) destination address
+      <label title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike. The separated coin lands here. Leave it blank for a coin held in the swap's own funding wallet: the swap returns the value to that wallet itself.">
+        Your BTC (Blake2b) destination address <span class="muted">(leave blank for a coin in the swap's own funding wallet)</span>
         <input id="sp-dest" placeholder="a BTC (Blake2b) address you control"
-          title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike; the separated coin lands here.">
+          title="A fresh receive address from a BTC (Blake2b) wallet you control, for example Shrike; the separated coin lands here. Blank is fine for a swap funding-wallet coin.">
       </label>
       <p class="muted">You only need one new address, the BTC (Blake2b) destination. Your BTC (SHA256)
       coin is not moved; it stays put and is safe to spend afterwards.
