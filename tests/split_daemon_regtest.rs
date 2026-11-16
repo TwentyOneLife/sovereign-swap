@@ -111,6 +111,38 @@ fn split_build_sign_submit_through_the_daemon() {
     xbtc.call("generatetoaddress", json!([1, marker_addr]));
     xbtc.mine(101); // mature the marker coinbase
 
+    // #312: the funding-view replay pre-check over the daemon's own (hot) Blake2b funding wallet. Its
+    // only UTXO is the post-fork Blake2b coinbase above, which does NOT exist on the BTC node, so it
+    // is safe and nothing is flagged. This also proves the handler checks the xbtc wallet against the
+    // OTHER chain (btc): were it checked against xbtc itself, that coin would read as unspent/replayable.
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/funding/survey",
+        &token,
+        r#"{"chain":"xbtc"}"#,
+    );
+    assert_eq!(code, 200, "funding survey failed: {body}");
+    let fv: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        fv["unverified"],
+        json!(false),
+        "both nodes reachable: {body}"
+    );
+    assert_eq!(
+        fv["output_only"],
+        json!(false),
+        "hot funding has a wallet: {body}"
+    );
+    assert!(
+        fv["replayable"].as_array().unwrap().is_empty(),
+        "a post-fork Blake2b coin is not cross-chain replayable: {body}"
+    );
+    assert!(
+        fv["safe_sat"].as_u64().unwrap() > 0,
+        "the matured marker coinbase is safe funds: {body}"
+    );
+
     let sha = pair.knots_sha_coin_txid(); // the user's pre-fork SHA-Coin (fixture 'w' wallet)
     let dest = xbtc.new_bech32_address();
 

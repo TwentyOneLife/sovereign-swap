@@ -451,3 +451,49 @@ fn split_build_refuses_when_blake2b_funding_is_not_hot() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn funding_survey_validates_chain_and_handles_output_only_without_a_node() {
+    // #312: the funding-view replay pre-check. An invalid chain is a 422; output-only funding has no
+    // daemon wallet to survey, so it returns a clear output_only result with no node I/O (no binaries
+    // needed). The replayable pre-check against real nodes is covered in funding_survey_regtest.rs.
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sovswap-fsurvey-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Bogus nodes (engine won't start, non-fatal); Blake2b funding is interactive with no descriptor,
+    // i.e. output-only, so /funding/survey returns before touching a node.
+    let settings = r#"{"btc_node":"http://127.0.0.1:1","xbtc_node":"http://127.0.0.1:1",
+        "relays":["ws://127.0.0.1:1"],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+        "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
+        "xbtc_funding":{"mode":"interactive"}}"#;
+    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/funding/survey",
+            Some(&token),
+            r#"{"chain":"doge"}"#
+        )
+        .0,
+        422,
+        "an unknown chain is refused"
+    );
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/funding/survey",
+        Some(&token),
+        r#"{"chain":"xbtc"}"#,
+    );
+    assert_eq!(code, 200, "output-only survey returns cleanly: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["output_only"], serde_json::json!(true));
+    assert_eq!(v["replayable_sat"], serde_json::json!(0));
+    assert_eq!(v["unverified"], serde_json::json!(false));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
