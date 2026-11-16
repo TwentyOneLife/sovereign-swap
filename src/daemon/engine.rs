@@ -144,6 +144,9 @@ impl EngineCmd {
 /// engine surfaces per-swap chain views.
 pub struct SwapView {
     id: [u8; 16],
+    /// The offer this swap is for (#304), so a client can hide a discovered offer it already has a swap
+    /// on - the maker withdraws a taken offer (design 0250), but a taker filters its own market locally.
+    offer_id: [u8; 16],
     phase: Phase,
     role: Role,
     maker_chain: SwapChain,
@@ -157,6 +160,7 @@ impl SwapView {
     pub(crate) fn of(s: &Swap) -> SwapView {
         SwapView {
             id: s.id,
+            offer_id: s.offer.id,
             phase: s.phase,
             role: s.role,
             maker_chain: s.offer.maker_chain,
@@ -174,6 +178,7 @@ impl SwapView {
     pub(crate) fn to_json(&self) -> Value {
         json!({
             "id": self.id.to_hex_string(Case::Lower),
+            "offer_id": self.offer_id.to_hex_string(Case::Lower),
             "phase": format!("{:?}", self.phase).to_lowercase(),
             "role": match self.role { Role::Maker => "maker", Role::Taker => "taker" },
             "maker_chain": chain_str(self.maker_chain),
