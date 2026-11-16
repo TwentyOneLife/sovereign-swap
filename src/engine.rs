@@ -1099,11 +1099,15 @@ impl<T: Transport> Engine<T> {
                 self.records[i].swap.taker_part,
             ),
         };
+        // The replay guard checks the signed inputs against the OTHER chain, the same lookup target
+        // `fund()` uses at swap time (#313). Output-only funding has no daemon wallet, so this is its
+        // only replay protection.
         let tx = self.nodes[&own_chain].finalize_submitted_lock(
             &pending,
             signed_psbt,
             &contract,
             amount,
+            &self.nodes[&own_chain.other()].rpc,
         )?;
         self.backend(own_chain).broadcast(&tx)?;
         self.records[i].funding = Some(tx);
