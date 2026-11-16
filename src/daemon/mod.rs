@@ -744,7 +744,11 @@ impl Daemon {
         }
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/status") => (200, self.status()),
-            ("GET", "/reference-rate") => self.reference_rate(),
+            ("GET", p) if p == "/reference-rate" || p.starts_with("/reference-rate?") => {
+                // `?fresh=1` forces a live fetch (Create-offer form open + Refresh, #254); the bare
+                // path stays cached for the header's background poll.
+                self.reference_rate(p.contains("fresh=1"))
+            }
             ("GET", "/offers") => self.get_offers(),
             ("GET", "/my-offers") => self.get_my_offers(),
             ("POST", "/offers") => self.post_offer(&req.body),
@@ -841,7 +845,7 @@ impl Daemon {
 
     /// The opt-in external price reference (nonkyc BTCB2/BTC, over Tor). `{enabled:false}` when off;
     /// a hint only, never a price the protocol relies on.
-    fn reference_rate(&self) -> (u16, Value) {
+    fn reference_rate(&self, force: bool) -> (u16, Value) {
         let settings = self.state.lock().unwrap().settings.clone();
         if !settings.price_reference {
             return (200, json!({ "enabled": false }));
@@ -849,7 +853,7 @@ impl Daemon {
         // The reference must dial the same Tor proxy as the engine (SWAP_TOR_SOCKS, else the
         // setting), not a hardcoded default: on StartOS the proxy is at an injected address.
         let socks = resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &settings.tor_socks);
-        match self.reference.get(&settings.relays, &socks) {
+        match self.reference.get(&settings.relays, &socks, force) {
             Ok((r, via)) => {
                 let source = match via {
                     crate::daemon::reference::RateVia::Relay => "nonkyc BTCB2/BTC, via relay (Tor)",
@@ -2034,7 +2038,7 @@ impl Daemon {
                         };
                         let market = self
                             .reference
-                            .get(&relays, &tor_socks)
+                            .get(&relays, &tor_socks, false)
                             .ok()
                             .and_then(|(r, _)| crate::pricing::market_price(sell_chain, r.rate));
                         if let Some(m) = market {
@@ -2357,7 +2361,7 @@ impl Daemon {
             // on and resolves; None when off or unavailable.
             let market = if price_ref_on {
                 self.reference
-                    .get(&relays, &tor_socks)
+                    .get(&relays, &tor_socks, false)
                     .ok()
                     .and_then(|(r, _)| crate::pricing::market_price(new.sell_chain, r.rate))
             } else {

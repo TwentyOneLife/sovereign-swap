@@ -627,7 +627,9 @@ function createSheet() {
 
   async function loadReference() {
     try {
-      const r = await api("GET", "/reference-rate");
+      // #254: force a live fetch (not the header's cached poll) so opening the form and the Refresh
+      // button read the current rate and a Refresh after a failure actually retries.
+      const r = await api("GET", "/reference-rate?fresh=1");
       refVerify = r && r.verify_url ? r.verify_url : refVerify;
       ref =
         r.enabled && !r.error && isFinite(r.rate) && r.rate > 0
