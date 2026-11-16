@@ -237,3 +237,197 @@ fn split_build_sign_submit_through_the_daemon() {
         "SHA256 reject reason should be missing inputs, got: {reason}"
     );
 }
+
+/// #314: a pre-fork SHA-Coin held in the DAEMON's own hot funding wallet (not the user's) is split with
+/// the daemon signing the coin itself. The user cannot sign it (the key is on the engine host), so the
+/// build reports `daemon_signed`, the unsigned PSBT is submitted straight through, and the daemon
+/// `walletprocesspsbt` signs both the coin and the marker. The daemon also picks the destination itself
+/// (a funding-wallet address), so there is no path to move a hot coin to an arbitrary address.
+#[test]
+fn split_signs_a_coin_held_in_the_daemon_hot_funding_wallet() {
+    const FORK: u32 = 110;
+    let Some(pair) = ForkedPair::start(FORK) else {
+        return;
+    };
+    let btc = &pair.btc;
+    let xbtc = &pair.xbtc;
+
+    let relay = RelayServer::new(RelayConfig::default())
+        .spawn("127.0.0.1:0")
+        .unwrap();
+    let fee_addr = xbtc.new_bech32_address();
+    let dir = std::env::temp_dir().join(format!(
+        "sovswap-split-hot-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = format!(
+        r#"{{"btc_node":"http://127.0.0.1:{bp}","xbtc_node":"http://127.0.0.1:{xp}","relays":["{relay}"],
+            "signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+            "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
+            "fee_enabled":true,"fee_xbtc_address":"{fee_addr}","split_fork_height":{FORK}}}"#,
+        bp = btc.rpc_port,
+        xp = xbtc.rpc_port,
+    );
+    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+    let (_, status) = request(&addr, "GET", "/status", &token, "");
+    assert!(
+        status.contains("\"engine\":true"),
+        "engine did not start: {status}"
+    );
+
+    let swap_wallet_name = xbtc
+        .call("listwallets", json!([]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str())
+        .find(|w| w.starts_with("swap-") && !w.ends_with("-watch"))
+        .expect("daemon created a swap wallet")
+        .to_owned();
+    let swap = xbtc.rpc.wallet(&swap_wallet_name);
+
+    // A matured post-fork Blake2b-Coin in the swap wallet, to lend as the marker.
+    let marker_addr = swap
+        .call("getnewaddress", json!(["", "bech32"]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    xbtc.call("generatetoaddress", json!([1, marker_addr]));
+    xbtc.mine(101);
+
+    // Make the DAEMON's hot funding wallet own the pre-fork SHA-Coin: import the mining wallet's PRIVATE
+    // descriptors into it at timestamp 0 so it rescans and can sign the existing block-60 coinbase, without
+    // any on-chain move (which would itself separate the coin and defeat the test).
+    let descs = xbtc
+        .wallet()
+        .call("listdescriptors", json!([true]))
+        .unwrap();
+    let to_import: Vec<Value> = descs["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let mut e = json!({"desc": d["desc"], "timestamp": 0, "active": false});
+            if !d["range"].is_null() {
+                e["range"] = d["range"].clone();
+            }
+            e
+        })
+        .collect();
+    let res = swap.call("importdescriptors", json!([to_import])).unwrap();
+    assert!(
+        res.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["success"] == json!(true)),
+        "importing the coin's descriptors into the funding wallet failed: {res}"
+    );
+
+    let sha = pair.knots_sha_coin_txid();
+    let owned = swap.call("listunspent", json!([1])).unwrap();
+    assert!(
+        owned
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["txid"] == json!(sha)),
+        "the funding wallet now holds the pre-fork coin to split: {owned}"
+    );
+    assert!(
+        !xbtc.call("gettxout", json!([sha, 0])).is_null(),
+        "the coin is unspent before the split"
+    );
+
+    // #314 drain guard: a daemon-signed job must NOT honor a caller-supplied external destination,
+    // otherwise /split/build + /split/submit would move a hot-wallet coin anywhere. The address must come
+    // from a FRESH wallet: importing the coin's descriptors above made every 'w' address ismine on the
+    // funding wallet, so an external address has to be one the funding wallet does not know.
+    xbtc.call("createwallet", json!(["external314"]));
+    let external = xbtc
+        .rpc
+        .wallet("external314")
+        .call("getnewaddress", json!(["", "bech32"]))
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/build",
+        &token,
+        &format!(r#"{{"sha_coins":[{{"txid":"{sha}","vout":0}}],"dest":"{external}"}}"#),
+    );
+    assert_eq!(code, 200, "build with an external dest failed: {body}");
+    let built_ext: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        built_ext["daemon_signed"],
+        json!(true),
+        "a hot funding-wallet coin is still daemon-signed when an external dest is supplied: {body}"
+    );
+    let decoded = xbtc.call("decodepsbt", json!([built_ext["psbt"].as_str().unwrap()]));
+    let vouts = decoded["tx"]["vout"].as_array().unwrap();
+    assert!(
+        vouts
+            .iter()
+            .all(|o| o["scriptPubKey"]["address"].as_str() != Some(external.as_str())),
+        "the daemon must ignore a caller-supplied external dest for a daemon-signed split: {decoded}"
+    );
+    let out0 = vouts[0]["scriptPubKey"]["address"].as_str().unwrap();
+    assert!(
+        swap.call("getaddressinfo", json!([out0])).unwrap()["ismine"]
+            .as_bool()
+            .unwrap_or(false),
+        "the separated value must return to the funding wallet (output 0 ismine), got {out0}"
+    );
+
+    // Build with NO dest: for a daemon-owned coin the daemon must pick a funding-wallet address itself.
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/build",
+        &token,
+        &format!(r#"{{"sha_coins":[{{"txid":"{sha}","vout":0}}]}}"#),
+    );
+    assert_eq!(code, 200, "build failed: {body}");
+    let built: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        built["daemon_signed"],
+        json!(true),
+        "a hot funding-wallet coin must be flagged daemon_signed: {body}"
+    );
+    let job_id = built["job_id"].as_str().unwrap();
+    let psbt = built["psbt"].as_str().unwrap();
+
+    // Submit the UNSIGNED PSBT straight through: the daemon signs both the coin and the marker.
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/submit",
+        &token,
+        &format!(r#"{{"job_id":"{job_id}","psbt":"{psbt}"}}"#),
+    );
+    assert_eq!(code, 200, "submit failed: {body}");
+    let out: Value = serde_json::from_str(&body).unwrap();
+    let txid = out["txid"].as_str().unwrap();
+
+    // The daemon actually spent the coin the user could not sign.
+    assert!(
+        xbtc.call("gettxout", json!([sha, 0])).is_null(),
+        "the pre-fork coin must be spent by the split the daemon signed"
+    );
+    // And the move is non-replayable: SHA256 rejects it for the missing marker input.
+    let hex = xbtc.call("getrawtransaction", json!([txid]));
+    let hex = hex.as_str().expect("split tx is on the Blake2b node");
+    let reject = btc.call("testmempoolaccept", json!([[hex]]));
+    assert_eq!(
+        reject[0]["allowed"],
+        json!(false),
+        "SHA256 must reject the daemon-signed split (missing marker input)"
+    );
+}

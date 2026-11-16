@@ -1219,11 +1219,25 @@ function loadSplit() {
   $("#sp-build").addEventListener("click", async () => {
     if (!splitJob.coin) { step1.textContent = "Find or pick a coin to protect first."; return; }
     const dest = $("#sp-dest").value.trim();
-    if (!dest) { step1.textContent = "Enter your BTC (Blake2b) destination address first."; return; }
     step1.textContent = "Building the unsigned transaction…";
     try {
-      const r = await api("POST", "/split/build", { sha_coins: [splitJob.coin], dest });
+      // A destination is needed only for a coin you hold; for a coin in the swap's own hot funding
+      // wallet the daemon picks one and signs the input itself, so send dest only when you entered one.
+      const body = { sha_coins: [splitJob.coin] };
+      if (dest) body.dest = dest;
+      const r = await api("POST", "/split/build", body);
       splitJob.job_id = r.job_id;
+      if (r.daemon_signed) {
+        // #314: the coin is in the swap's hot funding wallet; there is no PSBT for you to sign. The
+        // daemon co-signs the coin and the marker and broadcasts, so submit the built PSBT straight through.
+        step1.textContent = "✓ Built (hot funding-wallet coin). Fee " + fmtSats(r.fee_sat) + " XBT. Co-signing and broadcasting…";
+        const s = await api("POST", "/split/submit", { job_id: r.job_id, psbt: r.psbt });
+        splitJob.txid = s.txid;
+        $("#sp-verify-card").classList.remove("hidden");
+        step1.textContent = "✓ Broadcast on BTC (Blake2b). txid " + s.txid;
+        $("#sp-verify-card").scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
       $("#sp-psbt").value = r.psbt;
       $("#sp-sign-card").classList.remove("hidden");
       step1.textContent = "✓ Built. Fee " + fmtSats(r.fee_sat) + " XBT. Sign it in step 3.";

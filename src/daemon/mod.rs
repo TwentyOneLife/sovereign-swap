@@ -1397,9 +1397,9 @@ impl Daemon {
         let Ok(req) = serde_json::from_slice::<Value>(body) else {
             return (400, json!({"error": "body must be JSON"}));
         };
-        let Some(dest_str) = req["dest"].as_str() else {
-            return (422, json!({"error": "dest required"}));
-        };
+        // Optional: required only for a user-held coin. For a hot funding-wallet coin the daemon picks
+        // the destination itself (below, #314), so the caller need not, and must not, name one.
+        let dest_req = req["dest"].as_str().map(str::to_owned);
         let coins: Vec<(String, u32)> = req["sha_coins"]
             .as_array()
             .map(|a| {
@@ -1479,12 +1479,6 @@ impl Daemon {
                 .ok()
                 .and_then(|a| a.require_network(network).ok())
         };
-        let Some(dest) = parse_addr(dest_str) else {
-            return (
-                422,
-                json!({"error": "dest is not a valid address for this chain"}),
-            );
-        };
         // The fee address must be a plain address: we cannot derive a silent-payment output without the
         // keys of every input, and in a two-owner move we hold only the marker's.
         let Some(fee_addr) = parse_addr(&fee_cfg) else {
@@ -1495,6 +1489,60 @@ impl Daemon {
         };
         let wallet = xbtc.wallet(&wallet_name);
         let now = unix_now();
+
+        // #314: which of the SHA-Coins to split does OUR hot funding wallet hold? The user cannot sign
+        // those (the key is on the engine host), so the daemon signs them at co-sign; the rest the user
+        // signs out of band. Decide ownership now, at build, and persist it with the job so the submit
+        // gate treats exactly this set as daemon-signed.
+        let owned: std::collections::HashSet<(String, u32)> = list_unspent(&wallet)
+            .into_iter()
+            .map(|(t, v, _)| (t, v))
+            .collect();
+        let daemon_owned: Vec<(String, u32)> = coins
+            .iter()
+            .filter(|(t, v)| owned.contains(&(t.clone(), *v)))
+            .cloned()
+            .collect();
+        // Keep the flow binary for now (#314): a job is either all user-held or all daemon-held. A mixed
+        // job would need both a user signature and our co-sign on different inputs; deferred.
+        if !daemon_owned.is_empty() && daemon_owned.len() != coins.len() {
+            return (
+                422,
+                json!({"error": "a split job must be either all user-held coins or all hot funding-wallet coins, not a mix"}),
+            );
+        }
+        // #314 drain guard + destination. Once the daemon signs the inputs, the only thing stopping
+        // /split/build + /split/submit from moving any hot-wallet coin to an arbitrary address (anyone
+        // holding the GUI token, or a same-origin script) is that the destination must be ours. The
+        // separated value must return to the funding wallet anyway (that is what lets the funding view's
+        // safe balance cover the leg), so the daemon picks a fresh funding-wallet address and ignores any
+        // caller-supplied `dest`. A user-held coin keeps naming its own destination.
+        let (dest, dest_str) = if !daemon_owned.is_empty() {
+            let picked = wallet
+                .call("getnewaddress", json!(["", "bech32"]))
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned));
+            match picked.as_deref().and_then(parse_addr) {
+                Some(d) => (d, picked.unwrap()),
+                None => {
+                    return (
+                        502,
+                        json!({"error": "could not get a funding-wallet destination for the split"}),
+                    )
+                }
+            }
+        } else {
+            let Some(dest_str) = dest_req else {
+                return (422, json!({"error": "dest required"}));
+            };
+            let Some(dest) = parse_addr(&dest_str) else {
+                return (
+                    422,
+                    json!({"error": "dest is not a valid address for this chain"}),
+                );
+            };
+            (dest, dest_str)
+        };
 
         // Reserve a marker, auto-scanning the wallet's Blake2b-Coins into the pool if none is free.
         let (job_id, marker) = {
@@ -1586,6 +1634,15 @@ impl Daemon {
                     dest: dest_str.to_owned(),
                 },
             );
+            // #314: persist which inputs the daemon will sign, so submit treats exactly this set (plus the
+            // marker) as daemon-signed and leaves the others to the user.
+            st.set_daemon_inputs(
+                &job_id,
+                daemon_owned
+                    .iter()
+                    .map(|(t, v)| format!("{t}:{v}"))
+                    .collect(),
+            );
             let _ = st.save(&self.data_dir.join("split.json"));
         }
         (
@@ -1595,6 +1652,9 @@ impl Daemon {
                 "psbt": psbt,
                 "fee_sat": fee_sat,
                 "marker": {"txid": marker.txid, "vout": marker.vout},
+                // #314: true when the daemon signs the coin inputs itself (a hot funding-wallet coin), so
+                // the GUI skips the "sign in your wallet" step and posts straight to /split/submit.
+                "daemon_signed": !daemon_owned.is_empty(),
             }),
         )
     }
@@ -1611,7 +1671,7 @@ impl Daemon {
         let (Some(job_id), Some(signed)) = (req["job_id"].as_str(), req["psbt"].as_str()) else {
             return (422, json!({"error": "job_id and psbt required"}));
         };
-        let (expected, marker) = {
+        let (expected, marker, owned_inputs) = {
             let st = self.split.lock().unwrap();
             let Some(expected) = st.job(job_id).map(str::to_owned) else {
                 return (410, json!({"error": "unknown or expired job"}));
@@ -1619,7 +1679,7 @@ impl Daemon {
             let Some(marker) = st.pool.reserved_marker(job_id) else {
                 return (410, json!({"error": "no marker reserved for this job"}));
             };
-            (expected, marker)
+            (expected, marker, st.daemon_inputs(job_id).to_vec())
         };
         let marker_out = match marker.txid.parse() {
             Ok(txid) => bitcoin::OutPoint {
@@ -1628,7 +1688,21 @@ impl Daemon {
             },
             Err(_) => return (500, json!({"error": "bad marker txid in state"})),
         };
-        if let Err(e) = crate::split::validate_user_signed(&expected, signed, marker_out) {
+        // The inputs the daemon signs: always the lent marker, plus (since #314) any SHA-Coin we recorded
+        // at build as held in our own hot funding wallet. The submit gate requires exactly these to be
+        // unsigned (we add their signatures) and every other input to be user-ALL-signed.
+        let mut daemon_inputs = vec![marker_out];
+        for coin in &owned_inputs {
+            let Some(op) = coin
+                .split_once(':')
+                .and_then(|(t, v)| Some((t.parse().ok()?, v.parse().ok()?)))
+                .map(|(txid, vout)| bitcoin::OutPoint { txid, vout })
+            else {
+                return (500, json!({"error": "bad daemon-input outpoint in state"}));
+            };
+            daemon_inputs.push(op);
+        }
+        if let Err(e) = crate::split::validate_user_signed(&expected, signed, &daemon_inputs) {
             return (400, json!({"error": format!("{e}")}));
         }
         let (xn, xu, xp, xca, tor, wallet_name, xbtc_mode) = {
@@ -1679,6 +1753,13 @@ impl Daemon {
         let Some(psbt2) = processed["psbt"].as_str() else {
             return (502, json!({"error": "co-sign returned no psbt"}));
         };
+        // #314 backstop: after we co-sign, EVERY input (marker, any hot funding-wallet coin we just
+        // signed, and the user's) must carry an ALL-family signature before we broadcast. The
+        // byte-for-byte check does not cover per-input sighash fields, which the submitter controls, so a
+        // daemon-owned input accepted as unsigned above is held to the same no-ANYONECANPAY bar here.
+        if let Err(e) = crate::split::verify_cosigned_all_family(psbt2) {
+            return (400, json!({"error": format!("{e}")}));
+        }
         let finalized = match wallet.call("finalizepsbt", json!([psbt2])) {
             Ok(v) => v,
             Err(e) => return (502, json!({"error": format!("finalize: {e:?}")})),

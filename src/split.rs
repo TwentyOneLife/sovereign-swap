@@ -341,7 +341,7 @@ pub fn verify_marker(btc_rpc: &Client, marker_txid: &str) -> Result<(), SplitErr
 pub fn validate_user_signed(
     expected_unsigned_tx_hex: &str,
     submitted_psbt_b64: &str,
-    marker: OutPoint,
+    daemon_inputs: &[OutPoint],
 ) -> Result<(), SplitError> {
     use std::str::FromStr;
     let psbt = Psbt::from_str(submitted_psbt_b64)
@@ -353,50 +353,94 @@ pub fn validate_user_signed(
     }
     for (i, txin) in psbt.unsigned_tx.input.iter().enumerate() {
         let input = &psbt.inputs[i];
-        if txin.previous_output == marker {
-            // Our marker: no signature of any form (partial OR finalized) - we add the only one.
-            if !input.partial_sigs.is_empty()
-                || input.tap_key_sig.is_some()
-                || input.final_script_witness.is_some()
-                || input.final_script_sig.is_some()
-            {
+        if daemon_inputs.contains(&txin.previous_output) {
+            // Our inputs: the lent marker, and (since #314) any SHA-Coin that sits in our own hot funding
+            // wallet, which the user cannot sign because its key is on the engine host. Both must be left
+            // UNSIGNED here - the daemon adds the only signatures on them at co-sign (extended invariant
+            // (c), which before #314 was the marker alone). We re-check them for an ALL-family sighash
+            // AFTER co-signing (`verify_cosigned_all_family`), so they are held to the same bar as a user
+            // input despite not being signed yet.
+            if input_all_family(input).is_some() {
                 return Err(SplitError::Malformed(
-                    "the marker input must be left unsigned for us to co-sign".to_owned(),
+                    "a daemon-signed input (the marker, or a hot funding-wallet coin) must be left unsigned for us to co-sign".to_owned(),
                 ));
             }
             continue;
         }
-        // A user input must be signed with an ALL-family sighash. A signer may leave the signature as a
-        // PSBT partial_sig/tap_key_sig OR already FINALIZE the input (Bitcoin Core does the latter when
-        // it can fully satisfy an input), so accept both forms and read the sighash flag from whichever.
-        let all_family = if !input.partial_sigs.is_empty() {
-            input
-                .partial_sigs
-                .values()
-                .all(|s| s.sighash_type == EcdsaSighashType::All)
-        } else if let Some(s) = input.tap_key_sig.as_ref() {
-            matches!(
-                s.sighash_type,
-                TapSighashType::Default | TapSighashType::All
-            )
-        } else if let Some(w) = input.final_script_witness.as_ref() {
-            w.iter().next().map(sig_is_all_family).unwrap_or(false)
-        } else if let Some(ss) = input.final_script_sig.as_ref() {
-            first_push(ss)
-                .map(|s| sig_is_all_family(&s))
-                .unwrap_or(false)
-        } else {
-            return Err(SplitError::Malformed(format!(
-                "user input {i} is not signed"
-            )));
-        };
-        if !all_family {
-            return Err(SplitError::Malformed(format!(
-                "user input {i} is not signed with SIGHASH_ALL (ANYONECANPAY/NONE/SINGLE would be replayable)"
-            )));
+        // A user input must be signed with an ALL-family sighash. NONE here means the user has not signed
+        // an input that is theirs to sign.
+        match input_all_family(input) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(SplitError::Malformed(format!(
+                    "user input {i} is not signed with SIGHASH_ALL (ANYONECANPAY/NONE/SINGLE would be replayable)"
+                )))
+            }
+            None => {
+                return Err(SplitError::Malformed(format!(
+                    "user input {i} is not signed"
+                )))
+            }
         }
     }
     Ok(())
+}
+
+/// After the daemon co-signs, EVERY input of the resulting PSBT must carry an ALL-family signature
+/// before we broadcast (#314). The byte-for-byte unsigned-tx check (a) does not cover per-input PSBT
+/// fields such as the sighash flag, and whoever submitted the PSBT controls those, so an input the
+/// daemon just signed is re-verified here exactly like a user input: a non-ALL or still-unsigned input
+/// fails closed. This is the backstop that lets `validate_user_signed` accept a daemon-owned input as
+/// unsigned without ever broadcasting one that is not finally ALL-signed.
+pub fn verify_cosigned_all_family(cosigned_psbt_b64: &str) -> Result<(), SplitError> {
+    use std::str::FromStr;
+    let psbt = Psbt::from_str(cosigned_psbt_b64)
+        .map_err(|e| SplitError::Malformed(format!("co-signed psbt: {e}")))?;
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        match input_all_family(input) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(SplitError::Malformed(format!(
+                    "input {i} is not signed with SIGHASH_ALL after co-sign"
+                )))
+            }
+            None => {
+                return Err(SplitError::Malformed(format!(
+                    "input {i} is unsigned after co-sign"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a PSBT input is signed, and if so whether with an ALL-family sighash. `None` = no signature
+/// in any form (partial or finalized). `Some(true)` = signed ALL-family (0x01, or the fork's 0x21, or
+/// taproot DEFAULT/ALL). `Some(false)` = signed with a non-ALL sighash (ANYONECANPAY/NONE/SINGLE), which
+/// would be replayable. A signer may leave the signature as a PSBT partial_sig/tap_key_sig OR already
+/// FINALIZE the input (Bitcoin Core does the latter when it can fully satisfy one), so both forms are read.
+fn input_all_family(input: &bitcoin::psbt::Input) -> Option<bool> {
+    if !input.partial_sigs.is_empty() {
+        Some(
+            input
+                .partial_sigs
+                .values()
+                .all(|s| s.sighash_type == EcdsaSighashType::All),
+        )
+    } else if let Some(s) = input.tap_key_sig.as_ref() {
+        Some(matches!(
+            s.sighash_type,
+            TapSighashType::Default | TapSighashType::All
+        ))
+    } else if let Some(w) = input.final_script_witness.as_ref() {
+        Some(w.iter().next().map(sig_is_all_family).unwrap_or(false))
+    } else {
+        input.final_script_sig.as_ref().map(|ss| {
+            first_push(ss)
+                .map(|s| sig_is_all_family(&s))
+                .unwrap_or(false)
+        })
+    }
 }
 
 /// Is a raw signature's sighash flag an ALL-family one (never ANYONECANPAY/NONE/SINGLE)? A 64-byte
@@ -805,6 +849,11 @@ pub struct SplitState {
     /// `#[serde(default)]` so an existing split.json without it still loads.
     #[serde(default)]
     meta: HashMap<String, SplitMeta>,
+    /// job_id -> the job's SHA-Coin inputs that the daemon's own hot funding wallet holds and will sign
+    /// at submit (#314), as `"txid:vout"`. Empty/absent for the ordinary user-held-coin job (the user
+    /// signs those out of band). The marker is always daemon-signed and is tracked by the pool, not here.
+    #[serde(default)]
+    daemon_inputs: HashMap<String, Vec<String>>,
     /// Completed splits, newest appended last (#218). `#[serde(default)]` for backward-compatible load.
     #[serde(default)]
     history: Vec<SplitRecord>,
@@ -835,6 +884,20 @@ impl SplitState {
     /// Park the build-time display metadata for `job_id` (#218), consumed by [`record_submit`].
     pub fn set_meta(&mut self, job_id: &str, meta: SplitMeta) {
         self.meta.insert(job_id.to_owned(), meta);
+    }
+
+    /// Record the job's SHA-Coin inputs that the daemon's hot funding wallet holds and will sign at
+    /// submit (#314). `"txid:vout"` strings, matching how a coin is named elsewhere.
+    pub fn set_daemon_inputs(&mut self, job_id: &str, inputs: Vec<String>) {
+        self.daemon_inputs.insert(job_id.to_owned(), inputs);
+    }
+
+    /// The daemon-signed SHA-Coin inputs recorded for `job_id` (#314), or empty for a user-held job.
+    pub fn daemon_inputs(&self, job_id: &str) -> &[String] {
+        self.daemon_inputs
+            .get(job_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// On a successful broadcast, append a completed-split history entry (#218) from the job's parked
@@ -868,6 +931,7 @@ impl SplitState {
         for job_id in self.pool.expire(now, timeout) {
             self.jobs.remove(&job_id);
             self.meta.remove(&job_id);
+            self.daemon_inputs.remove(&job_id);
         }
     }
 
@@ -875,6 +939,7 @@ impl SplitState {
     /// recovered coin never becomes a future marker. Returns the consumed marker.
     pub fn finish_job(&mut self, job_id: &str, change_txid: String) -> Option<Marker> {
         self.jobs.remove(job_id);
+        self.daemon_inputs.remove(job_id);
         self.pool.consume(job_id, change_txid)
     }
 }
@@ -1208,7 +1273,7 @@ mod tests {
     #[test]
     fn submit_refuses_an_unsigned_user_input() {
         let (expected, psbt, marker) = unsigned_job();
-        assert!(validate_user_signed(&expected, &psbt.to_string(), marker).is_err());
+        assert!(validate_user_signed(&expected, &psbt.to_string(), &[marker]).is_err());
     }
 
     #[test]
@@ -1216,7 +1281,7 @@ mod tests {
         let (expected, mut psbt, marker) = unsigned_job();
         let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
         psbt.inputs[0].partial_sigs.insert(pk, sig);
-        validate_user_signed(&expected, &psbt.to_string(), marker).unwrap();
+        validate_user_signed(&expected, &psbt.to_string(), &[marker]).unwrap();
     }
 
     #[test]
@@ -1230,7 +1295,7 @@ mod tests {
             let (pk, sig) = dummy_ecdsa(bad);
             psbt.inputs[0].partial_sigs.insert(pk, sig);
             assert!(
-                validate_user_signed(&expected, &psbt.to_string(), marker).is_err(),
+                validate_user_signed(&expected, &psbt.to_string(), &[marker]).is_err(),
                 "sighash {bad:?} must be refused"
             );
         }
@@ -1254,7 +1319,7 @@ mod tests {
         )
         .unwrap();
         let other_hex = serialize_hex(&other.parse::<Psbt>().unwrap().unsigned_tx);
-        assert!(validate_user_signed(&other_hex, &psbt.to_string(), marker).is_err());
+        assert!(validate_user_signed(&other_hex, &psbt.to_string(), &[marker]).is_err());
     }
 
     #[test]
@@ -1267,7 +1332,7 @@ mod tests {
             psbt.inputs[0].final_script_witness =
                 Some(Witness::from_slice(&[sig, vec![0x02u8; 33]]));
             assert_eq!(
-                validate_user_signed(&expected, &psbt.to_string(), marker).is_ok(),
+                validate_user_signed(&expected, &psbt.to_string(), &[marker]).is_ok(),
                 ok,
                 "finalized sighash flag {flag:#x} should be ok={ok}"
             );
@@ -1281,7 +1346,46 @@ mod tests {
         psbt.inputs[0].partial_sigs.insert(pk, sig); // user signed (ok)
         let (pk2, sig2) = dummy_ecdsa(EcdsaSighashType::All);
         psbt.inputs[1].partial_sigs.insert(pk2, sig2); // marker pre-signed (NOT ok)
-        assert!(validate_user_signed(&expected, &psbt.to_string(), marker).is_err());
+        assert!(validate_user_signed(&expected, &psbt.to_string(), &[marker]).is_err());
+    }
+
+    #[test]
+    fn submit_accepts_a_daemon_owned_coin_left_unsigned() {
+        // #314: a SHA-Coin held in our own hot funding wallet is listed in daemon_inputs (alongside the
+        // marker) and left unsigned - the daemon signs it at co-sign - so the gate accepts it unsigned,
+        // with no user input left to require a signature on.
+        let (expected, psbt, marker) = unsigned_job();
+        let coin = psbt.unsigned_tx.input[0].previous_output;
+        validate_user_signed(&expected, &psbt.to_string(), &[marker, coin]).unwrap();
+    }
+
+    #[test]
+    fn submit_refuses_a_pre_signed_daemon_owned_coin() {
+        // A daemon-signed input must be left unsigned for us, exactly like the marker (#314).
+        let (expected, mut psbt, marker) = unsigned_job();
+        let coin = psbt.unsigned_tx.input[0].previous_output;
+        let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[0].partial_sigs.insert(pk, sig);
+        assert!(validate_user_signed(&expected, &psbt.to_string(), &[marker, coin]).is_err());
+    }
+
+    #[test]
+    fn cosigned_check_requires_every_input_all_signed() {
+        // #314 backstop: after the daemon co-signs, every input must carry an ALL-family signature.
+        let (_expected, mut psbt, _marker) = unsigned_job();
+        // An unsigned input (nothing co-signed yet) is refused.
+        assert!(verify_cosigned_all_family(&psbt.to_string()).is_err());
+        // Both inputs ALL-signed: accepted.
+        let (pk, sig) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[0].partial_sigs.insert(pk, sig);
+        let (pk2, sig2) = dummy_ecdsa(EcdsaSighashType::All);
+        psbt.inputs[1].partial_sigs.insert(pk2, sig2);
+        verify_cosigned_all_family(&psbt.to_string()).unwrap();
+        // Flip one input to ANYONECANPAY: refused.
+        psbt.inputs[1].partial_sigs.clear();
+        let (pk3, sig3) = dummy_ecdsa(EcdsaSighashType::AllPlusAnyoneCanPay);
+        psbt.inputs[1].partial_sigs.insert(pk3, sig3);
+        assert!(verify_cosigned_all_family(&psbt.to_string()).is_err());
     }
 
     // ---- P3: wallet survey ----
