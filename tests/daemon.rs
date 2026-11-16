@@ -572,3 +572,90 @@ fn psbt_ur_encodes_a_valid_psbt_and_rejects_garbage() {
         "a missing psbt field is a 400"
     );
 }
+
+#[test]
+fn psbt_from_ur_round_trips_and_rejects_garbage() {
+    // #274 PR2: the scan-back decode endpoint. A full set of ur:crypto-psbt parts decodes back to the
+    // same base64 PSBT; a partial set is complete:false; garbage is refused. No engine or node needed.
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Psbt, Transaction};
+
+    let (addr, token) = daemon();
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let psbt_b64 = Psbt::from_unsigned_tx(tx).unwrap().to_string();
+
+    // Encode with a tiny fragment length to force several parts.
+    let (_c, body) = request(
+        &addr,
+        "POST",
+        "/psbt/ur",
+        Some(&token),
+        &format!(r#"{{"psbt":"{psbt_b64}","max_fragment_len":2}}"#),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let parts: Vec<String> = v["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_owned())
+        .collect();
+    assert!(parts.len() > 1, "forced multipart: {body}");
+
+    let parts_json = serde_json::to_string(&parts).unwrap();
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/psbt/from-ur",
+        Some(&token),
+        &format!(r#"{{"parts":{parts_json}}}"#),
+    );
+    assert_eq!(code, 200, "decode: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["complete"], true, "{body}");
+    assert_eq!(
+        v["psbt"].as_str().unwrap(),
+        psbt_b64,
+        "round-trips to the same PSBT"
+    );
+
+    let one = serde_json::to_string(&parts[..1]).unwrap();
+    let (_code, body) = request(
+        &addr,
+        "POST",
+        "/psbt/from-ur",
+        Some(&token),
+        &format!(r#"{{"parts":{one}}}"#),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["complete"], false, "a partial set is incomplete: {body}");
+
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/psbt/from-ur",
+            Some(&token),
+            r#"{"parts":["UR:CRYPTO-PSBT/1-2/notrealbytewords"]}"#,
+        )
+        .0,
+        422,
+        "garbage parts are refused"
+    );
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/psbt/from-ur",
+            Some(&token),
+            r#"{"nope":1}"#
+        )
+        .0,
+        400,
+    );
+}
