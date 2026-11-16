@@ -525,7 +525,7 @@ function renderReplayWarn(el) {
     } else {
       el.innerHTML =
         `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting is not ` +
-        `available while Blake2b funding is ${xbtcMode} (issue #310) — fund this leg from coins that ` +
+        `available while Blake2b funding is ${xbtcMode} (issue #310); fund this leg from coins that ` +
         `are already separated.`;
     }
     return;
@@ -926,6 +926,73 @@ async function loadHistory() {
 // can wipe what the user is typing/pasting (#265). Cleared on a successful submit.
 const psbtDrafts = {};
 
+// #274: animated UR (ur:crypto-psbt) QR of the unsigned funding PSBT, for air-gapped signers. State
+// lives outside the DOM because the detail panel re-renders on every poll: `qrParts` caches the parts
+// per swap (so we don't refetch each poll), `qrShown` remembers whether the user opened the QR (so it
+// is re-attached after a rebuild), and a single `qrTimer` drives the frame animation.
+const qrParts = {}; // id -> { psbt, parts }: keyed by PSBT content so a re-parked PSBT is never stale
+const qrShown = {};
+let qrTimer = null;
+let qrFrame = 0;
+
+function stopQrAnim() {
+  if (qrTimer) {
+    clearInterval(qrTimer);
+    qrTimer = null;
+  }
+}
+
+// Draw one UR part string as a QR on `canvas`, alphanumeric mode (the parts are upper-case + ":/-", in
+// the QR alphanumeric set, so the code stays low-version). Returns false if it could not be encoded.
+function drawQr(canvas, text) {
+  try {
+    const qr = qrcode(0, "M"); // auto version, medium error correction
+    qr.addData(text, "Alphanumeric");
+    qr.make();
+    const n = qr.getModuleCount();
+    const ctx = canvas.getContext("2d");
+    const quiet = 2;
+    const cell = Math.floor(canvas.width / (n + quiet * 2));
+    const off = Math.floor((canvas.width - cell * (n + quiet * 2)) / 2) + quiet * cell;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#000";
+    for (let r = 0; r < n; r++)
+      for (let c = 0; c < n; c++)
+        if (qr.isDark(r, c)) ctx.fillRect(off + c * cell, off + r * cell, cell, cell);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Attach the animation to the current #qr-canvas for swap `id` (the element is recreated on each
+// re-render). Self-stops when that canvas leaves the document, so a closed/rebuilt panel leaves no
+// timer running.
+function startQrAnim(id) {
+  stopQrAnim();
+  const parts = qrParts[id] && qrParts[id].parts;
+  const box = $("#qr-box");
+  const canvas = $("#qr-canvas");
+  const label = $("#qr-label");
+  if (!parts || !parts.length || !box || !canvas) return;
+  box.classList.remove("hidden");
+  qrFrame = qrFrame % parts.length;
+  const paint = () => {
+    if (!document.body.contains(canvas)) return stopQrAnim();
+    const ok = drawQr(canvas, parts[qrFrame]);
+    if (label)
+      label.textContent = ok
+        ? parts.length > 1
+          ? `Frame ${qrFrame + 1} / ${parts.length} · scan the whole loop (SeedSigner, Coldcard Q)`
+          : "Scan with your air-gapped signer (SeedSigner, Coldcard Q)"
+        : "This PSBT is too large to show as a QR; use Copy instead.";
+    qrFrame = (qrFrame + 1) % parts.length;
+  };
+  paint();
+  if (parts.length > 1) qrTimer = setInterval(paint, 600);
+}
+
 async function fillSwapDetail(id, box) {
   // Only show the placeholder on first open; on a refresh keep the current content so the panel does
   // not flash or tear down the signing inputs (#265).
@@ -935,6 +1002,8 @@ async function fillSwapDetail(id, box) {
   if (!st || st.open !== id) return; // row closed or changed during the fetch
   const live = $("#swaps-table").querySelector(".detail-box");
   if (!live) return;
+  // The panel is about to be rebuilt; stop any QR animation bound to the old (detaching) canvas (#274).
+  stopQrAnim();
   if (!s) { live.innerHTML = `<span class="muted">detail unavailable</span>`; return; }
   const c = s.chain || {};
   // Our own lock is on our side of the swap, which is the taker lock when we are the taker (#73).
@@ -1006,7 +1075,8 @@ async function fillSwapDetail(id, box) {
             `engine broadcasts it as part of the swap. Broadcasting it yourself can strand your coins in a ` +
             `lock only the engine can refund.</p>` +
             `<label>Unsigned PSBT (copy)<textarea readonly rows="3" class="copyable" id="unsigned-psbt">${escapeHtml(s.pending_lock_psbt)}</textarea></label>` +
-            `<div class="row" style="justify-content:flex-end"><button class="ghost" type="button" id="copy-psbt">Copy</button></div>`) +
+            `<div class="row" style="justify-content:flex-end;gap:.4rem"><button class="ghost" type="button" id="qr-psbt" title="Show the unsigned PSBT as an animated QR to scan with an air-gapped signer (SeedSigner, Coldcard Q)">Show QR</button><button class="ghost" type="button" id="copy-psbt">Copy</button></div>` +
+            `<div id="qr-box" class="hidden" style="text-align:center;margin:.4rem 0"><canvas id="qr-canvas" width="340" height="340" style="max-width:100%;image-rendering:pixelated;background:#fff;border-radius:4px"></canvas><p class="muted" id="qr-label" style="margin:.2rem 0"></p></div>`) +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea></label>` +
         `<div class="row" style="justify-content:space-between;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`
@@ -1075,6 +1145,48 @@ async function fillSwapDetail(id, box) {
                 : err;
         }
       };
+    // #274: animated UR QR of the unsigned PSBT for air-gapped signers. Only the descriptor-backed
+    // branch has #unsigned-psbt (output-only parks an inputless PSBT no QR signer can sign, #261).
+    const qrBtn = live.querySelector("#qr-psbt");
+    if (qrBtn) {
+      const psbt = s.pending_lock_psbt;
+      const cached = () => qrParts[id] && qrParts[id].psbt === psbt;
+      const setLabel = () => (qrBtn.textContent = qrShown[id] ? "Hide QR" : "Show QR");
+      // Fetch (if this exact PSBT is not cached) the UR parts, then start/continue the animation.
+      const open = async (resetFrame) => {
+        if (!cached()) {
+          qrBtn.textContent = "Encoding…";
+          try {
+            const r = await api("POST", "/psbt/ur", { psbt });
+            qrParts[id] = { psbt, parts: r.parts || [] };
+          } catch (e) {
+            qrShown[id] = false;
+            setLabel();
+            const m = live.querySelector("#psbt-msg");
+            if (m) m.textContent = "Could not build the QR: " + ((e.data && e.data.error) || "error");
+            return;
+          }
+        }
+        if (resetFrame) qrFrame = 0;
+        setLabel();
+        startQrAnim(id);
+      };
+      qrBtn.onclick = () => {
+        if (qrShown[id]) {
+          qrShown[id] = false;
+          stopQrAnim();
+          const box = live.querySelector("#qr-box");
+          if (box) box.classList.add("hidden");
+          setLabel();
+          return;
+        }
+        qrShown[id] = true;
+        open(true);
+      };
+      // Re-attach after a poll rebuilt the panel, if the user had it open: continue the animation,
+      // refetching only if the parked PSBT changed (so the QR never shows a stale PSBT, #274).
+      if (qrShown[id]) open(false);
+    }
   }
 }
 

@@ -27,4 +27,5 @@ pub mod split;
 pub mod store;
 pub mod swap;
 pub mod transport;
+pub mod ur;
 pub mod ws;

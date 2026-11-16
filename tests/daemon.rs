@@ -304,6 +304,13 @@ fn the_gui_is_served_with_the_token_injected() {
         200,
         "app.css not served"
     );
+    // #274: the vendored QR generator is served same-origin (script-src 'self').
+    let (code, qr) = request(&addr, "GET", "/qrcode.js", None, "");
+    assert_eq!(code, 200, "qrcode.js not served");
+    assert!(
+        qr.contains("qrcode-generator"),
+        "qrcode.js provenance banner present"
+    );
 }
 
 #[test]
@@ -496,4 +503,59 @@ fn funding_survey_validates_chain_and_handles_output_only_without_a_node() {
     assert_eq!(v["unverified"], serde_json::json!(false));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn psbt_ur_encodes_a_valid_psbt_and_rejects_garbage() {
+    // #274: the stateless PSBT -> ur:crypto-psbt QR endpoint. A valid PSBT returns UPPER-CASE UR
+    // part strings (QR alphanumeric mode); garbage is a 422. No engine or node needed.
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Psbt, Transaction};
+
+    let (addr, token) = daemon();
+
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let psbt = Psbt::from_unsigned_tx(tx).unwrap().to_string();
+
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/psbt/ur",
+        Some(&token),
+        &format!(r#"{{"psbt":"{psbt}"}}"#),
+    );
+    assert_eq!(code, 200, "a valid PSBT encodes: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["count"].as_u64().unwrap() >= 1);
+    let parts = v["parts"].as_array().unwrap();
+    assert!(!parts.is_empty());
+    assert!(
+        parts[0].as_str().unwrap().starts_with("UR:CRYPTO-PSBT/"),
+        "parts are upper-case ur:crypto-psbt: {}",
+        parts[0]
+    );
+
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/psbt/ur",
+            Some(&token),
+            r#"{"psbt":"not-a-psbt"}"#
+        )
+        .0,
+        422,
+        "garbage is rejected"
+    );
+    assert_eq!(
+        request(&addr, "POST", "/psbt/ur", Some(&token), r#"{"nope":1}"#).0,
+        400,
+        "a missing psbt field is a 400"
+    );
 }
