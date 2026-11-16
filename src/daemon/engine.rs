@@ -531,6 +531,16 @@ pub(crate) fn lock_json(lock: &Option<LockView>, height: u32, required_depth: u3
             "required_depth": required_depth,
             "amount_ok": l.amount_ok,
             "spent": l.spend.is_some(),
+            // #307: the spend of this lock (a claim or a refund). Its depth is the confirmation progress
+            // of the claim, so the GUI can show a countdown during `claiming` instead of just "spent":
+            // the swap reaches `done` once a claim is `required_depth` deep. `is_claim` (the spend
+            // revealed the HTLC preimage) separates a claim from a refund branch.
+            "spend": l.spend.as_ref().map(|sp| json!({
+                "confirmations": sp.depth,
+                "required_depth": required_depth,
+                "ours": sp.ours,
+                "is_claim": sp.preimage.is_some(),
+            })),
         }),
         None => Value::Null,
     }
@@ -676,5 +686,40 @@ mod tests {
         assert_eq!(j["refund_in_blocks"], 34); // 100 + 40 - 1 - 105
         assert_eq!(j["taker_lock"], Value::Null);
         assert_eq!(j["maker_lock"]["spent"], false);
+    }
+
+    #[test]
+    fn lock_json_exposes_spend_claim_progress() {
+        // #307: a spent lock carries its spend's confirmation progress, so the GUI shows a claim/refund
+        // countdown during `claiming` instead of a bare "spent". A preimage in the spend marks a claim.
+        let lock = LockView {
+            outpoint: OutPoint::null(),
+            value: Amount::from_sat(500_000),
+            amount_ok: true,
+            confirmed_height: Some(100),
+            spend: Some(crate::swap::SpendView {
+                preimage: Some([7u8; crate::htlc::PREIMAGE_LEN]),
+                depth: 2,
+                ours: true,
+            }),
+            fee: crate::swap::FeeState::NotRequired,
+        };
+        let j = lock_json(&Some(lock), 110, 3);
+        assert_eq!(j["spent"], true);
+        assert_eq!(j["spend"]["confirmations"], 2);
+        assert_eq!(j["spend"]["required_depth"], 3);
+        assert_eq!(j["spend"]["ours"], true);
+        assert_eq!(j["spend"]["is_claim"], true);
+
+        // A lock with no spend has a null spend object.
+        let unspent = LockView {
+            outpoint: OutPoint::null(),
+            value: Amount::from_sat(500_000),
+            amount_ok: true,
+            confirmed_height: Some(100),
+            spend: None,
+            fee: crate::swap::FeeState::NotRequired,
+        };
+        assert_eq!(lock_json(&Some(unspent), 110, 3)["spend"], Value::Null);
     }
 }
