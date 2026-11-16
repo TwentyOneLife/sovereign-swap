@@ -1057,6 +1057,112 @@ function startQrAnim(id) {
   if (parts.length > 1) qrTimer = setInterval(paint, 600);
 }
 
+// #274 PR2: scan a signed PSBT back from an air-gapped signer's animated ur:crypto-psbt QR, via the
+// camera (getUserMedia) or an uploaded image. Each decoded frame is a UR fragment; the growing set is
+// POSTed to the daemon's /psbt/from-ur, which fountain-reassembles them. On completion `onPsbt(base64)`
+// fires. jsQR (vendored, verified) does the per-frame QR decode; the daemon does the UR decode.
+async function startPsbtScan(onPsbt) {
+  const ov = document.createElement("div");
+  ov.style.cssText =
+    "position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px";
+  ov.innerHTML =
+    `<div style="color:#ddd;font-size:15px">Scan the signer's animated QR (SeedSigner, Sparrow, Shrike)</div>` +
+    `<video id="scan-video" playsinline muted style="max-width:92vw;max-height:58vh;border-radius:8px;background:#000"></video>` +
+    `<canvas id="scan-canvas" style="display:none"></canvas>` +
+    `<div id="scan-status" style="color:var(--orange);font-size:14px">starting camera…</div>` +
+    `<div style="display:flex;gap:12px;align-items:center">` +
+    `<label class="link" style="color:#ddd;cursor:pointer">Use an image instead<input id="scan-file" type="file" accept="image/*" style="display:none"></label>` +
+    `<button id="scan-close" class="ghost" type="button">Cancel</button></div>`;
+  document.body.appendChild(ov);
+  const video = ov.querySelector("#scan-video");
+  const canvas = ov.querySelector("#scan-canvas");
+  const status = ov.querySelector("#scan-status");
+  const parts = new Set();
+  let stream = null,
+    raf = null,
+    done = false,
+    posting = false,
+    lastScan = 0;
+  const cleanup = () => {
+    done = true;
+    if (raf) cancelAnimationFrame(raf);
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    ov.remove();
+  };
+  ov.querySelector("#scan-close").onclick = cleanup;
+
+  // Decode one frame's QR; collect UR parts; ask the daemon to reassemble. One POST in flight at a time.
+  const onImage = async (data, w, h) => {
+    if (done || typeof jsQR !== "function") return;
+    const code = jsQR(data, w, h);
+    if (!code || !code.data) return;
+    const str = code.data.trim();
+    if (!/^ur:crypto-psbt\//i.test(str)) {
+      status.textContent = "that QR is not a ur:crypto-psbt PSBT";
+      return;
+    }
+    if (parts.has(str) || posting) return;
+    parts.add(str);
+    status.textContent = `read ${parts.size} frame(s)…`;
+    posting = true;
+    try {
+      const r = await api("POST", "/psbt/from-ur", { parts: [...parts] });
+      if (r.complete && r.psbt) {
+        cleanup();
+        onPsbt(r.psbt);
+      }
+    } catch (e) {
+      status.textContent = "✗ " + ((e.data && e.data.error) || "decode failed");
+    } finally {
+      posting = false;
+    }
+  };
+
+  ov.querySelector("#scan-file").onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    // A data: URL, not a blob: one, so the <img> load satisfies the GUI's `img-src 'self' data:` CSP.
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        onImage(d.data, d.width, d.height);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(f);
+  };
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    video.srcObject = stream;
+    await video.play();
+    status.textContent = "point at the animated QR…";
+    const ctx = canvas.getContext("2d");
+    const loop = (ts) => {
+      if (done) return;
+      // Throttle the decode to ~6/s: full-frame QR decode is CPU-heavy, and signers animate slowly.
+      if (video.readyState >= 2 && ts - lastScan > 160) {
+        lastScan = ts;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        onImage(d.data, d.width, d.height);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+  } catch (_e) {
+    status.textContent = "camera unavailable (allow access, or use an image instead)";
+  }
+}
+
 async function fillSwapDetail(id, box) {
   // Only show the placeholder on first open; on a refresh keep the current content so the panel does
   // not flash or tear down the signing inputs (#265).
@@ -1147,7 +1253,7 @@ async function fillSwapDetail(id, box) {
             `<div id="qr-box" class="hidden" style="text-align:center;margin:.4rem 0"><canvas id="qr-canvas" width="340" height="340" style="max-width:100%;image-rendering:pixelated;background:#fff;border-radius:4px"></canvas><p class="muted" id="qr-label" style="margin:.2rem 0"></p></div>`) +
         `<label>Signed PSBT (paste)<textarea id="signed-psbt" rows="3" placeholder="cHNidP8B…"></textarea>` +
         `<span class="muted" style="font-size:.85em">Paste the signed PSBT in Base64 (it starts with <code>cHNidP8B</code>), not a raw transaction.</span></label>` +
-        `<div class="row" style="justify-content:space-between;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
+        `<div class="row" style="justify-content:space-between;gap:.4rem"><span style="display:flex;gap:.4rem"><button class="ghost" type="button" id="paste-psbt">Paste</button><button class="ghost" type="button" id="scan-psbt" title="Scan the signed PSBT back from an air-gapped signer's QR (camera or image)">Scan QR</button></span><button class="primary" id="submit-psbt">Submit signed PSBT</button></div>` +
         `<p class="muted" id="psbt-msg"></p></div>`
       : "");
   if (s.pending_lock_psbt) {
@@ -1189,6 +1295,17 @@ async function fillSwapDetail(id, box) {
           if (ta) ta.focus(); // clipboard read blocked: let the user paste manually
         }
       };
+    const scanBtn = live.querySelector("#scan-psbt");
+    if (scanBtn)
+      scanBtn.onclick = () =>
+        startPsbtScan((psbt) => {
+          if (ta) {
+            ta.value = psbt;
+            psbtDrafts[id] = psbt;
+            const m = live.querySelector("#psbt-msg");
+            if (m) m.textContent = "✓ Scanned a signed PSBT. Review, then Submit.";
+          }
+        });
     const btn = live.querySelector("#submit-psbt");
     if (btn)
       btn.onclick = async () => {
@@ -1442,6 +1559,12 @@ function loadSplit() {
       }
     }
   });
+  $("#sp-scan").addEventListener("click", () =>
+    startPsbtScan((psbt) => {
+      $("#sp-signed").value = psbt;
+      $("#sp-step2").textContent = "✓ Scanned a signed transaction. Review, then Submit.";
+    }),
+  );
   $("#sp-submit").addEventListener("click", async () => {
     const psbt = $("#sp-signed").value.trim();
     if (!psbt) { $("#sp-step2").textContent = "Paste your signed PSBT first."; return; }

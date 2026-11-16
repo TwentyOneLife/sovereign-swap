@@ -95,6 +95,8 @@ const APP_JS: &str = include_str!("../gui/app.js");
 /// Vendored QR Code generator (qrcode-generator 1.4.4, MIT), for the funding-PSBT animated QR (#274).
 /// Served same-origin and compiled in, so it is pinned and reproducible; provenance in its header.
 const QRCODE_JS: &str = include_str!("../gui/qrcode.js");
+/// jsQR, the vendored QR DECODER for scan-back (#274 PR2); verified + audited, see its banner.
+const JSQR_JS: &str = include_str!("../gui/jsQR.js");
 
 /// Response headers that harden the embedded GUI: `frame-ancestors`/`X-Frame-Options` block framing
 /// (clickjacking), the CSP pins every resource to this origin, and `base-uri`/`form-action` close the
@@ -613,7 +615,7 @@ impl Daemon {
             let is_page = req.method == "GET"
                 && matches!(
                     req.path.as_str(),
-                    "/" | "/index.html" | "/app.css" | "/app.js" | "/qrcode.js"
+                    "/" | "/index.html" | "/app.css" | "/app.js" | "/qrcode.js" | "/jsQR.js"
                 );
             if is_page && !self.basic_ok(&req, &user, &pass) {
                 return self.write_unauthorized_basic(&mut stream);
@@ -661,6 +663,13 @@ impl Daemon {
                         &mut stream,
                         "application/javascript; charset=utf-8",
                         QRCODE_JS.as_bytes(),
+                    )
+                }
+                "/jsQR.js" => {
+                    return self.write_asset(
+                        &mut stream,
+                        "application/javascript; charset=utf-8",
+                        JSQR_JS.as_bytes(),
                     )
                 }
                 _ => {}
