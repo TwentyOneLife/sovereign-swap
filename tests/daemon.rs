@@ -412,3 +412,42 @@ fn a_second_daemon_on_the_same_data_dir_is_refused_then_allowed_after_release() 
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn split_build_refuses_when_blake2b_funding_is_not_hot() {
+    // #301/#310: the split co-sign needs a KEYED Blake2b funding wallet. In cold / descriptor-backed
+    // funding it is watch-only, so /split/build refuses up front (before any node I/O) rather than
+    // ever sign the user's balance from a stale keyed left-over on the engine host. No bitcoind needed:
+    // the refusal is reached from settings alone. Points at #310 for the eventual cold-mode path.
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("sovswap-split-cold-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Bogus node addresses: the engine will not start (non-fatal), but /split/build never connects on
+    // this path. A fee address is set so the handler passes its fee-config gate and reaches the mode
+    // check; Blake2b funding is interactive (descriptor-backed/output-only), i.e. not hot.
+    let settings = r#"{"btc_node":"http://127.0.0.1:1","xbtc_node":"http://127.0.0.1:1",
+        "relays":["ws://127.0.0.1:1"],"signer":"hot","btc_conf":1,"xbtc_conf":1,"margin_blocks":2,
+        "btc_rpc_user":"u","btc_rpc_pass":"p","xbtc_rpc_user":"u","xbtc_rpc_pass":"p",
+        "fee_xbtc_address":"bcrt1qexample","xbtc_funding":{"mode":"interactive"}}"#;
+    std::fs::write(dir.join("settings.json"), settings).unwrap();
+    let (addr, token) = Daemon::open(&dir).unwrap().spawn().unwrap();
+
+    let (code, body) = request(
+        &addr,
+        "POST",
+        "/split/build",
+        Some(&token),
+        r#"{"dest":"bcrt1qdest","sha_coins":[{"txid":"aa","vout":0}]}"#,
+    );
+    assert_eq!(
+        code, 409,
+        "cold/descriptor Blake2b funding cannot co-sign a split: {body}"
+    );
+    assert!(
+        body.contains("#310"),
+        "the refusal points at the cold-mode split issue: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
