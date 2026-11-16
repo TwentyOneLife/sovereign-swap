@@ -815,12 +815,14 @@ impl ChainNode {
     }
 
     /// SPV proof bundle for one confirmed output (#247): the raw transaction, a Merkle (txout) proof
-    /// binding that txid into its block, and the block's 80-byte header, so a client that does not
+    /// binding that txid into its block, and the block's serialized header, so a client that does not
     /// trust this daemon (a light client, or a front treating the engine as untrusted) can verify a
     /// lock exists on-chain with the agreed amount and script before committing anything irreversible.
-    /// The block hash is resolved from the height and passed to `getrawtransaction`/`gettxoutproof`, so
-    /// neither needs a transaction index. A pruned node that no longer holds the block returns an RPC
-    /// error, which the caller surfaces rather than fabricating a proof.
+    /// The header is whatever the chain serves: 80 bytes on BTC (SHA256), and the extended form on BTC
+    /// (Blake2b), whose proof-of-work is BLAKE2b, so the client checks the right header and PoW per
+    /// chain. The block hash is resolved from the height and passed to `getrawtransaction`/
+    /// `gettxoutproof`, so neither needs a transaction index. A pruned node that no longer holds the
+    /// block returns an RPC error, which the caller surfaces rather than fabricating a proof.
     pub fn spv_proof(&self, outpoint: OutPoint, height: u32) -> Result<Value, NodeError> {
         let txid = outpoint.txid.to_string();
         let str_field = |v: Value, what: &str| -> Result<String, NodeError> {
