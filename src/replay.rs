@@ -33,6 +33,46 @@ pub fn check_inputs<L: UtxoLookup>(
     Ok(())
 }
 
+/// The funding view's prediction of the runtime guard (design 0001, #312): each funding UTXO
+/// classified by the SAME predicate `check_inputs` uses, so the view and the backstop can never
+/// disagree. An outpoint still unspent on the OTHER chain is replayable; one already spent there is
+/// safe. Fails closed like the guard: a lookup error marks the survey `unverified` and the coin is
+/// counted as NEITHER safe nor replayable, so `safe_sat` never over-counts (the caller treats
+/// unverified as not-safe).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReplaySurvey {
+    /// The replayable funding UTXOs (outpoint + value in sats), i.e. still unspent on the other chain.
+    pub replayable: Vec<(OutPoint, u64)>,
+    pub replayable_sat: u64,
+    /// Sum of UTXOs proven spent on the other chain (safe to fund a lock from).
+    pub safe_sat: u64,
+    /// True if any lookup errored; those coins are in neither total, so `safe_sat` stays conservative.
+    pub unverified: bool,
+}
+
+/// Survey funding UTXOs for cross-chain replay risk against `other_chain`, using the guard's own
+/// `is_unspent` predicate. `utxos` is `(outpoint, value_sat)`.
+pub fn survey_replay<L: UtxoLookup>(utxos: &[(OutPoint, u64)], other_chain: &L) -> ReplaySurvey {
+    let mut s = ReplaySurvey::default();
+    for (outpoint, value) in utxos {
+        match other_chain.is_unspent(outpoint) {
+            Ok(true) => {
+                s.replayable.push((*outpoint, *value));
+                s.replayable_sat += value;
+            }
+            Ok(false) => s.safe_sat += value,
+            // Fail closed and stop: once a lookup errors the survey is already `unverified` (the caller
+            // treats that as not-safe), so there is nothing to gain from more lookups, and a node that
+            // hangs rather than refuses would otherwise cost one timeout per remaining UTXO.
+            Err(_) => {
+                s.unverified = true;
+                break;
+            }
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +147,35 @@ mod tests {
             check_inputs(&spending(&[outpoint(1)]), &Unreachable),
             Err(ReplayError::Lookup("node unreachable"))
         );
+    }
+
+    #[test]
+    fn survey_splits_replayable_from_safe_by_the_guards_predicate() {
+        // outpoint(2) is still unspent on the other chain (replayable); outpoint(1) is not (safe).
+        let other = Stub(HashSet::from([outpoint(2)]));
+        let s = survey_replay(&[(outpoint(1), 1000), (outpoint(2), 2500)], &other);
+        assert_eq!(s.replayable, vec![(outpoint(2), 2500)]);
+        assert_eq!(s.replayable_sat, 2500);
+        assert_eq!(s.safe_sat, 1000);
+        assert!(!s.unverified);
+    }
+
+    #[test]
+    fn survey_fails_closed_marking_unverified_and_never_counting_safe() {
+        // A lookup error must not let a coin be counted as safe; it is unverified, in neither total.
+        let s = survey_replay(&[(outpoint(1), 1000), (outpoint(2), 2500)], &Unreachable);
+        assert!(s.unverified);
+        assert_eq!(s.safe_sat, 0);
+        assert_eq!(s.replayable_sat, 0);
+        assert!(s.replayable.is_empty());
+    }
+
+    #[test]
+    fn survey_of_coins_unique_to_this_chain_is_all_safe() {
+        let other = Stub(HashSet::from([outpoint(9)]));
+        let s = survey_replay(&[(outpoint(1), 500), (outpoint(2), 700)], &other);
+        assert_eq!(s.safe_sat, 1200);
+        assert_eq!(s.replayable_sat, 0);
+        assert!(!s.unverified);
     }
 }

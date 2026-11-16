@@ -731,6 +731,7 @@ impl Daemon {
             ("POST", "/offers") => self.post_offer(&req.body),
             ("GET", "/swaps") => self.get_swaps(),
             ("GET", "/history") => self.get_history(),
+            ("POST", "/funding/survey") => self.funding_survey(&req.body),
             ("POST", "/split/classify") => self.split_classify(&req.body),
             ("POST", "/split/scan") => self.split_scan(&req.body),
             ("GET", p) if p.starts_with("/split/scan/") => {
@@ -1161,6 +1162,145 @@ impl Daemon {
     /// while. Returns each coin as `{txid, vout, value_sat, kind, needs_split}`; the pre-fork ones (kind
     /// `sha_coin`, `needs_split` true) are the ones to protect. The actual split still builds from a
     /// specific coin (`/split/build`); this only resolves an address to its coins.
+    /// Funding-view replay pre-check (#312): classify the funding wallet's own UTXOs by the runtime
+    /// guard's predicate (unspent on the OTHER chain = cross-chain replayable), so the GUI can offer
+    /// split-first before a swap instead of hitting the guard and failing at signing time. One
+    /// `gettxout` per funding UTXO on the other chain: synchronous and cheap (no txindex, no scan),
+    /// and fails closed (a lookup error is reported `unverified`, never counted as safe).
+    fn funding_survey(&self, body: &[u8]) -> (u16, Value) {
+        let Ok(req) = serde_json::from_slice::<Value>(body) else {
+            return (400, json!({"error": "body must be JSON"}));
+        };
+        let chain = match req["chain"].as_str() {
+            Some("btc") => Chain::Btc,
+            Some("xbtc") => Chain::Xbtc,
+            _ => return (422, json!({"error": "chain must be \"btc\" or \"xbtc\""})),
+        };
+        let chain_str = match chain {
+            Chain::Btc => "btc",
+            Chain::Xbtc => "xbtc",
+        };
+        // This chain's node + funding mode (whose wallet we survey), and the OTHER chain's node (the
+        // replay lookup target, as `check_inputs` uses at swap time). Read under one lock.
+        #[allow(clippy::type_complexity)]
+        let (
+            (this_node, this_user, this_pass, this_ca),
+            (other_node, other_user, other_pass, other_ca),
+            output_only,
+            want_keyed,
+            tor,
+            wallet_base,
+        ) = {
+            let s = &self.state.lock().unwrap().settings;
+            let btc = (
+                s.btc_node.clone(),
+                s.btc_rpc_user.clone(),
+                s.btc_rpc_pass.clone(),
+                s.btc_rpc_ca.clone(),
+            );
+            let xbtc = (
+                s.xbtc_node.clone(),
+                s.xbtc_rpc_user.clone(),
+                s.xbtc_rpc_pass.clone(),
+                s.xbtc_rpc_ca.clone(),
+            );
+            let funding = match chain {
+                Chain::Btc => &s.btc_funding,
+                Chain::Xbtc => &s.xbtc_funding,
+            };
+            let (this_creds, other_creds) = match chain {
+                Chain::Btc => (btc, xbtc),
+                Chain::Xbtc => (xbtc, btc),
+            };
+            (
+                this_creds,
+                other_creds,
+                funding.is_output_only(),
+                funding.mode == FundingMode::Hot,
+                resolve_tor_socks(std::env::var("SWAP_TOR_SOCKS").ok(), &s.tor_socks),
+                format!(
+                    "swap-{}",
+                    self.identity_seed[..4].to_hex_string(Case::Lower)
+                ),
+            )
+        };
+        // Output-only funding keeps no daemon wallet to survey; the user funds from their own wallet,
+        // so the runtime guard is the only protection there (#313), nothing to pre-check here.
+        if output_only {
+            return (
+                200,
+                json!({
+                    "chain": chain_str, "output_only": true,
+                    "replayable": [], "replayable_sat": 0, "safe_sat": 0, "unverified": false,
+                }),
+            );
+        }
+        let this = match connect_client(&this_node, &this_user, &this_pass, &this_ca, &tor) {
+            Ok(c) => c,
+            Err(e) => return (502, json!({"error": format!("{chain_str} node: {e}")})),
+        };
+        let funding_name =
+            match crate::node::resolve_funding_wallet_name(&this, &wallet_base, want_keyed) {
+                Ok(n) => n,
+                Err(e) => {
+                    return (
+                        502,
+                        json!({"error": format!("resolve funding wallet: {e:?}")}),
+                    )
+                }
+            };
+        // Call listunspent directly (not the shared `list_unspent`, which swallows RPC errors): a
+        // failure here, e.g. the funding wallet not loaded, must be a 502, never a false "no coins /
+        // all safe". Fail closed.
+        let wallet = this.wallet(&funding_name);
+        let unspent = match wallet.call("listunspent", json!([1])) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    502,
+                    json!({"error": format!("{chain_str} funding wallet listunspent: {e:?}")}),
+                )
+            }
+        };
+        let utxos: Vec<(bitcoin::OutPoint, u64)> = unspent
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| {
+                Some((
+                    bitcoin::OutPoint {
+                        txid: u["txid"].as_str()?.parse().ok()?,
+                        vout: u["vout"].as_u64()? as u32,
+                    },
+                    (u["amount"].as_f64()? * 1e8).round() as u64,
+                ))
+            })
+            .collect();
+        // The other chain is the replay lookup target; a timeout so an unreachable node yields
+        // `unverified` (fail closed) rather than hanging the request.
+        let other = match connect_client(&other_node, &other_user, &other_pass, &other_ca, &tor) {
+            Ok(c) => c.with_timeout(SIGNER_TIMEOUT),
+            Err(e) => return (502, json!({"error": format!("other node: {e}")})),
+        };
+        let survey = crate::replay::survey_replay(&utxos, &other);
+        let replayable: Vec<Value> = survey
+            .replayable
+            .iter()
+            .map(|(op, v)| json!({"txid": op.txid.to_string(), "vout": op.vout, "value_sat": v}))
+            .collect();
+        (
+            200,
+            json!({
+                "chain": chain_str,
+                "output_only": false,
+                "replayable": replayable,
+                "replayable_sat": survey.replayable_sat,
+                "safe_sat": survey.safe_sat,
+                "unverified": survey.unverified,
+            }),
+        )
+    }
+
     fn split_scan(&self, body: &[u8]) -> (u16, Value) {
         let Ok(req) = serde_json::from_slice::<Value>(body) else {
             return (400, json!({"error": "body must be JSON"}));

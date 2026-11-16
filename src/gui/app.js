@@ -429,8 +429,16 @@ function fundingBalanceSat(chain) {
   const f = statusData && statusData.funding && statusData.funding[chain];
   return f && typeof f.balance_sat === "number" ? f.balance_sat : null;
 }
-// Update the funding preflight warning (#f-fund-warn placeholder) for the leg funded on `chain`.
-function updateFundWarn(chain) {
+// #312: the funding-view replay pre-check, cached per chain for the open sheet. The survey (one
+// gettxout per funding UTXO on the other chain) depends only on the wallet, not the leg amount, so we
+// fetch it once per chain and compare to the amount on each recompute. `replayWarnCtx` is the leg the
+// warning is currently rendered for, so an async survey that lands late only paints the right leg.
+const replaySurvey = {}; // chain -> survey | "loading" | {error:true}
+let replayWarnCtx = { chain: null, amount: 0 };
+
+// Update the funding preflight warning (#f-fund-warn placeholder) for the leg funded on `chain`,
+// locking `amountSat` (0/undefined while the amount is still being typed).
+function updateFundWarn(chain, amountSat) {
   const el = $("#f-fund-warn");
   if (!el) return;
   if (fundingOutputOnly(chain)) {
@@ -440,7 +448,9 @@ function updateFundWarn(chain) {
       `funding (advanced). You fund it by paying exact outputs from a wallet that can build a template, ` +
       `not by signing in Sparrow/Shrike. For the normal sign-in-your-wallet flow, set an account ` +
       `descriptor (descriptor-backed interactive) in Settings.`;
-  } else if (fundingBalanceSat(chain) === 0) {
+    return;
+  }
+  if (fundingBalanceSat(chain) === 0) {
     // #295: descriptor-backed but the funding wallet is empty, exactly the configured-but-unsynced
     // state that silently failed at signing time before.
     el.className = "warn";
@@ -448,10 +458,79 @@ function updateFundWarn(chain) {
       `<strong>Heads up:</strong> your ${chainShort(chain)} funding wallet shows a <strong>0 ` +
       `balance</strong>. It may need a rescan (set a funding birthday in Settings) or a deposit before ` +
       `this leg can fund.`;
-  } else {
+    return;
+  }
+  // Ready to fund: predict the runtime replay guard (#312). Fetch the survey once per chain.
+  replayWarnCtx = { chain, amount: amountSat || 0 };
+  if (replaySurvey[chain] === undefined) loadReplaySurvey(chain);
+  renderReplayWarn(el);
+}
+
+async function loadReplaySurvey(chain) {
+  replaySurvey[chain] = "loading";
+  try {
+    replaySurvey[chain] = await api("POST", "/funding/survey", { chain });
+  } catch (_) {
+    replaySurvey[chain] = { error: true };
+  }
+  const el = $("#f-fund-warn");
+  if (el && replayWarnCtx.chain === chain) renderReplayWarn(el);
+}
+
+// Paint the replay warning for the current leg from its cached survey. Warn only when the safe
+// (non-replayable) balance cannot cover this leg (coin selection may avoid the replayable coins, so
+// "has replayable coins" alone would over-warn); the mode decides whether a split is offered.
+function renderReplayWarn(el) {
+  const { chain, amount } = replayWarnCtx;
+  const d = replaySurvey[chain];
+  const clear = () => {
     el.className = "hidden";
     el.innerHTML = "";
+  };
+  if (!d || d === "loading" || d.output_only) return clear();
+  // Fail closed in the UI too: if the coins could not be verified against the other chain, say so,
+  // never silently treat them as all-safe. The runtime guard is still the backstop at signing.
+  if (d.error || d.unverified) {
+    el.className = "warn";
+    el.innerHTML =
+      `<strong>Heads up:</strong> could not fully verify your ${chainShort(chain)} funding coins ` +
+      `against the other chain (node unreachable). The replay guard still refuses any ` +
+      `cross-chain-replayable coin when you sign.`;
+    return;
   }
+  // Warn only when there ARE replayable coins AND the safe (non-replayable) balance cannot cover this
+  // leg: coin selection may avoid the replayable coins, so "has replayable coins" alone would
+  // over-warn, and too little total balance is the #295 0-balance concern, not a replay problem.
+  if (amount && d.replayable_sat > 0 && d.safe_sat < amount) {
+    // Whether a split is available depends ONLY on the Blake2b funding mode (the split co-sign runs on
+    // the Blake2b node and refuses unless it is hot, #310), not on the chain being funded.
+    const xbtcMode = (statusData && statusData.funding && statusData.funding.xbtc && statusData.funding.xbtc.mode) || "hot";
+    el.className = "warn";
+    const held =
+      `Your ${chainShort(chain)} funding wallet holds ${fmtSats(d.replayable_sat)} ${chainShort(chain)} ` +
+      `in pre-fork coin(s) that are replayable across chains, and only ${fmtSats(d.safe_sat)} that is ` +
+      `safe to lock, less than this leg needs.`;
+    if (xbtcMode === "hot") {
+      el.innerHTML =
+        `<strong>Split first.</strong> ${held} Separate them in the ` +
+        `<a href="#" id="f-go-split">Split</a> tab first, or the swap will be refused when you sign ` +
+        `the funding transaction.`;
+      const go = $("#f-go-split");
+      if (go)
+        go.addEventListener("click", (e) => {
+          e.preventDefault();
+          const tab = document.querySelector('.tab[data-tab="split"]');
+          if (tab) tab.click();
+        });
+    } else {
+      el.innerHTML =
+        `<strong>Heads up:</strong> ${held} The swap will refuse these coins, and splitting is not ` +
+        `available while Blake2b funding is ${xbtcMode} (issue #310) — fund this leg from coins that ` +
+        `are already separated.`;
+    }
+    return;
+  }
+  clear();
 }
 
 function offerForm(o) {
@@ -524,6 +603,8 @@ function createSheet() {
   // #253: refuse at the handler too, not only by disabling the button, since the status may change.
   const h = health();
   if (!h.trade) { alert("Create offer is unavailable right now: " + h.reason + "."); return; }
+  // #312: survey the funding wallet afresh for this sheet (so a just-finished split is not stale).
+  for (const k in replaySurvey) delete replaySurvey[k];
   openSheet(offerForm(null));
   let ref = null; // { rate: BTC per xBTC, band: price_band_pct, verify } or null when unavailable
   let refLoaded = false; // whether the first /reference-rate fetch has returned yet (#263)
@@ -560,7 +641,8 @@ function createSheet() {
     if (cc) cc.textContent = chainShort(taker);
     if (rc) rc.textContent = chainShort(sell);
     // #292: the maker funds (locks) the chain it sells; warn if that leg is output-only.
-    updateFundWarn(sell);
+    // #312: and whether its coins are cross-chain-replayable (split-first) for the amount being sold.
+    updateFundWarn(sell, parseBtc($("#f-amount").value));
     const amount = parseBtc($("#f-amount").value);
     if (!ref) {
       // No market-derived price. The form prices only from the market, so it cannot publish until the
@@ -659,9 +741,12 @@ function createSheet() {
 function takeSheet(o) {
   const h = health();
   if (!h.trade) { alert("Taking an offer is unavailable right now: " + h.reason + "."); return; }
+  // #312: survey the funding wallet afresh for this sheet (so a just-finished split is not stale).
+  for (const k in replaySurvey) delete replaySurvey[k];
   openSheet(offerForm(o));
   // #292: the taker funds its own lock on the taker chain; warn if that leg is output-only.
-  updateFundWarn(o.taker_chain);
+  // #312: the taker locks counter_amount_sat on the taker chain; flag replayable funding coins for it.
+  updateFundWarn(o.taker_chain, o.counter_amount_sat);
   $("#f-go").onclick = async () => {
     if (
       fundingOutputOnly(o.taker_chain) &&

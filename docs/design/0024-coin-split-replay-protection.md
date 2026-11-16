@@ -77,3 +77,16 @@ every user's split would spend the previous one's change and chain all users int
 The whole flow is exercised end to end by regtest tests against a Bitcoin Core + Knots BLAKE2b pair that
 share their pre-fork blocks, including a daemon-level test that drives build → sign → submit → broadcast
 and asserts the move is accepted on Blake2b and rejected on SHA256 for missing inputs.
+
+## Funding-view pre-check (split-first)
+
+Rather than let a swap fund a lock from a replayable coin and hit the runtime guard only when the user
+signs, the funding view predicts the guard: `POST /funding/survey {chain}` classifies the funding
+wallet's own UTXOs by the SAME predicate the guard uses (an outpoint still unspent on the OTHER chain is
+replayable), one `gettxout` per UTXO (no `txindex`, no scan). It returns
+`{ replayable, replayable_sat, safe_sat, unverified }`, fails closed (a lookup error is `unverified`,
+never counted safe), and the client warns, and offers a split first, only when there are replayable coins
+AND the safe balance cannot cover the leg. Output-only funding has no wallet to survey, so the guard is
+the only protection there. Deliberately NOT ancestry classification: a pre-fork coin already spent or
+split on the other chain is no longer replayable, and only the guard's own predicate agrees with the
+backstop. Splitting the flagged coins requires hot Blake2b funding (the co-sign needs a keyed wallet).
