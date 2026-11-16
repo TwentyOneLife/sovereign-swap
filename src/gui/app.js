@@ -382,10 +382,19 @@ async function dismissOffer(id, btn) {
 
 async function loadMarket() {
   loadMyOffers();
-  const offers = await api("GET", "/offers").catch(() => []);
-  $("#offers-empty").style.display = offers.length ? "none" : "block";
+  const [offers, swaps] = await Promise.all([
+    api("GET", "/offers").catch(() => []),
+    api("GET", "/swaps").catch(() => []),
+  ]);
+  // #304: hide an offer this node already has an ACTIVE swap on. The maker withdraws a taken offer
+  // (design 0250), but relay propagation lags, so a taker filters its own market locally and never
+  // re-takes its own in-flight offer. Terminal swaps are NOT filtered: a refunded offer is re-published
+  // and legitimately re-takeable, and a done offer has already left the market.
+  const engaged = new Set(swaps.filter((s) => !isTerminal(s)).map((s) => s.offer_id));
+  const visible = offers.filter((o) => !engaged.has(o.id));
+  $("#offers-empty").style.display = visible.length ? "none" : "block";
   mountTable($("#offers"), {
-    rows: offers,
+    rows: visible,
     rowId: (o) => o.id,
     defaultSort: 0, // Seen, newest first
     defaultDir: "desc",
