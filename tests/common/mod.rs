@@ -99,9 +99,22 @@ impl Node {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Value {
-        self.rpc
-            .call(method, params)
-            .unwrap_or_else(|e| panic!("{method}: {e:?}"))
+        // Retry only transient, pre-execution failures: the node not yet accepting connections, or
+        // still in warmup. A ConnectionRefused means the request never reached the node, and RPC -28
+        // means the node refused to run it while loading, so retrying is safe even for a non-idempotent
+        // method (nothing executed). An application error such as -4 is never retried (that would hide a
+        // real coin-selection bug). This absorbs the #317 flake where a loaded CI runner lets a call hit
+        // a node a moment before it is ready.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.rpc.call(method, params.clone()) {
+                Ok(v) => return v,
+                Err(e) if is_transient(&e) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => panic!("{method}: {e:?}"),
+            }
+        }
     }
 
     /// The test's own mining wallet, apart from any wallet an engine creates.
@@ -370,6 +383,35 @@ pub fn binaries() -> Option<(String, String)> {
             None
         }
     }
+}
+
+/// A node RPC failure that is safe to retry because the request never executed: the node was not yet
+/// accepting connections (ConnectionRefused), or was still in warmup (RPC -28). Never matches an
+/// application error such as -4 "Insufficient funds", which is a real result, not a transient.
+fn is_transient(e: &RpcError) -> bool {
+    match e {
+        RpcError::Io(io) => io.kind() == std::io::ErrorKind::ConnectionRefused,
+        RpcError::Rpc { code, .. } => *code == -28, // RPC_IN_WARMUP: "Loading block index..."
+        _ => false,
+    }
+}
+
+/// Wait until `wallet` on `node` shows a confirmed (minconf>=1) UTXO, mining while it waits, so a test
+/// never drives swap funding before the wallet has processed its just-mined funding block. Without this,
+/// a loaded CI runner can let `fund()` run against a wallet that has not yet seen its coin and fail with
+/// RPC -4 "Insufficient funds" (#317). A just-mined block's outputs are processed by the wallet atomically,
+/// so one confirmed UTXO means the whole funding block has landed.
+pub fn wait_for_confirmed_utxo(node: &Node, wallet: &str) {
+    let w = node.rpc.wallet(wallet);
+    for _ in 0..60 {
+        let utxos = w.call("listunspent", json!([1])).unwrap();
+        if utxos.as_array().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        node.mine(1);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("funding wallet {wallet} never showed a confirmed UTXO");
 }
 
 /// A deterministic forked pair for the coin-split tests: a Core (SHA256) node and a Knots (BLAKE2b)

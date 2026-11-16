@@ -189,6 +189,9 @@ impl World {
         maker.deposit(self.node(maker_chain), 2.0);
         taker.deposit(self.node(maker_chain.other()), 2.0);
         self.mine();
+        // #317: do not fund the swap until each wallet has processed its funding block (avoids a flaky -4).
+        common::wait_for_confirmed_utxo(self.node(maker_chain), "maker");
+        common::wait_for_confirmed_utxo(self.node(maker_chain.other()), "taker");
         maker.engine().publish(offer.clone()).unwrap();
         taker.tick();
         assert_eq!(taker.engine().seen_offers(), std::slice::from_ref(&offer));

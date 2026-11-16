@@ -26,7 +26,7 @@ use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, Network, PublicKey, ScriptBuf, Transaction, Txid};
 
-use common::{binaries, Node};
+use common::{binaries, wait_for_confirmed_utxo, Node};
 use sovereign_swap::engine::{Commitment, Config, Engine, EngineError};
 use sovereign_swap::envelope::Identity;
 use sovereign_swap::htlc::Contract;
@@ -101,19 +101,6 @@ fn open(
 fn tick(e: &mut Engine<Tp>) {
     let errs = e.tick();
     assert!(errs.is_empty(), "tick errors: {errs:?}");
-}
-
-fn wait_for_confirmed_utxo(node: &Node, wallet: &str) {
-    let w = node.rpc.wallet(wallet);
-    for _ in 0..60 {
-        let utxos = w.call("listunspent", serde_json::json!([1])).unwrap();
-        if utxos.as_array().is_some_and(|a| !a.is_empty()) {
-            return;
-        }
-        node.mine(1);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("funding wallet {wallet} never showed a confirmed UTXO");
 }
 
 /// The public commitment bundle the user derives from ITS OWN seed for swap `index`. Exactly what the

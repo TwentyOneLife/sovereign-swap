@@ -27,7 +27,7 @@ use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
-use common::{binaries, Node};
+use common::{binaries, wait_for_confirmed_utxo, Node};
 use sovereign_swap::engine::{Config, Engine, EngineError, FeeTamper};
 use sovereign_swap::envelope::Identity;
 use sovereign_swap::htlc::Contract;
@@ -223,23 +223,6 @@ fn tick(e: &mut Engine<Tp>) {
 
 /// Drive the two engines until the taker parks its funding lock awaiting the user's signature, and
 /// return the swap id and the parked unsigned PSBT.
-/// Wait until `wallet` on `node` reports a confirmed (minconf 1) UTXO, mining a block per retry so it
-/// is self-healing whether or not the caller pre-mined. Building the funding PSBT on an early tick
-/// otherwise races bitcoind's asynchronous wallet update after a freshly mined block, which
-/// intermittently surfaced as an "Insufficient funds" error on that tick (#148).
-fn wait_for_confirmed_utxo(node: &Node, wallet: &str) {
-    let w = node.rpc.wallet(wallet);
-    for _ in 0..60 {
-        let utxos = w.call("listunspent", json!([1])).unwrap();
-        if utxos.as_array().is_some_and(|a| !a.is_empty()) {
-            return;
-        }
-        node.mine(1);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("funding wallet {wallet} never showed a confirmed UTXO");
-}
-
 fn drive_until_parked(
     maker: &mut Engine<Tp>,
     taker: &mut Engine<Tp>,
