@@ -142,7 +142,10 @@
         <textarea id="sp-signed" rows="3" placeholder="paste the signed transaction from Sparrow"
           title="The fully-signed transaction from your signer."></textarea>
       </label>
-      <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker when funding is hot, and broadcast it on BTC (Blake2b).">Submit and broadcast</button>
+      <div class="row" style="gap:.4rem">
+        <button id="sp-scan" class="ghost" type="button" title="Scan the signed transaction back from an air-gapped signer's QR (camera or image)">Scan QR</button>
+        <button id="sp-submit" class="primary" title="We verify the signed transaction is the one we built, co-sign the marker when funding is hot, and broadcast it on BTC (Blake2b).">Submit and broadcast</button>
+      </div>
       <p id="sp-step2" class="muted"></p>
     </div>
     <div class="card hidden" id="sp-verify-card">
@@ -182,6 +185,7 @@
 <div id="modal" class="modal hidden"><div class="sheet card"></div></div>
 
 <script src="/qrcode.js"></script>
+<script src="/jsQR.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
