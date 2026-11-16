@@ -51,9 +51,17 @@ button so a maker can remove an offer it can no longer back. Pausing is withdraw
 ### L2. Maker-set expiry (#212)
 Let the maker stamp an offer "valid for N days". Carry a `valid_until` on the offer, honored client-side
 (do not show or take an expired offer) and, where the relay parses offers, tombstoned at expiry. Make it
-a backward-compatible optional field: an old peer that ignores it falls back to the existing 7-day
-re-announce TTL, so this needs no hard protocol break. This also shortens the orphan-offer window (an
-un-withdrawable offer from a retired identity ages out at its expiry instead of the full TTL).
+a backward-compatible optional field: an old peer that ignores it falls back to the re-announce TTL,
+so this needs no hard protocol break. This also shortens the orphan-offer window (an un-withdrawable
+offer from a retired identity ages out at its expiry instead of the full TTL).
+
+The re-announce TTL itself was 7 days (matching the relay's event retention) but is now ~1 hour, a
+small multiple (`SEEN_OFFER_STALE_INTERVALS`) of the 5-minute re-announce period (#258). A live offer
+is re-seen every period so it never ages out; only a maker gone silent, including a `valid_until: null`
+offer that L2's expiry prune cannot touch, clears, bounding cross-node divergence to ~1 hour rather
+than a week. This bounds only local display: a relay still replays its own 7-day store to a fresh
+subscriber (the client cannot change that), and an operator can dismiss a ghost immediately (it is
+pinned out locally by `withdrawn`).
 
 ## The only accountability lever that fits: optional proof-of-funding
 

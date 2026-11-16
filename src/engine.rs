@@ -94,11 +94,28 @@ fn fee_amount_or_none(
     fee::fee_amount_min(rates, role, locked, min_trade).ok()
 }
 
+/// How many re-announce intervals a discovered offer may miss before discovery ages it out. A live
+/// maker re-announces every [`REANNOUNCE_INTERVAL`] (5 min), so 12 missed announces (~1 h) clears a
+/// ghost quickly while still tolerating a transient relay/Tor hiccup.
+const SEEN_OFFER_STALE_INTERVALS: u64 = 12;
+
 /// How long a discovered offer stays in the local market without being re-seen before it ages out
-/// (#88/#70/#65). Matches the relay's event retention (7 days), so an offer the relay would still
-/// serve is never dropped first, but a dead or withdrawn offer whose maker is gone - including a
-/// pre-M1 legacy offer with no `Withdraw` - cannot linger in discovery forever.
-const SEEN_OFFER_TTL_SECS: u64 = 7 * 24 * 3600;
+/// (#88/#70/#65). Previously 7 days (the relay's event retention), which let a ghost - a maker gone
+/// silent, including a `valid_until: null` offer the maker-expiry prune cannot touch (#258) - linger
+/// for a week and desync market views across nodes. Now [`SEEN_OFFER_STALE_INTERVALS`] re-announce
+/// periods (~1 h): a live offer is re-seen every 5 min so it never ages out, only a dead one clears,
+/// bounding cross-node divergence to ~1 h. Expressed as a multiple of [`REANNOUNCE_INTERVAL`] so the
+/// two cannot drift (the TTL must always exceed the announce period). This bounds only the LOCAL
+/// display: a relay still replays its own 7-day store to a fresh subscriber, which the client cannot
+/// change, and a dismissed ghost is additionally pinned out by `withdrawn`.
+const SEEN_OFFER_TTL_SECS: u64 = REANNOUNCE_INTERVAL.as_secs() * SEEN_OFFER_STALE_INTERVALS;
+
+// Guard the #258 intent at compile time: the stale window must stay well below the relay's 7-day
+// store (so a ghost clears far sooner) yet comfortably exceed the re-announce period (so a live
+// offer is never aged out between announces).
+const _: () = assert!(
+    SEEN_OFFER_TTL_SECS < 24 * 3600 && SEEN_OFFER_TTL_SECS > REANNOUNCE_INTERVAL.as_secs() * 2
+);
 
 /// How many own-chain blocks the engine keeps watching a handed-out, then abandoned, Interactive lock
 /// for the user to broadcast before it gives up (design 0019 bound). ~1 week of BTC blocks: long
@@ -2801,6 +2818,47 @@ mod tests {
             now + SEEN_OFFER_TTL_SECS + 1
         ));
         assert!(seen_offers.is_empty() && seen_at.is_empty());
+    }
+
+    #[test]
+    fn prune_seen_clears_a_null_expiry_ghost_within_the_hour_not_the_week() {
+        // #258: a maker-silent offer with no `valid_until` has no maker-expiry to prune against, so
+        // the stale window is its only cleanup. With the shortened window (~1 h) a ghost ages out of
+        // local discovery in ~12 missed re-announces, not the old 7 days, so views reconverge. Uses
+        // absolute durations (not the symbol) so a regression that lengthens the window fails here.
+        use super::prune_seen;
+        use crate::swap::{Chain, Offer};
+        use bitcoin::Amount;
+        let offer = |n: u8| Offer {
+            id: [n; 16],
+            maker_chain: Chain::Xbtc,
+            maker_amount: Amount::from_sat(1000),
+            taker_amount: Amount::from_sat(1000),
+            min_maker_amount: Amount::ZERO,
+            maker_lock_blocks: 40,
+            taker_lock_blocks: 20,
+            maker_lock_depth: 2,
+            taker_lock_depth: 2,
+            margin_blocks: 3,
+            fee: None,
+            valid_until: None, // the ghost: no maker expiry for prune_seen to catch
+        };
+        let now = 1_000_000u64;
+        let mut seen_offers = vec![offer(1), offer(2)];
+        let mut seen_at = vec![
+            ([1u8; 16], now - 1800), // re-seen 30 min ago: a live, re-announced offer -> kept
+            ([2u8; 16], now - 2 * 3600), // not re-seen for 2 h: a silent-maker ghost -> dropped
+        ];
+        assert!(prune_seen(&mut seen_offers, &mut seen_at, now));
+        let ids: Vec<[u8; 16]> = seen_offers.iter().map(|o| o.id).collect();
+        assert!(
+            ids.contains(&[1u8; 16]),
+            "a 30-min-old (re-announced) offer stays inside the stale window"
+        );
+        assert!(
+            !ids.contains(&[2u8; 16]),
+            "a 2-h-stale null-expiry ghost is dropped"
+        );
     }
 
     #[test]
