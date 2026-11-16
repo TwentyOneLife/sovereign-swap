@@ -869,9 +869,22 @@ function explorerTx(chain, lock) {
       : need
         ? `${Math.min(confs, need)}/${need} conf`
         : `${confs} conf`;
-  const settled = lock.spent || (confs != null && (!need || confs >= need));
-  const color = settled ? "var(--ok)" : confs == null ? "var(--dim)" : "var(--orange)";
-  const state = `${count} · ${lock.spent ? "spent" : "locked"}`;
+  const lockSettled = confs != null && (!need || confs >= need);
+  // #307: once the lock is spent, show the SPEND (claim or refund) confirming, not a bare "spent", so the
+  // long `claiming -> done` wait has a countdown. The swap is done when a claim is required_depth deep.
+  let state, color;
+  if (lock.spend) {
+    const sp = lock.spend;
+    const sneed = sp.required_depth;
+    const sconf = sp.confirmations ?? 0;
+    const sdone = sneed ? sconf >= sneed : sconf > 0;
+    const scount = sneed ? `${Math.min(sconf, sneed)}/${sneed} conf` : `${sconf} conf`;
+    state = `${sp.is_claim ? "claim" : "refund"} ${scount}${sdone ? " · done" : ""}`;
+    color = sdone ? "var(--ok)" : "var(--orange)";
+  } else {
+    state = count + " · locked";
+    color = lockSettled ? "var(--ok)" : confs == null ? "var(--dim)" : "var(--orange)";
+  }
   // #309: the required depth the engine enforces is a value-based security FLOOR (deeper for larger
   // swaps), which can exceed the configured btc_conf/xbtc_conf; label it so a user who set 2 and sees 6
   // understands why. The setting raises this floor, never lowers it.
@@ -879,6 +892,35 @@ function explorerTx(chain, lock) {
     ? `Requires ${need} confirmation(s): a value-based security floor for this amount (low-hashrate reorg safety). Your btc_conf/xbtc_conf can raise this, never lower it below the floor.`
     : "";
   return `${explorerLink(chain, lock.txid)}<br><span style="color:${color}" title="${escapeHtml(depthTitle)}">${escapeHtml(state)}</span>`;
+}
+
+// #307: a compact step breadcrumb over the swap lifecycle, current step highlighted, so the long
+// `locking` and `claiming` waits read as "you are here" rather than one static phase word. Derived
+// from the daemon phase plus the own-lock state, phrased the same for maker and taker. Refund is the
+// alternate terminal branch.
+function swapStepper(s, ownLock) {
+  const p = s.phase;
+  const refund = p === "refunding" || p === "refunded";
+  const steps = refund
+    ? ["Taken", "Locked", "Refunding", "Refunded"]
+    : ["Taken", "Fund lock", "Locked", "Claiming", "Done"];
+  let cur;
+  if (refund) cur = p === "refunded" ? 3 : 2;
+  else if (p === "done") cur = 4;
+  else if (p === "claiming") cur = 3;
+  else cur = ownLock && (ownLock.spent || ownLock.confirmations != null) ? 2 : 1; // locking
+  const sep = `<span style="color:var(--dim)"> → </span>`;
+  return (
+    `<div style="margin:.2rem 0;font-size:.85em">` +
+    steps
+      .map((label, i) => {
+        const color = i < cur ? "var(--ok)" : i === cur ? "var(--orange)" : "var(--dim)";
+        const mark = i < cur ? "✓ " : i === cur ? "▸ " : "";
+        return `<span style="color:${color}">${mark}${escapeHtml(label)}</span>`;
+      })
+      .join(sep) +
+    `</div>`
+  );
 }
 
 // History / ledger (#67): the daemon derives per-swap entries + totals from its own records at
@@ -1039,6 +1081,7 @@ async function fillSwapDetail(id, box) {
     `<p data-sd style="margin:.2rem 0"><span class="pill ${isTerminal(s) ? "phase-" + s.phase : "phase-active"}" title="Swap phase, from the daemon each poll">${escapeHtml(s.phase)}</span>` +
     `<span class="muted"> · ${s.role} · ${fmtSats(s.maker_amount_sat)} ${chainShort(s.maker_chain)} for ${fmtSats(s.taker_amount_sat)} ${chainShort(s.taker_chain)}` +
     (s.secret_revealed ? " · secret revealed" : "") + `</span></p>` +
+    swapStepper(s, ownLock) +
     `<div class="legs">` +
     `<div class="leg card"><strong>Your leg (${escapeHtml(chainLong(ownChain))})</strong><br>${explorerTx(ownChain, ownLock)}</div>` +
     `<div class="leg card"><strong>Counterparty (${escapeHtml(chainLong(cpChain))})</strong><br>${explorerTx(cpChain, cpLock)}</div>` +
