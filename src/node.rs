@@ -814,6 +814,54 @@ impl ChainNode {
         Address::from_script(&contract.script_pubkey(), self.network).expect("P2WSH has an address")
     }
 
+    /// Sample this chain's runtime health (#308) from its own block timestamps plus wall-clock now: the
+    /// tip's time and median-time-past, and the MTP `window` blocks back, fed to `assess_chain_health`.
+    /// Used to refuse locking a taker leg into a stalled or far-slower-than-target chain, whose lock
+    /// would outlast the counterparty's reserved timelock budget. Block timestamps come from
+    /// `getblockheader` (always present, unlike `getblockchaininfo.time` on older nodes).
+    pub fn chain_health(
+        &self,
+        target_secs: u32,
+        window: u32,
+    ) -> Result<crate::swap::ChainHealth, NodeError> {
+        let info = self.rpc.call("getblockchaininfo", json!([]))?;
+        let height = info["blocks"]
+            .as_u64()
+            .ok_or_else(|| NodeError::Unexpected("getblockchaininfo: no blocks".into()))?
+            as u32;
+        let best = info["bestblockhash"]
+            .as_str()
+            .ok_or_else(|| NodeError::Unexpected("getblockchaininfo: no bestblockhash".into()))?;
+        let tip = self.rpc.call("getblockheader", json!([best]))?;
+        let tip_time = tip["time"]
+            .as_i64()
+            .ok_or_else(|| NodeError::Unexpected("tip header: no time".into()))?;
+        let tip_mtp = tip["mediantime"]
+            .as_i64()
+            .ok_or_else(|| NodeError::Unexpected("tip header: no mediantime".into()))?;
+        let back = height.saturating_sub(window);
+        let back_hash = self.rpc.call("getblockhash", json!([back]))?;
+        let back_hash = back_hash
+            .as_str()
+            .ok_or_else(|| NodeError::Unexpected("getblockhash: not a string".into()))?;
+        let back_hdr = self.rpc.call("getblockheader", json!([back_hash]))?;
+        let mtp_back = back_hdr["mediantime"]
+            .as_i64()
+            .ok_or_else(|| NodeError::Unexpected("back header: no mediantime".into()))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok(crate::swap::assess_chain_health(
+            now,
+            tip_time,
+            tip_mtp,
+            mtp_back,
+            height.saturating_sub(back),
+            target_secs,
+        ))
+    }
+
     /// Funds and signs a lock of `amount` in `contract` from the funding wallet, from inputs with at
     /// least `minconf` confirmations, refusing inputs that are still spendable on `other_chain`.
     /// Nothing is broadcast.
