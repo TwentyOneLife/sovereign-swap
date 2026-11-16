@@ -167,6 +167,9 @@ fn a_full_swap_settles_with_btc_read_and_broadcast_over_electrum() {
     core.mine(1);
     knots.mine(1);
     wait_synced(&probe, &core);
+    // #317: do not fund the swap until each wallet has processed its funding block (avoids a flaky -4).
+    common::wait_for_confirmed_utxo(&knots, "maker");
+    common::wait_for_confirmed_utxo(&core, "taker");
 
     maker.publish(offer()).unwrap();
     tick(&mut taker); // discover the offer over the relay
